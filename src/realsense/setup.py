@@ -18,12 +18,12 @@ setup(
     zip_safe=True,
     maintainer='will',
     maintainer_email='willlee965109@gmail.com',
-    description='Intel RealSense RGB image publisher node',
+    description='OpenCV multi-window viewer for the official realsense2_camera node',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'rgb_publisher = realsense.rgb_publisher_node:main',
+            'camera_viewer = realsense.camera_viewer_node:main',
         ],
     },
 )

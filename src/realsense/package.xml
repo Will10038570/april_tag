@@ -3,7 +3,7 @@
 <package format="3">
   <name>realsense</name>
   <version>0.0.1</version>
-  <description>Intel RealSense RGB image publisher node</description>
+  <description>OpenCV multi-window viewer for the official realsense2_camera node</description>
   <maintainer email="willlee965109@gmail.com">will</maintainer>
   <license>Apache-2.0</license>
 
@@ -12,6 +12,7 @@
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
