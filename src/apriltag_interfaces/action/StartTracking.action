@@ -1,0 +1,6 @@
+bool start
+---
+bool success
+string message
+---
+string status
