@@ -14,7 +14,7 @@ Camera frame arrives
        │
        ▼
  AprilTag Detection            [apriltag/perception/tag_perception.py]
-       │  → publishes annotated image to /apriltag/marked_image
+       │  → publishes annotated image to /up/apriltag/marked_image
        ▼
  Target Selection & Control    [apriltag/runtime/target_flow.py]
    ├── TrajectoryPlanner       → align yaw first, then translate
@@ -22,7 +22,7 @@ Camera frame arrives
    └── Safety Watchdog         → safe-stop on tag loss
        │
        ▼
- /cmd_vel  /apriltag_pose  /apriltag_trajectory  TF
+ /cmd_vel_nav  /up/apriltag_pose  /up/apriltag_trajectory  TF
 ```
 
 ## Features
@@ -73,22 +73,30 @@ Source the workspace overlay:
 source install/setup.bash
 ```
 
-Run the node:
+Launch the camera, the AprilTag node, and the pose printer under the `up` namespace:
 
 ```bash
-ros2 run apriltag apriltag_node
+ros2 launch apriltag test_april_tag_pose.launch.py
 ```
+
+To run the node alone in the same namespace:
+
+```bash
+ros2 run apriltag apriltag_node --ros-args -r __ns:=/up
+```
+
+Without a namespace, the relative names below lose the `/up` prefix (e.g. `/start_tracking`, `/apriltag_pose`).
 
 Start tracking from another terminal with the action server:
 
 ```bash
-ros2 action send_goal /start_tracking apriltag_interfaces/action/StartTracking "{start: true}"
+ros2 action send_goal /up/start_tracking apriltag_interfaces/action/StartTracking "{start: true}"
 ```
 
 Stop tracking and publish a zero velocity command:
 
 ```bash
-ros2 action send_goal /start_tracking apriltag_interfaces/action/StartTracking "{start: false}"
+ros2 action send_goal /up/start_tracking apriltag_interfaces/action/StartTracking "{start: false}"
 ```
 
 Run the controller demo module without ROS:
@@ -103,16 +111,16 @@ python -m apriltag.control
 |---|---|---|---|
 | `/camera/camera/color/image_raw` | `sensor_msgs/Image` | Subscribe | Raw camera frames |
 | `/camera/camera/color/camera_info` | `sensor_msgs/CameraInfo` | Subscribe | Camera intrinsics |
-| `/cmd_vel` | `geometry_msgs/Twist` | Publish | Velocity commands |
-| `/apriltag_pose` | `geometry_msgs/PoseStamped` | Publish | Tag pose in camera frame |
-| `/apriltag_trajectory` | `nav_msgs/Path` | Publish | Two-point path (origin → tag) |
-| `/apriltag/marked_image` | `sensor_msgs/Image` | Publish | Annotated image with detections |
+| `/cmd_vel_nav` | `geometry_msgs/Twist` | Publish | Velocity commands |
+| `/up/apriltag_pose` | `geometry_msgs/PoseStamped` | Publish | Tag pose in camera frame |
+| `/up/apriltag_trajectory` | `nav_msgs/Path` | Publish | Two-point path (origin → tag) |
+| `/up/apriltag/marked_image` | `sensor_msgs/Image` | Publish | Annotated image with detections |
 
 ## Actions
 
 | Action | Type | Description |
 |---|---|---|
-| `/start_tracking` | `apriltag_interfaces/action/StartTracking` | Starts tracking and resets controller state, equivalent to pressing Enter in the node terminal |
+| `/up/start_tracking` | `apriltag_interfaces/action/StartTracking` | `start: true` starts tracking and resets controller state; `start: false` pauses and publishes a zero velocity command |
 
 ### TF Transforms
 

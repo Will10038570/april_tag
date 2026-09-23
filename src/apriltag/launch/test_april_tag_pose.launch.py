@@ -19,6 +19,7 @@ def generate_launch_description():
         package='apriltag',
         executable='apriltag_node',
         name='apriltag_node',
+        namespace='up',
         output='screen',
     )
 
@@ -26,6 +27,7 @@ def generate_launch_description():
         package='apriltag',
         executable='print_tag_pose',
         name='tag_pose_printer',
+        namespace='up',
         output='screen',
     )
 

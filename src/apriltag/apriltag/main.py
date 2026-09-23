@@ -58,9 +58,9 @@ class AprilTagRosNode(Node):
         self.camera_frame = 'camera_link'
 
         # publisher for PoseStamped and TF broadcaster
-        self.pose_pub = self.create_publisher(PoseStamped, '/apriltag_pose', 10)
-        self.traj_pub = self.create_publisher(Path, '/apriltag_trajectory', 10)
-        self.image_pub = self.create_publisher(Image, '/apriltag/marked_image', self.image_qos)
+        self.pose_pub = self.create_publisher(PoseStamped, 'apriltag_pose', 10)
+        self.traj_pub = self.create_publisher(Path, 'apriltag_trajectory', 10)
+        self.image_pub = self.create_publisher(Image, 'apriltag/marked_image', self.image_qos)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         ## AprilTag physical size and distance parameters

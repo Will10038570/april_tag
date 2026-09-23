@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Debug tool: print distance and yaw angle from camera to the tracked AprilTag.
 
-Subscribes to /apriltag_pose (only published while tracking is active, i.e.
+Subscribes to /up/apriltag_pose (only published while tracking is active, i.e.
 after sending the start_tracking action goal) and prints a line per frame:
 
     distance: 0.52 m | yaw: 3.2 deg
@@ -32,9 +32,9 @@ class TagPosePrinter(Node):
     def __init__(self):
         super().__init__('tag_pose_printer')
         self._last_print = 0.0
-        self.create_subscription(PoseStamped, '/apriltag_pose', self._on_pose, 10)
+        self.create_subscription(PoseStamped, 'apriltag_pose', self._on_pose, 10)
         self.get_logger().info(
-            "Waiting for /apriltag_pose... "
+            "Waiting for /up/apriltag_pose... "
             "(send the start_tracking action goal to start publishing)"
         )
 
