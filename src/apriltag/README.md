@@ -4,26 +4,24 @@ A ROS 2 Python package that detects [AprilTag](https://april.eecs.umich.edu/soft
 
 ## Overview
 
-The codebase is now organized as a standard ROS 2 `ament_python` package. Most application source lives under `src/apriltag/apriltag/`, with `apriltag.main` registered as the executable entry point.
+The package runs as two nodes under the `up` namespace:
+
+- **`apriltag_detection`** — detects tags and publishes the closest tag's pose. It starts disabled and only subscribes to the camera while enabled.
+- **`apriltag_control`** — orchestrator. It owns the `start_tracking` action, enables detection when a goal starts, runs the planner + LQR, publishes `/cmd_vel_nav`, and disables detection again when the goal succeeds, fails, is cancelled or is stopped.
 
 ```
-Camera frame arrives
-       │
-       ▼
- Image conversion              [apriltag/ros/ros_io.py]
-       │
-       ▼
- AprilTag Detection            [apriltag/perception/tag_perception.py]
-       │  → publishes annotated image to /up/apriltag/marked_image
-       ▼
- Target Selection & Control    [apriltag/runtime/target_flow.py]
-   ├── TrajectoryPlanner       → align yaw first, then translate
-   ├── LQRTracker              → optimal velocity commands (vx, vy, vw)
-   └── Safety Watchdog         → safe-stop on tag loss
-       │
-       ▼
- /cmd_vel_nav  /up/apriltag_pose  /up/apriltag_trajectory  TF
+ client ──start_tracking──► apriltag_control ──SetBool /up/apriltag_detection/enable──► apriltag_detection
+                                  ▲                                                        │
+                                  │                     camera/camera/color/image_raw ────►│ detect + pose
+                                  └──────────── /up/apriltag_pose (PoseStamped) ◄──────────┘ (+ TF, marked_image)
+                                  │
+   quaternion → R → control error → TrajectoryPlanner → LQR → clamp
+                                  │
+                                  ▼
+                   /cmd_vel_nav  /up/apriltag_trajectory
 ```
+
+Target loss is checked by a timer in `apriltag_control` (detection publishes nothing when no tag is visible).
 
 ## Features
 
@@ -43,6 +41,7 @@ ROS 2 dependencies declared in `package.xml`:
 - `geometry_msgs`
 - `nav_msgs`
 - `sensor_msgs`
+- `std_srvs`
 
 Python dependencies used by the package:
 
@@ -73,16 +72,17 @@ Source the workspace overlay:
 source install/setup.bash
 ```
 
-Launch the camera, the AprilTag node, and the pose printer under the `up` namespace:
+Launch the camera, both AprilTag nodes, and the pose printer under the `up` namespace:
 
 ```bash
 ros2 launch apriltag test_april_tag_pose.launch.py
 ```
 
-To run the node alone in the same namespace:
+To run the nodes alone in the same namespace:
 
 ```bash
-ros2 run apriltag apriltag_node --ros-args -r __ns:=/up
+ros2 run apriltag apriltag_detection --ros-args -r __ns:=/up
+ros2 run apriltag apriltag_control --ros-args -r __ns:=/up
 ```
 
 Without a namespace, the relative names below lose the `/up` prefix (e.g. `/start_tracking`, `/apriltag_pose`).
@@ -105,22 +105,62 @@ Run the controller demo module without ROS:
 python -m apriltag.control
 ```
 
+## Virtual End-to-End Test
+
+`tools/virtual_tracking_sim.py` replaces the RealSense camera and the AMR with a simulation, so the real `apriltag_detection` and `apriltag_control` run unmodified: a virtual tag36h11 tag stands at the world origin, a virtual holonomic AMR integrates `/cmd_vel_nav`, and a synthetic camera image of the tag is rendered from their relative pose and published on `up/camera/camera/color/image_raw` + `camera_info`.
+
+Run it inside the Docker container (needs `DISPLAY`):
+
+```bash
+ros2 launch apriltag test_virtual_tracking.launch.py
+```
+
+The whole test runs in `ROS_DOMAIN_ID=99` (launch argument `domain_id`) so a real AMR never receives the simulated `/cmd_vel_nav`. Use the same domain for CLI debugging, e.g. `ROS_DOMAIN_ID=99 ros2 topic echo /cmd_vel_nav`.
+
+Dashboard:
+
+| Panel | Content |
+|---|---|
+| Top view | Tag, AMR, camera FOV (yellow = tag in view), trail, Stage 1 / 2 goal positions. Drag the AMR body to move it, drag the round handle (or mouse wheel, `a` / `d`) to rotate — only while not running |
+| Camera | `marked_image` from detection while enabled, otherwise the raw synthetic image |
+| Pose error | Ground-truth error (lines) vs. the controller's error parsed from the action feedback (circles), ±0.05 tolerance band, Stage 2 switch time |
+| cmd_vel_nav | Thick dark line: the cmd the sim actually applies to the AMR (sampled at 50 Hz, zero after 0.5 s without a message). Thin line + dots: every raw `/cmd_vel_nav` message from `apriltag_control`. ±0.5 limit |
+
+Keys: `s` start (sends the `start_tracking` goal), `x` stop (cancels the goal), `r` reset to the initial pose, `+` / `-` zoom, `q` quit.
+
+Every finished run is saved to `virtual_tracking_logs/` (relative to the working directory): `<time>_<result>_sim.csv` (50 Hz pose, ground-truth error, cmd), `<time>_<result>_feedback.csv` (controller feedback), `<time>_<result>_cmd_raw.csv` (every raw `/cmd_vel_nav` message) and a PNG of the dashboard.
+
+Headless (no window, one goal, then exit after saving):
+
+```bash
+ros2 launch apriltag test_virtual_tracking.launch.py headless:=true auto_start:=true \
+    init_x:=-1.0 init_y:=0.15 init_yaw_deg:=10.0
+```
+
+The sim's camera intrinsics, camera mount offset, tag size and stage distances are ROS parameters of `virtual_tracking_sim`; `tag_size`, `camera_y_offset` and the stage distances must match the values in `detection_node.py` / `control_node.py`.
+
 ## Topics
 
-| Topic | Type | Direction | Description |
+| Topic | Type | Node | Direction | Description |
+|---|---|---|---|---|
+| `/up/camera/camera/color/image_raw` | `sensor_msgs/Image` | detection | Subscribe (only while enabled) | Raw camera frames |
+| `/up/camera/camera/color/camera_info` | `sensor_msgs/CameraInfo` | detection | Subscribe (until received) | Camera intrinsics |
+| `/up/apriltag_pose` | `geometry_msgs/PoseStamped` | detection → control | Publish / Subscribe | Closest tag pose in camera optical frame, stamped with the image time |
+| `/up/apriltag/marked_image` | `sensor_msgs/Image` | detection | Publish | Annotated image with detections |
+| `/up/apriltag_trajectory` | `nav_msgs/Path` | control | Publish | Two-point path (origin → tag) |
+| `/cmd_vel_nav` | `geometry_msgs/Twist` | control | Publish | Velocity commands |
+
+## Services
+
+| Service | Type | Node | Description |
 |---|---|---|---|
-| `/camera/camera/color/image_raw` | `sensor_msgs/Image` | Subscribe | Raw camera frames |
-| `/camera/camera/color/camera_info` | `sensor_msgs/CameraInfo` | Subscribe | Camera intrinsics |
-| `/cmd_vel_nav` | `geometry_msgs/Twist` | Publish | Velocity commands |
-| `/up/apriltag_pose` | `geometry_msgs/PoseStamped` | Publish | Tag pose in camera frame |
-| `/up/apriltag_trajectory` | `nav_msgs/Path` | Publish | Two-point path (origin → tag) |
-| `/up/apriltag/marked_image` | `sensor_msgs/Image` | Publish | Annotated image with detections |
+| `/up/apriltag_detection/enable` | `std_srvs/SetBool` | detection | Called by `apriltag_control`; `true` subscribes to the camera, `false` unsubscribes |
 
 ## Actions
 
 | Action | Type | Description |
 |---|---|---|
-| `/up/start_tracking` | `apriltag_interfaces/action/StartTracking` | `start: true` starts tracking and resets controller state; `start: false` pauses and publishes a zero velocity command |
+| `/up/start_tracking` | `apriltag_interfaces/action/StartTracking` | Served by `apriltag_control`. `start: true` enables detection, resets controller state and tracks until aligned (succeed) or the tag is lost (abort); `start: false` pauses and publishes a zero velocity command. Detection is disabled whenever a goal ends |
 
 ### TF Transforms
 
@@ -128,7 +168,7 @@ Broadcasts `camera_frame → apriltag_<tag_id>` for each detected tag.
 
 ## Configuration
 
-All parameters are set in `AprilTagRosNode.__init__()` in `src/apriltag/apriltag/main.py`:
+Parameters are set in `AprilTagDetectionNode.__init__()` (`apriltag/detection_node.py`: `tag_size`, tag family) and `AprilTagControlNode.__init__()` (`apriltag/control_node.py`: everything else):
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -162,7 +202,8 @@ apriltag_ws/
 │       │   └── apriltag
 │       ├── apriltag/
 │       │   ├── __init__.py
-│       │   ├── main.py                  # ROS 2 node entry point
+│       │   ├── detection_node.py        # apriltag_detection node
+│       │   ├── control_node.py          # apriltag_control node (orchestrator)
 │       │   ├── control.py               # PID, LQR, and TrajectoryPlanner
 │       │   ├── domain/
 │       │   │   ├── app_types.py         # Shared dataclasses
@@ -174,7 +215,7 @@ apriltag_ws/
 │       │   └── runtime/
 │       │       ├── control_flow.py      # Control pipeline steps
 │       │       ├── safety_guard.py      # Target-loss watchdog logic
-│       │       └── target_flow.py       # Target dispatch and orchestration
+│       │       └── target_flow.py       # Target selection
 │       └── test/
 └── README.md
 ```

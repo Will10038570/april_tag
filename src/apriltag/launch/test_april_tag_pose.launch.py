@@ -15,10 +15,18 @@ def generate_launch_description():
         ),
     )
 
-    apriltag_node = Node(
+    apriltag_detection = Node(
         package='apriltag',
-        executable='apriltag_node',
-        name='apriltag_node',
+        executable='apriltag_detection',
+        name='apriltag_detection',
+        namespace='up',
+        output='screen',
+    )
+
+    apriltag_control = Node(
+        package='apriltag',
+        executable='apriltag_control',
+        name='apriltag_control',
         namespace='up',
         output='screen',
     )
@@ -31,4 +39,4 @@ def generate_launch_description():
         output='screen',
     )
 
-    return LaunchDescription([camera, apriltag_node, print_tag_pose])
+    return LaunchDescription([camera, apriltag_detection, apriltag_control, print_tag_pose])

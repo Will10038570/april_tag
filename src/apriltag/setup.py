@@ -28,8 +28,10 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'apriltag_node = apriltag.main:main',
+            'apriltag_detection = apriltag.detection_node:main',
+            'apriltag_control = apriltag.control_node:main',
             'print_tag_pose = tools.print_tag_pose:main',
+            'virtual_tracking_sim = tools.virtual_tracking_sim:main',
         ],
     },
 )

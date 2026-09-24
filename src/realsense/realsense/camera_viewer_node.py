@@ -6,10 +6,10 @@ from sensor_msgs.msg import Image
 
 # key -> (default topic published by realsense2_camera, encoding, window title)
 STREAM_SPECS = {
-    'rgb': ('/camera/camera/color/image_raw', 'bgr8', 'RGB'),
-    'depth': ('/camera/camera/depth/image_rect_raw', '16UC1', 'Depth'),
-    'ir1': ('/camera/camera/infra1/image_rect_raw', 'mono8', 'Infrared 1'),
-    'ir2': ('/camera/camera/infra2/image_rect_raw', 'mono8', 'Infrared 2'),
+    'rgb': ('camera/camera/color/image_raw', 'bgr8', 'RGB'),
+    'depth': ('camera/camera/depth/image_rect_raw', '16UC1', 'Depth'),
+    'ir1': ('camera/camera/infra1/image_rect_raw', 'mono8', 'Infrared 1'),
+    'ir2': ('camera/camera/infra2/image_rect_raw', 'mono8', 'Infrared 2'),
 }
 
 

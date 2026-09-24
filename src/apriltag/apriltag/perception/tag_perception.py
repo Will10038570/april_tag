@@ -1,4 +1,4 @@
-"""AprilTag 感知層：偵測資料提取、位姿估計、控制狀態計算。"""
+"""AprilTag 感知層：偵測資料提取、位姿估計。"""
 
 from typing import List, Optional, Tuple
 
@@ -10,7 +10,6 @@ from apriltag.domain.app_types import (
     AprilTagPose,
     CameraIntrinsics,
 )
-from apriltag.domain.math_utils import optical_to_control_error
 
 
 def extract_detection_data(raw_detection) -> Tuple[Optional[int], np.ndarray, Optional[Tuple[float, float]]]:
@@ -73,11 +72,9 @@ def draw_detections_and_collect_targets(
     intrinsics: CameraIntrinsics,
     detector,
     tag_size: float,
-    desired_distance: float,
-    camera_y_offset: float,
     logger,
 ):
-    """Draw detections and return target dictionaries for control/publish."""
+    """Draw detections and return target dictionaries (id, t, R) for publishing."""
     targets = []
 
     for det in detections:
@@ -118,46 +115,12 @@ def draw_detections_and_collect_targets(
                     2,
                 )
 
-            state = optical_to_control_error(t_vec, desired_distance, pose.R, camera_y_offset)
-            if center_i:
-                y0 = center_i[1] + 20
-                cv2.putText(
-                    img,
-                    f"x_err:{state.x_error:.2f} m",
-                    (center_i[0] + 10, y0),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 255),
-                    1,
-                )
-                cv2.putText(
-                    img,
-                    f"y_err:{state.y_error:.2f} m",
-                    (center_i[0] + 10, y0 + 15),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 255),
-                    1,
-                )
-                cv2.putText(
-                    img,
-                    f"yaw_err:{state.yaw_error:.2f} rad",
-                    (center_i[0] + 10, y0 + 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 255),
-                    1,
-                )
-
             # logger.info(text)
             targets.append(
                 {
                     "id": tag_id,
                     "t": t_vec,
                     "R": pose.R,
-                    "x_error": state.x_error,
-                    "y_error": state.y_error,
-                    "yaw_error": state.yaw_error,
                 }
             )
         except Exception as exc:

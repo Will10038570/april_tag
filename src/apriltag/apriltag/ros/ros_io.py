@@ -1,5 +1,6 @@
 """ROS I/O helpers for message conversion and publishing."""
 
+import array
 from typing import Optional, Tuple
 
 import cv2
@@ -23,7 +24,8 @@ def cv2_to_img_msg(img_bgr: np.ndarray, header=None, encoding: str = "bgr8") -> 
     msg.encoding = encoding
     msg.is_bigendian = False
     msg.step = int(img_bgr.shape[1] * img_bgr.shape[2])
-    msg.data = bytes(img_bgr.data)
+    # array.array is ~1000x faster than bytes here: rclpy validates bytes element by element
+    msg.data = array.array("B", img_bgr.tobytes())
     return msg
 
 
@@ -106,18 +108,21 @@ def publish_trajectory(traj_pub, pose_msg: PoseStamped) -> None:
 
 
 def publish_pose_and_tf(
-    clock,
+    stamp,
     camera_frame: str,
     pose_pub,
-    traj_pub,
     tf_broadcaster,
     tag_id,
     t_vec,
     r_mat: Optional[np.ndarray] = None,
 ) -> None:
-    """Publish PoseStamped, Path and TF for one AprilTag target."""
+    """Publish PoseStamped and TF for one AprilTag target.
+
+    `stamp` should be the source image's header stamp so consumers can compute
+    dt from capture time.
+    """
     pose_msg = PoseStamped()
-    pose_msg.header.stamp = clock.now().to_msg()
+    pose_msg.header.stamp = stamp
     pose_msg.header.frame_id = camera_frame
     pose_msg.pose.position.x = float(t_vec[0])
     pose_msg.pose.position.y = float(t_vec[1])
@@ -139,10 +144,8 @@ def publish_pose_and_tf(
     pose_msg.pose.orientation.w = qw
     pose_pub.publish(pose_msg)
 
-    publish_trajectory(traj_pub, pose_msg)
-
     tf_msg = TransformStamped()
-    tf_msg.header.stamp = clock.now().to_msg()
+    tf_msg.header.stamp = stamp
     tf_msg.header.frame_id = camera_frame
     tf_msg.child_frame_id = f"apriltag_{tag_id}"
     tf_msg.transform.translation.x = float(t_vec[0])

@@ -40,6 +40,19 @@ def rotation_matrix_to_quaternion(R: np.ndarray) -> Tuple[float, float, float, f
     return (x, y, z, w)
 
 
+def quaternion_to_rotation_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
+    """四元數 (x, y, z, w) 轉 3x3 旋轉矩陣；為 rotation_matrix_to_quaternion 的反向轉換。"""
+    n = x * x + y * y + z * z + w * w
+    if n < 1e-12:
+        return np.eye(3)
+    s = 2.0 / n
+    return np.array([
+        [1.0 - s * (y * y + z * z), s * (x * y - z * w), s * (x * z + y * w)],
+        [s * (x * y + z * w), 1.0 - s * (x * x + z * z), s * (y * z - x * w)],
+        [s * (x * z - y * w), s * (y * z + x * w), 1.0 - s * (x * x + y * y)],
+    ])
+
+
 def rotation_matrix_to_yaw_error(R: np.ndarray) -> float:
     """從 AprilTag pose rotation matrix 提取控制座標偏航誤差。
 
