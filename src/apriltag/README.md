@@ -7,7 +7,7 @@ A ROS 2 Python package that detects [AprilTag](https://april.eecs.umich.edu/soft
 The package runs as two nodes under the `up` namespace:
 
 - **`apriltag_detection`** — detects tags and publishes the closest tag's pose. It starts disabled and only subscribes to the camera while enabled.
-- **`apriltag_control`** — orchestrator. It owns the `start_tracking` action, enables detection when a goal starts, runs the planner + LQR, publishes `/cmd_vel_nav`, and disables detection again when the goal succeeds, fails, is cancelled or is stopped.
+- **`apriltag_control`** — orchestrator. It owns the `start_tracking` action, closes AMCL and enables detection when a goal starts, runs the planner + LQR, publishes `/cmd_vel_nav`, disables the PLC lidar safety field before Stage 2, and when the goal succeeds, fails, is cancelled or is stopped it disables detection and restores lidar safety and AMCL.
 
 ```
  client ──start_tracking──► apriltag_control ──SetBool /up/apriltag_detection/enable──► apriltag_detection
@@ -23,12 +23,34 @@ The package runs as two nodes under the `up` namespace:
 
 Target loss is checked by a timer in `apriltag_control` (detection publishes nothing when no tag is visible).
 
+## G7+ Integration: AMCL And Lidar Safety
+
+`apriltag_control` calls two external G7+ providers at fixed points of a `start_tracking` goal:
+
+```
+start=True goal
+ ├─ 1. close AMCL: check → close (only if on) → check again      any failure → abort
+ ├─ 2. enable detection → Stage 1 (50 cm)
+ ├─ 3. Stage 1 converged: stop, then SetBool(true) lidar safety   success=false / no reply → abort
+ │     → Stage 2 (28 cm)
+ └─ 4. goal end (succeeded / tag lost / cancelled / start=false / failure / node shutdown):
+       stop → disable detection → SetBool(false) lidar safety → open AMCL → check
+```
+
+- Only what this node changed is restored (AMCL that was already off stays off). A restore that fails is logged, retried at the next goal end or at node shutdown, and noted in the result message. It does not change the goal outcome.
+- All service calls run in the action execute thread, so `pose_callback` and the target-loss watchdog keep running. While waiting for lidar safety the robot stays stopped and receives no motion.
+- Only one `start=True` goal runs at a time. A second one is rejected.
+- SIGINT / SIGTERM are handled by the node itself, so the restore calls are still made when it is shut down. SIGKILL cannot be handled.
+
+**Responsibility boundary:** this package only calls the services at the right time and checks their responses. Whether AMCL or the PLC actually behave as requested belongs to the G7+ providers (`dev_amcl`, ros1_bridge, `ads_bridge_node`).
+
 ## Features
 
 - Real-time AprilTag detection via `pupil_apriltags`
-- Two-stage trajectory planning: yaw alignment → forward translation
+- Two-stage docking: align at 50 cm (Stage 1), then at 28 cm (Stage 2)
 - Discrete-time LQR controller with DARE-based gain computation
 - Safety watchdog: safe-stop when the target is lost for too long
+- G7+ integration: closes AMCL during the goal and disables the PLC lidar safety field for Stage 2, restoring both on every exit path
 - Publishes pose, trajectory path, annotated image, and TF transform
 - Clear separation between control, perception, domain types, ROS I/O, and runtime orchestration
 
@@ -75,7 +97,7 @@ source install/setup.bash
 Launch the camera, both AprilTag nodes, and the pose printer under the `up` namespace:
 
 ```bash
-ros2 launch apriltag test_april_tag_pose.launch.py
+ros2 launch apriltag april_tag.launch.py
 ```
 
 To run the nodes alone in the same namespace:
@@ -115,7 +137,9 @@ Run it inside the Docker container (needs `DISPLAY`):
 ros2 launch apriltag test_virtual_tracking.launch.py
 ```
 
-The whole test runs in `ROS_DOMAIN_ID=99` (launch argument `domain_id`) so a real AMR never receives the simulated `/cmd_vel_nav`. Use the same domain for CLI debugging, e.g. `ROS_DOMAIN_ID=99 ros2 topic echo /cmd_vel_nav`.
+A fake node `fake_g7_services` stands in for AMCL and the PLC lidar safety. It serves the same four services but only keeps two bool flags (AMCL on/off, lidar safety enabled/disabled), shown in the dashboard. After every goal the sim logs `after goal: amcl=… lidar_safety=… (restored)`, or an error if `apriltag_control` did not restore them.
+
+The whole test runs in `ROS_DOMAIN_ID=65` (launch argument `domain_id`), the same domain as the robot, so **unplug the robot's network cable** before running it. Use the same domain for CLI debugging, e.g. `ROS_DOMAIN_ID=65 ros2 topic echo /cmd_vel_nav`.
 
 Dashboard:
 
@@ -155,34 +179,66 @@ The sim's camera intrinsics, camera mount offset, tag size and stage distances a
 | Service | Type | Node | Description |
 |---|---|---|---|
 | `/up/apriltag_detection/enable` | `std_srvs/SetBool` | detection | Called by `apriltag_control`; `true` subscribes to the camera, `false` unsubscribes |
+| `/check_mcl_if_trigger` | `std_srvs/Trigger` | G7+ AMCL | Called by `apriltag_control`; `success=true` means AMCL is running |
+| `/close_amcl`, `/open_amcl` | `std_srvs/Empty` | G7+ AMCL | Called by `apriltag_control` at goal start / end |
+| `/g7_plc/set_disable_lidar_safety` | `std_srvs/SetBool` | G7+ PLC bridge | Called by `apriltag_control`; `true` before Stage 2, `false` at goal end. `success` is the confirmed write |
 
 ## Actions
 
 | Action | Type | Description |
 |---|---|---|
-| `/up/start_tracking` | `apriltag_interfaces/action/StartTracking` | Served by `apriltag_control`. `start: true` enables detection, resets controller state and tracks until aligned (succeed) or the tag is lost (abort); `start: false` pauses and publishes a zero velocity command. Detection is disabled whenever a goal ends |
+| `/up/start_tracking` | `apriltag_interfaces/action/StartTracking` | Served by `apriltag_control`. `start: true` closes AMCL, enables detection, resets controller state and tracks until aligned (succeed) or the tag is lost / a service fails (abort); `start: false` stops the running goal and publishes a zero velocity command. Whenever a goal ends, detection is disabled and lidar safety / AMCL are restored. Feedback: `tracking: x_err=… y_err=… yaw_err=… stage=… amcl=… lidar_safety=…` |
 
 ### TF Transforms
 
 Broadcasts `camera_frame → apriltag_<tag_id>` for each detected tag.
 
+## Logging
+
+`apriltag_control` prefixes its logs so they can be filtered, e.g. `grep '\[request\]'`:
+
+| Prefix | When |
+|---|---|
+| `[action] goal received / accepted`, `[action] cancel requested` | Goal and cancel requests |
+| `[request]` / `[response]` | Every service call (content, and response time) |
+| `[publish]` | `/cmd_vel_nav` commands: stops always, control commands at most once per second |
+| `[action] feedback` | At most once per second |
+| `[action] result` | Goal end with status, success and message |
+
+The once-per-second limit is `LOG_THROTTLE_SEC` in `control_node.py`.
+
 ## Configuration
 
-Parameters are set in `AprilTagDetectionNode.__init__()` (`apriltag/detection_node.py`: `tag_size`, tag family) and `AprilTagControlNode.__init__()` (`apriltag/control_node.py`: everything else):
+Parameters are hard-coded in `AprilTagDetectionNode.__init__()` (`apriltag/detection_node.py`) and `AprilTagControlNode.__init__()` (`apriltag/control_node.py`). Check the first two against the real robot before running on it:
 
-| Parameter | Default | Description |
-|---|---|---|
-| `tag_size` | `0.019` m | **Must match the physical tag size** |
-| `desired_distance` | `0.02` m | Target standoff distance from the tag |
-| `max_vx`, `max_vy` | `1.0` m/s | Linear velocity saturation |
-| `max_vw` | `2.0` rad/s | Angular velocity saturation |
-| `max_dt` | `0.2` s | Timestep cap (handles frame drops) |
-| `lost_target_timeout` | `0.6` s | Time before safe-stop on tag loss |
-| Tag family | `tag36h11` | AprilTag family |
-| LQR Q weights | `(8.0, 8.0, 5.0)` | State cost: x, y, yaw |
-| LQR R weights | `(1.0, 1.0, 0.6)` | Control cost: vx, vy, vw |
-| `yaw_align_threshold` | `0.12` rad (~7°) | Threshold to switch from align to translate stage |
-| `smooth_tau` | `0.25` s | Reference trajectory smoothing time constant |
+| Parameter | Value | Where | Description |
+|---|---|---|---|
+| `tag_size` | `0.0635` m | `detection_node.py` | **Edge of the tag's black square (8 × 8 cells, without the white border). Must match the printed tag** |
+| `camera_y_offset` | `0.026` m (= `0.036` mount + `y_offset` `-0.01` trim) | `control_node.py` | Camera lateral offset from the robot centre line, + = left |
+| Tag family | `tag36h11` | `detection_node.py` | AprilTag family |
+| `stage1_distance` | `0.50` m | `control_node.py` | Stage 1 target distance to the tag |
+| `stage2_distance` | `0.28` m | `control_node.py` | Stage 2 (final) target distance to the tag |
+| `stop_x/y/yaw_error_tolerance` | `0.05` m / `0.05` m / `0.05` rad | `control_node.py` | A stage is aligned when all errors stay within these |
+| `stop_hold_seconds` | `1.0` s | `control_node.py` | ... for this long |
+| `max_vx`, `max_vy` | `0.5` m/s | `control_node.py` | Linear velocity saturation |
+| `max_vw` | `0.5` rad/s | `control_node.py` | Angular velocity saturation |
+| `max_dt` | `0.2` s | `control_node.py` | Timestep cap (handles frame drops) |
+| `lost_target_timeout` | `1.0` s | `control_node.py` | No tag pose for this long → safe stop, goal aborted |
+| `smooth_tau` | `0.5` s | `control_node.py` (`TrajectoryPlanner`) | Reference smoothing time constant |
+| LQR Q weights | `(1.0, 1.0, 0.5)` | `control.py` default | State cost: x, y, yaw |
+| LQR R weights | `(3.0, 1.0, 3.0)` | `control_node.py` | Control cost: vx, vy, vw (vy is penalised least, so lateral correction is fastest) |
+| `detection_service_timeout` | `2.0` s | `control_node.py` | Wait for `apriltag_detection/enable` |
+
+ROS parameters of `apriltag_control`:
+
+| Parameter | Default |
+|---|---|
+| `manage_amcl_and_lidar_safety` | `true` (`false` skips every AMCL and lidar safety call; tracking is never blocked by them) |
+| `amcl_check_service` | `/check_mcl_if_trigger` |
+| `amcl_close_service` | `/close_amcl` |
+| `amcl_open_service` | `/open_amcl` |
+| `lidar_safety_service` | `/g7_plc/set_disable_lidar_safety` |
+| `external_service_timeout` | `5.0` s (wait for service + wait for response, each) |
 
 ## Project Structure
 
@@ -204,7 +260,7 @@ apriltag_ws/
 │       │   ├── __init__.py
 │       │   ├── detection_node.py        # apriltag_detection node
 │       │   ├── control_node.py          # apriltag_control node (orchestrator)
-│       │   ├── control.py               # PID, LQR, and TrajectoryPlanner
+│       │   ├── control.py               # TrajectoryPlanner and LQR trackers
 │       │   ├── domain/
 │       │   │   ├── app_types.py         # Shared dataclasses
 │       │   │   └── math_utils.py        # Math utilities and frame conversions
@@ -216,18 +272,26 @@ apriltag_ws/
 │       │       ├── control_flow.py      # Control pipeline steps
 │       │       ├── safety_guard.py      # Target-loss watchdog logic
 │       │       └── target_flow.py       # Target selection
+│       ├── launch/
+│       │   ├── april_tag.launch.py                # camera + detection + control (real robot)
+│       │   └── test_virtual_tracking.launch.py    # virtual end-to-end test
+│       ├── tools/
+│       │   ├── print_tag_pose.py
+│       │   └── virtual_tracking_sim.py  # virtual camera / AMR / fake G7+ services + dashboard
 │       └── test/
 └── README.md
 ```
 
 ## Control Architecture
 
-### Trajectory Planner (two stages)
+### Docking Stages
 
-1. **`align`** — Holds position reference fixed and drives yaw error to zero. Transitions to `translate` when `|yaw_error| ≤ 0.12 rad`.
-2. **`translate`** — Drives x/y/yaw errors to zero. Reverts to `align` if yaw drifts beyond `1.5 × threshold`.
+1. **Stage 1** — track to `stage1_distance` (0.50 m). When all errors stay within tolerance for `stop_hold_seconds`, the robot stops and the lidar safety field is disabled.
+2. **Stage 2** — track to `stage2_distance` (0.28 m). When converged the robot stops and the goal succeeds.
 
-First-order smoothing (`smooth_tau = 0.25 s`) is applied to reference transitions.
+### Trajectory Planner
+
+The reference for x, y and yaw starts at the current error and slides toward zero on all three axes at once, with first-order smoothing (`smooth_tau = 0.5 s`). It is reset at the start of each stage.
 
 ### LQR Controller
 

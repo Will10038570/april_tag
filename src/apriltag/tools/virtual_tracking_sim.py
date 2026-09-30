@@ -9,7 +9,10 @@ apriltag_detection and apriltag_control nodes run unmodified:
   /cmd_vel_nav;
 - a synthetic camera image of the tag is rendered from the AMR/tag relative
   pose and published with camera_info, so apriltag_detection really detects it;
-- Start sends the start_tracking goal and the run lasts until the action returns.
+- Start sends the start_tracking goal and the run lasts until the action returns;
+- a fake G7+ node (FakeG7Services) stands in for AMCL and the PLC lidar safety.
+  It only keeps two bool flags, switched and reported through the same services
+  apriltag_control calls on the robot, so the call order and restores can be checked.
 
 The OpenCV dashboard shows a top view (drag the AMR to set the initial pose),
 the camera image, pose errors (ground truth vs. controller feedback) and the
@@ -45,6 +48,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
+from std_srvs.srv import Empty, SetBool, Trigger
 
 from apriltag.domain.math_utils import optical_to_control_error
 
@@ -146,6 +150,60 @@ def render_camera_image(board: np.ndarray, t: np.ndarray, r_mat: np.ndarray, tag
 
 
 # --------------------------------------------------------------------------
+# Fake G7+ AMCL / lidar safety
+# --------------------------------------------------------------------------
+
+class FakeG7Services(Node):
+    """Bool-only stand-in for dev_amcl and the PLC lidar safety.
+
+    No localization or safety function; it just records what apriltag_control
+    asked for, so the sim can show and check the state.
+    """
+
+    def __init__(self):
+        super().__init__('fake_g7_services')
+        self.lock = threading.Lock()
+        self.amcl_on = True
+        self.lidar_safety_disabled = False
+        self.create_service(Trigger, '/check_mcl_if_trigger', self._on_check_amcl)
+        self.create_service(Empty, '/close_amcl', self._on_close_amcl)
+        self.create_service(Empty, '/open_amcl', self._on_open_amcl)
+        self.create_service(SetBool, '/g7_plc/set_disable_lidar_safety', self._on_lidar_safety)
+
+    def state(self) -> Tuple[bool, bool]:
+        with self.lock:
+            return self.amcl_on, self.lidar_safety_disabled
+
+    def _on_check_amcl(self, _request, response):
+        with self.lock:
+            response.success = self.amcl_on
+        response.message = 'amcl is on' if response.success else 'amcl is off'
+        self.get_logger().info(f'check_mcl_if_trigger -> {response.message}')
+        return response
+
+    def _on_close_amcl(self, _request, response):
+        with self.lock:
+            self.amcl_on = False
+        self.get_logger().info('close_amcl -> amcl off')
+        return response
+
+    def _on_open_amcl(self, _request, response):
+        with self.lock:
+            self.amcl_on = True
+        self.get_logger().info('open_amcl -> amcl on')
+        return response
+
+    def _on_lidar_safety(self, request, response):
+        with self.lock:
+            self.lidar_safety_disabled = bool(request.data)
+        response.success = True
+        response.message = 'confirmed: true'
+        state = 'disabled' if request.data else 'enabled'
+        self.get_logger().info(f'set_disable_lidar_safety data={request.data} -> lidar safety {state}')
+        return response
+
+
+# --------------------------------------------------------------------------
 # Simulation node
 # --------------------------------------------------------------------------
 
@@ -162,8 +220,9 @@ class RunLog:
 
 class VirtualTrackingSim(Node):
 
-    def __init__(self):
+    def __init__(self, fake_g7: FakeG7Services):
         super().__init__('virtual_tracking_sim')
+        self.fake_g7 = fake_g7
 
         def param(name, default):
             return self.declare_parameter(name, default).value
@@ -274,7 +333,9 @@ class VirtualTrackingSim(Node):
         with self.lock:
             if self.run_start_ros is None or Time.from_msg(msg.stamp) < self.run_start_ros:
                 return
-            self.control_log = (self.control_log + [msg.msg])[-3:]
+            # skip the periodic cmd_vel / feedback logs so state changes stay visible
+            if not msg.msg.startswith(('[publish]', '[action] feedback')):
+                self.control_log = (self.control_log + [msg.msg])[-3:]
             if self.phase in ACTIVE_PHASES and msg.msg.startswith('Stage 1 aligned') and self.stage == 1:
                 self.stage = 2
                 self.run.stage2_t = time.monotonic() - self.run_start
@@ -463,6 +524,14 @@ class VirtualTrackingSim(Node):
             summary += (f' | final GT err x={final[4]:+.4f} y={final[5]:+.4f} yaw={final[6]:+.4f}'
                         f' | max |cmd| vx={max_cmd[0]:.3f} vy={max_cmd[1]:.3f} wz={max_cmd[2]:.3f}')
         self.get_logger().info(summary)
+        # every goal end must leave AMCL on and lidar safety enabled
+        amcl_on, lidar_safety_disabled = self.fake_g7.state()
+        restore = (f"after goal: amcl={'on' if amcl_on else 'off'} "
+                   f"lidar_safety={'disabled' if lidar_safety_disabled else 'enabled'}")
+        if amcl_on and not lidar_safety_disabled:
+            self.get_logger().info(f'{restore} (restored)')
+        else:
+            self.get_logger().error(f'{restore} (NOT restored)')
         self.get_logger().info(f'Run saved to {base}_*.csv')
         with self.lock:
             self.png_request = base + '.png'
@@ -471,6 +540,7 @@ class VirtualTrackingSim(Node):
 
     def snapshot(self) -> dict:
         now = time.monotonic()
+        amcl_on, lidar_safety_disabled = self.fake_g7.state()
         with self.lock:
             if self.run_start is None:
                 elapsed = 0.0
@@ -494,6 +564,8 @@ class VirtualTrackingSim(Node):
                 'image': self.marked_image if marked_fresh else self.raw_image,
                 'image_is_marked': marked_fresh,
                 'tag_visible': self.tag_visible,
+                'amcl_on': amcl_on,
+                'lidar_safety_disabled': lidar_safety_disabled,
             }
 
     def is_running(self) -> bool:
@@ -784,6 +856,10 @@ class Dashboard:
         sx = x0 + 420
         put(img, f'{phase}', (sx, y0 + 34), phase_color, 0.8, 2)
         put(img, f'stage {snap["stage"]}   elapsed {snap["elapsed"]:.2f}s', (sx + 190, y0 + 32), TEXT, 0.55)
+        put(img, f"AMCL {'ON' if snap['amcl_on'] else 'OFF'}", (sx + 520, y0 + 32),
+            (80, 220, 80) if snap['amcl_on'] else (80, 180, 255), 0.55, 2)
+        put(img, f"lidar safety {'DISABLED' if snap['lidar_safety_disabled'] else 'ENABLED'}", (sx + 640, y0 + 32),
+            (80, 80, 255) if snap['lidar_safety_disabled'] else (80, 220, 80), 0.55, 2)
 
         cmd = snap['cmd']
         gt = self.sim.ground_truth_error(snap['pose'], snap['stage'])
@@ -868,9 +944,11 @@ class Dashboard:
 
 def main(args=None):
     rclpy.init(args=args)
-    sim = VirtualTrackingSim()
+    fake_g7 = FakeG7Services()
+    sim = VirtualTrackingSim(fake_g7)
     executor = MultiThreadedExecutor()
     executor.add_node(sim)
+    executor.add_node(fake_g7)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
 
@@ -908,6 +986,7 @@ def main(args=None):
         cv2.destroyAllWindows()
         executor.shutdown()
         sim.destroy_node()
+        fake_g7.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
