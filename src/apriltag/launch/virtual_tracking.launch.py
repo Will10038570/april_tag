@@ -1,11 +1,11 @@
 """End-to-end virtual test: real apriltag_detection + apriltag_control, with the
-camera, the AMR and the G7+ AMCL / lidar safety services replaced by
+camera, the AMR and the G7+ AMCL services / lidar safety topic replaced by
 tools/virtual_tracking_sim.
 
 Runs in ROS domain 65, the same as the robot: apriltag_control publishes the
-absolute /cmd_vel_nav and calls the AMCL / lidar safety services, so unplug the
-robot's network cable before running it. CLI debugging:
-    ROS_DOMAIN_ID=65 ros2 topic echo /cmd_vel_nav
+absolute /cmd_vel, /pre_cmd_vel and /g7_plc/disable_lidar_safety and calls the AMCL
+services, so unplug the robot's network cable before running it. CLI debugging:
+    ROS_DOMAIN_ID=65 ros2 topic echo /cmd_vel
 """
 
 from launch import LaunchDescription
@@ -29,6 +29,10 @@ def generate_launch_description():
         DeclareLaunchArgument('log_dir', default_value='virtual_tracking_logs'),
         DeclareLaunchArgument('manage_amcl_and_lidar_safety', default_value='true',
                               description='false: apriltag_control skips AMCL / lidar safety'),
+        # simulation's own stage distances, independent of launch/april_tag.launch.py;
+        # the sim reads them back from apriltag_control
+        DeclareLaunchArgument('stage1_distance', default_value='0.50'),
+        DeclareLaunchArgument('stage2_distance', default_value='0.28'),
     ]
 
     apriltag_detection = Node(
@@ -48,6 +52,8 @@ def generate_launch_description():
         parameters=[{
             'manage_amcl_and_lidar_safety': ParameterValue(
                 LaunchConfiguration('manage_amcl_and_lidar_safety'), value_type=bool),
+            'stage1_distance': ParameterValue(LaunchConfiguration('stage1_distance'), value_type=float),
+            'stage2_distance': ParameterValue(LaunchConfiguration('stage2_distance'), value_type=float),
         }],
     )
 
@@ -73,6 +79,9 @@ def generate_launch_description():
     return LaunchDescription([
         *args,
         SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id')),
+        # shorter log time: '2026-09-30 09:13:00.383' instead of epoch seconds
+        SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT',
+                               '[{severity}] [{date_time_with_ms}] [{name}]: {message}'),
         apriltag_detection,
         apriltag_control,
         virtual_tracking_sim,

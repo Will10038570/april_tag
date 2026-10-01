@@ -6,13 +6,14 @@ apriltag_detection and apriltag_control nodes run unmodified:
 
 - a virtual AprilTag (tag36h11) stands at the world origin, facing -x;
 - a virtual holonomic AMR carries a camera; its pose is integrated from
-  /cmd_vel_nav;
+  /cmd_vel (Stage 1) and /pre_cmd_vel (Stage 2);
 - a synthetic camera image of the tag is rendered from the AMR/tag relative
   pose and published with camera_info, so apriltag_detection really detects it;
 - Start sends the start_tracking goal and the run lasts until the action returns;
 - a fake G7+ node (FakeG7Services) stands in for AMCL and the PLC lidar safety.
-  It only keeps two bool flags, switched and reported through the same services
-  apriltag_control calls on the robot, so the call order and restores can be checked.
+  It only keeps two bool flags, switched through the same AMCL services and lidar
+  safety topic apriltag_control uses on the robot, so the call order and restores
+  can be checked.
 
 The OpenCV dashboard shows a top view (drag the AMR to set the initial pose),
 the camera image, pose errors (ground truth vs. controller feedback) and the
@@ -42,13 +43,15 @@ from action_msgs.msg import GoalStatus
 from apriltag_interfaces.action import StartTracking
 from geometry_msgs.msg import Twist
 from rcl_interfaces.msg import Log
+from rcl_interfaces.srv import GetParameters
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
-from std_srvs.srv import Empty, SetBool, Trigger
+from std_msgs.msg import Bool
+from std_srvs.srv import Empty, Trigger
 
 from apriltag.domain.math_utils import optical_to_control_error
 
@@ -168,7 +171,7 @@ class FakeG7Services(Node):
         self.create_service(Trigger, '/check_mcl_if_trigger', self._on_check_amcl)
         self.create_service(Empty, '/close_amcl', self._on_close_amcl)
         self.create_service(Empty, '/open_amcl', self._on_open_amcl)
-        self.create_service(SetBool, '/g7_plc/set_disable_lidar_safety', self._on_lidar_safety)
+        self.create_subscription(Bool, '/g7_plc/disable_lidar_safety', self._on_lidar_safety, 10)
 
     def state(self) -> Tuple[bool, bool]:
         with self.lock:
@@ -193,14 +196,11 @@ class FakeG7Services(Node):
         self.get_logger().info('open_amcl -> amcl on')
         return response
 
-    def _on_lidar_safety(self, request, response):
+    def _on_lidar_safety(self, msg):
         with self.lock:
-            self.lidar_safety_disabled = bool(request.data)
-        response.success = True
-        response.message = 'confirmed: true'
-        state = 'disabled' if request.data else 'enabled'
-        self.get_logger().info(f'set_disable_lidar_safety data={request.data} -> lidar safety {state}')
-        return response
+            self.lidar_safety_disabled = bool(msg.data)
+        state = 'disabled' if msg.data else 'enabled'
+        self.get_logger().info(f'disable_lidar_safety data={msg.data} -> lidar safety {state}')
 
 
 # --------------------------------------------------------------------------
@@ -214,7 +214,7 @@ class RunLog:
     # controller feedback: (t, x_err, y_err, yaw_err)
     feedback: List[tuple] = field(default_factory=list)
     stage2_t: Optional[float] = None
-    # every /cmd_vel_nav message as received: (t, vx, vy, wz)
+    # every /cmd_vel and /pre_cmd_vel message as received: (t, vx, vy, wz)
     cmd_raw: List[tuple] = field(default_factory=list)
 
 
@@ -229,7 +229,11 @@ class VirtualTrackingSim(Node):
 
         # must match apriltag_detection / apriltag_control
         self.tag_size = float(param('tag_size', 0.0635))
-        self.stage_distances = (float(param('stage1_distance', 0.50)), float(param('stage2_distance', 0.28)))
+        # stage distances are read from apriltag_control at startup, so the sim
+        # always follows its parameters; these values only fill the dashboard
+        # until then, and no goal is started before they are read
+        self.stage_distances = (0.50, 0.28)
+        self.stage_distances_known = False
         self.tag_id = int(param('tag_id', 0))
 
         # virtual camera (RealSense D435 colour at 640x480 is roughly fx = fy = 615)
@@ -284,10 +288,15 @@ class VirtualTrackingSim(Node):
         image_qos = QoSProfile(history=QoSHistoryPolicy.KEEP_LAST, depth=1)
         self.image_pub = self.create_publisher(Image, 'camera/camera/color/image_raw', image_qos)
         self.info_pub = self.create_publisher(CameraInfo, 'camera/camera/color/camera_info', 10)
-        self.create_subscription(Twist, '/cmd_vel_nav', self._on_cmd_vel, 10)
+        # apriltag_control: Stage 1 on /cmd_vel, Stage 2 on /pre_cmd_vel
+        self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
+        self.create_subscription(Twist, '/pre_cmd_vel', self._on_cmd_vel, 10)
         self.create_subscription(Image, 'apriltag/marked_image', self._on_marked_image, image_qos)
         self.create_subscription(Log, '/rosout', self._on_rosout, 100)
         self.action_client = ActionClient(self, StartTracking, 'start_tracking')
+        self.control_param_client = self.create_client(GetParameters, 'apriltag_control/get_parameters')
+        self._control_param_future = None
+        self._control_param_timer = self.create_timer(1.0, self._fetch_stage_distances)
 
         self._last_physics = time.monotonic()
         self.create_timer(1.0 / float(param('physics_rate', 50.0)), self._physics_step)
@@ -399,8 +408,30 @@ class VirtualTrackingSim(Node):
 
     # ---- action -----------------------------------------------------------
 
+    def _fetch_stage_distances(self):
+        """Read stage1/2_distance from apriltag_control once it is up."""
+        if self._control_param_future is not None or not self.control_param_client.service_is_ready():
+            return
+        request = GetParameters.Request(names=['stage1_distance', 'stage2_distance'])
+        self._control_param_future = self.control_param_client.call_async(request)
+        self._control_param_future.add_done_callback(self._on_stage_distances)
+
+    def _on_stage_distances(self, future):
+        response = future.result()
+        values = [v.double_value for v in response.values] if response is not None else []
+        if len(values) != 2:
+            self.get_logger().warn('Cannot read stage distances from apriltag_control, retrying.')
+            self._control_param_future = None
+            return
+        self._control_param_timer.cancel()
+        with self.lock:
+            self.stage_distances = (values[0], values[1])
+            self.stage_distances_known = True
+        self.get_logger().info(
+            f'Stage distances from apriltag_control: stage1={values[0]:.2f}m stage2={values[1]:.2f}m')
+
     def _try_auto_start(self):
-        if self.action_client.server_is_ready():
+        if self.stage_distances_known and self.action_client.server_is_ready():
             self._auto_start_timer.cancel()
             self.start()
 
@@ -410,6 +441,9 @@ class VirtualTrackingSim(Node):
                 return
             if not self.action_client.server_is_ready():
                 self.result_message = 'start_tracking action server not available.'
+                return
+            if not self.stage_distances_known:
+                self.result_message = 'Stage distances not read from apriltag_control yet.'
                 return
             self.initial_pose = self.pose.copy()
             self.run = RunLog()
@@ -831,7 +865,7 @@ class Dashboard:
         raw_dots = [(cmd_raw[:, 0], cmd_raw[:, 1 + i], shade(c, 1.35), 2, True)
                     for i, c in enumerate((C_X, C_Y, C_YAW))]
         draw_plot(
-            img, CMD_RECT, 'cmd_vel_nav   thick = applied by sim (50Hz),  thin+dot = raw from control',
+            img, CMD_RECT, 'cmd_vel   thick = applied by sim (50Hz),  thin+dot = raw from control',
             t_max, (-0.6, 0.6),
             lines=applied + raw_lines, dots=raw_dots,
             hlines=[(0.5, C_LIMIT), (-0.5, C_LIMIT)], vlines=vlines,

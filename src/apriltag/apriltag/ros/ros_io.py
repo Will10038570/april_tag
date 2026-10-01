@@ -6,7 +6,6 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
-from nav_msgs.msg import Path
 from sensor_msgs.msg import Image
 
 from apriltag.domain.app_types import CameraIntrinsics
@@ -89,22 +88,6 @@ def publish_twist(cmd_pub, vx: float, vy: float, vw: float) -> None:
     twist.linear.y = float(vy)
     twist.angular.z = float(vw)
     cmd_pub.publish(twist)
-
-
-def publish_trajectory(traj_pub, pose_msg: PoseStamped) -> None:
-    """Publish a short two-point trajectory (origin -> tag pose)."""
-    point = PoseStamped()
-    point.header = pose_msg.header
-    point.pose = pose_msg.pose
-
-    origin = PoseStamped()
-    origin.header = pose_msg.header
-    origin.pose.orientation.w = 1.0
-
-    path_msg = Path()
-    path_msg.header = pose_msg.header
-    path_msg.poses = [origin, point]
-    traj_pub.publish(path_msg)
 
 
 def publish_pose_and_tf(

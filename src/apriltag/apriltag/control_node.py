@@ -7,22 +7,22 @@ import numpy as np
 import rclpy
 from apriltag_interfaces.action import StartTracking
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Path
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
+from std_msgs.msg import Bool
 from std_srvs.srv import Empty, SetBool, Trigger
 
 from apriltag.control import LQRTracker, TrajectoryPlanner
 from apriltag.domain.math_utils import optical_to_control_error, quaternion_to_rotation_matrix
-from apriltag.ros.ros_io import publish_trajectory, publish_twist
+from apriltag.ros.ros_io import publish_twist
 from apriltag.runtime.control_flow import publish_control
 from apriltag.runtime.safety_guard import handle_target_lost
 
-# high-rate messages (cmd_vel_nav, action feedback) are logged at most once per this period
+# high-rate messages (cmd_vel, action feedback) are logged at most once per this period
 LOG_THROTTLE_SEC = 1.0
 
 
@@ -39,15 +39,17 @@ class AprilTagControlNode(Node):
 
     Owns the start_tracking action. On a start goal it closes AMCL, enables
     apriltag_detection, tracks /apriltag_pose with TrajectoryPlanner + LQR and
-    publishes /cmd_vel_nav. Before Stage 2 it stops and disables the PLC lidar
+    publishes /cmd_vel in Stage 1 and /pre_cmd_vel (G7+ precision mode, the
+    motors wait until the steering is within 5 deg) in Stage 2. Before Stage 2 it stops and disables the PLC lidar
     safety field. Whenever the goal ends (succeeded, failed, cancelled or
-    stopped) it stops the robot, disables detection and restores whatever it
-    changed: lidar safety first, then AMCL. With manage_amcl_and_lidar_safety
-    set to false it skips all AMCL and lidar safety calls.
+    stopped) it stops the robot, disables detection, enables lidar safety and
+    restores AMCL if it closed it. With manage_amcl_and_lidar_safety set to
+    false it skips all AMCL and lidar safety calls.
 
-    AMCL and lidar safety are external services. This node only calls them at
-    the right time and checks their responses; what the providers actually do
-    with a request is outside this package.
+    AMCL is switched through external services whose responses are checked.
+    Lidar safety follows the G7+ AutoCharging way: a Bool is published on the
+    PLC bridge topic with no read-back, so it cannot be confirmed here. What
+    the providers actually do with a request is outside this package.
     """
 
     def __init__(self):
@@ -57,12 +59,13 @@ class AprilTagControlNode(Node):
                                                  'apriltag_pose',
                                                  self.pose_callback,
                                                  1)
-        self.traj_pub = self.create_publisher(Path, 'apriltag_trajectory', 10)
 
         ## AprilTag distance parameters
-        # two-stage desired forward distances to tag
-        self.stage1_distance = 0.50   # 第一階段：50 cm 對齊
-        self.stage2_distance = 0.28   # 第二階段：28.5 cm 對齊
+        # two-stage desired forward distances to tag (m), ROS parameters
+        self.stage1_distance = float(self.declare_parameter(
+            'stage1_distance', 0.50).value)   # 第一階段：50 cm 對齊
+        self.stage2_distance = float(self.declare_parameter(
+            'stage2_distance', 0.28).value)   # 第二階段：28 cm 對齊
         self.desired_distance = self.stage1_distance
         # camera lateral offset in AMR control frame (+left / -right)
         # self.camera_y_offset = 0.036
@@ -75,11 +78,18 @@ class AprilTagControlNode(Node):
         self.trajectory_planner = TrajectoryPlanner(smooth_tau=0.5)
         # r_weights: R_vx=3.0 > R_vy=1.0 → K_vy > K_vx (lateral faster than forward)
         self.lqr_tracker = LQRTracker(r_weights=(3.0, 1.0, 3.0))
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel_nav', 10)
+        # Stage 1: normal cmd_vel; Stage 2: G7+ precision cmd_vel, same as the
+        # final approach of G7+ AutoCharging
+        self.stage1_cmd_vel_topic = self.declare_parameter(
+            'stage1_cmd_vel_topic', '/cmd_vel').value
+        self.stage2_cmd_vel_topic = self.declare_parameter(
+            'stage2_cmd_vel_topic', '/pre_cmd_vel').value
+        self.stage1_cmd_pub = self.create_publisher(Twist, self.stage1_cmd_vel_topic, 10)
+        self.stage2_cmd_pub = self.create_publisher(Twist, self.stage2_cmd_vel_topic, 10)
         # capture time (s) of the last pose used for control, for dt
         self._last_stamp = None
-        self.max_vx = 0.05
-        self.max_vy = 0.05
+        self.max_vx = 0.1
+        self.max_vy = 0.1
         self.max_vw = 0.05
         self.max_dt = 0.2
         self.latest_plan = None
@@ -133,9 +143,10 @@ class AprilTagControlNode(Node):
             'amcl_close_service', '/close_amcl').value
         self.amcl_open_service = self.declare_parameter(
             'amcl_open_service', '/open_amcl').value
-        # SetBool data=True disables the lidar safety field; success is the write result
-        self.lidar_safety_service = self.declare_parameter(
-            'lidar_safety_service', '/g7_plc/set_disable_lidar_safety').value
+        # Bool data=True disables the lidar safety field, False enables it;
+        # fire-and-forget, same as G7+ AutoCharging
+        self.lidar_safety_topic = self.declare_parameter(
+            'lidar_safety_topic', '/g7_plc/disable_lidar_safety').value
         self.external_service_timeout = float(self.declare_parameter(
             'external_service_timeout', 5.0).value)
 
@@ -145,14 +156,13 @@ class AprilTagControlNode(Node):
             Empty, self.amcl_close_service, callback_group=self._client_cb_group)
         self.amcl_open_client = self.create_client(
             Empty, self.amcl_open_service, callback_group=self._client_cb_group)
-        self.lidar_safety_client = self.create_client(
-            SetBool, self.lidar_safety_service, callback_group=self._client_cb_group)
+        self.lidar_safety_pub = self.create_publisher(Bool, self.lidar_safety_topic, 1)
 
-        # what this node changed and must restore; kept across goals if a
+        # AMCL this node closed and must open again; kept across goals if a
         # restore fails, so the next goal end or node shutdown retries it
         self._amcl_closed_by_us = False
-        self._lidar_safety_disabled_by_us = False
-        # last state reported by the providers, for feedback and logs
+        # for feedback and logs: AMCL as reported by its provider, lidar safety
+        # as last published (not confirmed by the PLC)
         self._amcl_state = 'unknown'          # on / off / unknown / unmanaged
         self._lidar_safety_state = 'unknown'  # enabled / disabled / unknown / unmanaged
         self._restore_lock = threading.Lock()
@@ -178,22 +188,26 @@ class AprilTagControlNode(Node):
             'Control is paused. Send the start_tracking action to start.'
         )
 
+    def _publish_zero_on_all(self, label: str) -> None:
+        # stops go to both topics, so the robot stops whichever stage is active
+        for pub in (self.stage1_cmd_pub, self.stage2_cmd_pub):
+            publish_twist(pub, 0.0, 0.0, 0.0)
+            self.get_logger().info(f'[publish] {pub.topic_name} {label} vx=0 vy=0 wz=0')
+
     def _publish_stop_command(self) -> None:
-        stop_msg = Twist()
-        self.cmd_pub.publish(stop_msg)
-        self.get_logger().info(f'[publish] {self.cmd_pub.topic_name} stop vx=0 vy=0 wz=0')
+        self._publish_zero_on_all('stop')
 
     def _publish_control_command(self, vx: float, vy: float, vw: float) -> None:
-        publish_twist(self.cmd_pub, vx, vy, vw)
+        pub = self.stage2_cmd_pub if self._alignment_stage == 2 else self.stage1_cmd_pub
+        publish_twist(pub, vx, vy, vw)
         self.get_logger().info(
-            f'[publish] {self.cmd_pub.topic_name} vx={vx:+.3f} vy={vy:+.3f} wz={vw:+.3f} '
+            f'[publish] {pub.topic_name} vx={vx:+.3f} vy={vy:+.3f} wz={vw:+.3f} '
             f'stage={self._alignment_stage}',
             throttle_duration_sec=LOG_THROTTLE_SEC,
         )
 
     def _safe_stop(self, reset_planner: bool = False) -> None:
-        publish_twist(self.cmd_pub, 0.0, 0.0, 0.0)
-        self.get_logger().info(f'[publish] {self.cmd_pub.topic_name} safe stop vx=0 vy=0 wz=0')
+        self._publish_zero_on_all('safe stop')
         if reset_planner:
             self.trajectory_planner.reset()
             self.lqr_tracker.reset()
@@ -281,36 +295,23 @@ class AprilTagControlNode(Node):
             self._amcl_closed_by_us = False
         return True
 
-    def _set_lidar_safety_disabled(self, disabled: bool) -> bool:
-        """Write the PLC lidar safety flag; return True if the provider confirms it."""
-        action = 'disable' if disabled else 'enable'
-        if disabled:
-            # mark before the call, same reason as AMCL
-            self._lidar_safety_disabled_by_us = True
-        response = self._call_service(
-            self.lidar_safety_client, SetBool.Request(data=disabled),
-            self.external_service_timeout, f'{action} lidar safety')
-        if response is None:
-            self._lidar_safety_state = 'unknown'
-            return False
-        if not response.success:
-            self._lidar_safety_state = 'unknown'
-            self.get_logger().error(f'Cannot {action} lidar safety: {response.message}')
-            return False
-
+    def _set_lidar_safety_disabled(self, disabled: bool) -> None:
+        """Publish the PLC disable-lidar-safety flag once (G7+ way: no read-back)."""
+        self.lidar_safety_pub.publish(Bool(data=disabled))
         self._lidar_safety_state = 'disabled' if disabled else 'enabled'
-        self.get_logger().info(f'Lidar safety {self._lidar_safety_state} ({response.message})')
-        if not disabled:
-            self._lidar_safety_disabled_by_us = False
-        return True
+        self.get_logger().info(
+            f'[publish] {self.lidar_safety_pub.topic_name} data={disabled} '
+            f'({"disable" if disabled else "enable"} lidar safety, not confirmed)'
+        )
 
     def _restore_external_state(self) -> bool:
-        """Undo what this node changed: lidar safety first, then AMCL."""
+        """Enable lidar safety, then open AMCL if this node closed it."""
+        if not self.manage_amcl_and_lidar_safety:
+            return True
         with self._restore_lock:
             ok = True
-            if self._lidar_safety_disabled_by_us and not self._set_lidar_safety_disabled(False):
-                self.get_logger().error('Restore failed: lidar safety may still be disabled.')
-                ok = False
+            # always published at goal end, whether or not Stage 2 was reached
+            self._set_lidar_safety_disabled(False)
             if self._amcl_closed_by_us and not self._set_amcl_enabled(True):
                 self.get_logger().error('Restore failed: AMCL may still be closed.')
                 ok = False
@@ -450,17 +451,12 @@ class AprilTagControlNode(Node):
             return self._control_enabled and self._stage2_pending
 
     def _begin_stage2(self) -> None:
-        """Disable lidar safety while stopped, then switch to Stage 2 or fail the goal."""
-        if self.manage_amcl_and_lidar_safety and not self._set_lidar_safety_disabled(True):
-            if not self._is_control_enabled():
-                return  # goal already ended while waiting for the service
-            msg = 'Failed to disable lidar safety. Tracking stopped before Stage 2.'
-            self._pause_control(msg)
-            self._signal_tracking_complete(False, msg)
-            return
+        """Disable lidar safety while stopped, then switch to Stage 2."""
+        if self.manage_amcl_and_lidar_safety:
+            self._set_lidar_safety_disabled(True)
 
         with self._control_lock:
-            # target lost / cancelled while waiting for the service
+            # target lost / cancelled in the meantime
             if not (self._control_enabled and self._stage2_pending):
                 return
             self._stage2_pending = False
@@ -482,8 +478,8 @@ class AprilTagControlNode(Node):
         return self._restore_external_state() and ok
 
     def _goal_end_timeout(self) -> float:
-        # detection off + lidar safety + AMCL check/open/check, each wait + call
-        return 2.0 * (self.detection_service_timeout + 4 * self.external_service_timeout)
+        # detection off + AMCL check/open/check, each wait + call
+        return 2.0 * (self.detection_service_timeout + 3 * self.external_service_timeout)
 
     def shutdown(self) -> None:
         """End a running goal and restore external state before the node is destroyed."""
@@ -496,6 +492,8 @@ class AprilTagControlNode(Node):
             if not self._goal_idle.wait(timeout=self._goal_end_timeout()):
                 self.get_logger().error('Running goal did not end in time.')
         self._restore_external_state()
+        # give the lidar safety message time to go out before the node is destroyed
+        time.sleep(0.2)
 
     def _is_control_enabled(self) -> bool:
         with self._control_lock:
@@ -562,8 +560,6 @@ class AprilTagControlNode(Node):
         }
         self._latest_best_target = best_target
         self._last_target_time = now
-
-        publish_trajectory(self.traj_pub, msg)
 
         # stopped between the stages while lidar safety is being disabled;
         # keep the target watchdog fed but publish no motion

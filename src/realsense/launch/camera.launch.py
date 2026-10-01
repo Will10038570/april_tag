@@ -1,4 +1,5 @@
 from launch import LaunchDescription
+from launch.conditions import IfCondition
 from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -13,12 +14,18 @@ def generate_launch_description():
         DeclareLaunchArgument('enable_depth', default_value='false'),
         DeclareLaunchArgument('enable_ir1', default_value='false'),
         DeclareLaunchArgument('enable_ir2', default_value='false'),
+        # "width,height,fps" for rs_launch.py rgb_camera.color_profile
+        DeclareLaunchArgument('rgb_profile', default_value='1280,720,30'),
+        # cv2.imshow viewer; needs an X display, so off by default (headless)
+        DeclareLaunchArgument('enable_viewer', default_value='false'),
     ]
 
     enable_rgb = LaunchConfiguration('enable_rgb')
     enable_depth = LaunchConfiguration('enable_depth')
     enable_ir1 = LaunchConfiguration('enable_ir1')
     enable_ir2 = LaunchConfiguration('enable_ir2')
+    rgb_profile = LaunchConfiguration('rgb_profile')
+    enable_viewer = LaunchConfiguration('enable_viewer')
 
     realsense_driver = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -31,6 +38,7 @@ def generate_launch_description():
             'enable_depth': enable_depth,
             'enable_infra1': enable_ir1,
             'enable_infra2': enable_ir2,
+            'rgb_camera.color_profile': rgb_profile,
         }.items(),
     )
 
@@ -39,6 +47,7 @@ def generate_launch_description():
         executable='camera_viewer',
         name='realsense_camera_viewer',
         output='screen',
+        condition=IfCondition(enable_viewer),
         parameters=[{
             'enable_rgb': ParameterValue(enable_rgb, value_type=bool),
             'enable_depth': ParameterValue(enable_depth, value_type=bool),
