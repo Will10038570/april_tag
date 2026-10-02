@@ -6,10 +6,14 @@ apriltag_detection and apriltag_control nodes run unmodified:
 
 - a virtual AprilTag (tag36h11) stands at the world origin, facing -x;
 - a virtual holonomic AMR carries a camera; its pose is integrated from
-  /cmd_vel (Stage 1) and /pre_cmd_vel (Stage 2);
+  /cmd_vel (Stage 1) and /pre_cmd_vel (Stage 2 and leaving);
 - a synthetic camera image of the tag is rendered from the AMR/tag relative
   pose and published with camera_info, so apriltag_detection really detects it;
-- Start sends the start_tracking goal and the run lasts until the action returns;
+- Start sends the start_tracking goal. When it succeeds apriltag_control holds in
+  IN_POSITION (AMCL closed, lidar safety disabled, checked here as "held");
+  Leave then sends the leave_cs goal (headless: sent automatically) and the run
+  ends with its result, where AMCL and lidar safety must be restored. Stop in
+  IN_POSITION abandons the alignment (start_tracking start=False);
 - a fake G7+ node (FakeG7Services) stands in for AMCL and the PLC lidar safety.
   It only keeps two bool flags, switched through the same AMCL services and lidar
   safety topic apriltag_control uses on the robot, so the call order and restores
@@ -22,7 +26,8 @@ cmd_vel commands. Each finished run is saved as CSV + PNG.
 Controls:
     top view   drag AMR body = move, drag the round handle in front = rotate,
                mouse wheel or a / d = rotate 2 deg (only while not running)
-    keys       s = start, x = stop (cancel goal), r = reset to initial pose,
+    keys       s = start, l = leave (in IN_POSITION), x = stop (cancel goal, or
+               abandon in IN_POSITION), r = reset to initial pose,
                + / - = zoom top view, q or Esc = quit
 """
 
@@ -57,7 +62,12 @@ from apriltag.domain.math_utils import optical_to_control_error
 
 WINDOW_NAME = 'AprilTag virtual tracking'
 FEEDBACK_RE = re.compile(r'x_err=(\S+)\s+y_err=(\S+)\s+yaw_err=(\S+)')
-ACTIVE_PHASES = ('STARTING', 'RUNNING')
+# apriltag_control prefixes its log messages with '[stage <STATE>] : '
+STAGE_PREFIX_RE = re.compile(r'^\[stage [A-Z_0-9 ]+\] : ')
+# STARTING / RUNNING: start_tracking goal; IN_POSITION: waiting for leave;
+# LEAVING: leave_cs goal
+ACTIVE_PHASES = ('STARTING', 'RUNNING', 'IN_POSITION', 'LEAVING')
+STAGE_LABELS = {1: 'S1', 2: 'S2', 3: 'L'}
 
 
 # --------------------------------------------------------------------------
@@ -214,6 +224,7 @@ class RunLog:
     # controller feedback: (t, x_err, y_err, yaw_err)
     feedback: List[tuple] = field(default_factory=list)
     stage2_t: Optional[float] = None
+    leave_t: Optional[float] = None
     # every /cmd_vel and /pre_cmd_vel message as received: (t, vx, vy, wz)
     cmd_raw: List[tuple] = field(default_factory=list)
 
@@ -229,10 +240,11 @@ class VirtualTrackingSim(Node):
 
         # must match apriltag_detection / apriltag_control
         self.tag_size = float(param('tag_size', 0.0635))
-        # stage distances are read from apriltag_control at startup, so the sim
-        # always follows its parameters; these values only fill the dashboard
-        # until then, and no goal is started before they are read
-        self.stage_distances = (0.50, 0.28)
+        # stage / leave distances are read from apriltag_control at startup, so
+        # the sim always follows its parameters; these values only fill the
+        # dashboard until then, and no goal is started before they are read.
+        # Index stage - 1: Stage 1, Stage 2, leave (stage 3)
+        self.stage_distances = (0.50, 0.28, 0.40)
         self.stage_distances_known = False
         self.tag_id = int(param('tag_id', 0))
 
@@ -294,6 +306,7 @@ class VirtualTrackingSim(Node):
         self.create_subscription(Image, 'apriltag/marked_image', self._on_marked_image, image_qos)
         self.create_subscription(Log, '/rosout', self._on_rosout, 100)
         self.action_client = ActionClient(self, StartTracking, 'start_tracking')
+        self.leave_client = ActionClient(self, StartTracking, 'leave_cs')
         self.control_param_client = self.create_client(GetParameters, 'apriltag_control/get_parameters')
         self._control_param_future = None
         self._control_param_timer = self.create_timer(1.0, self._fetch_stage_distances)
@@ -339,13 +352,14 @@ class VirtualTrackingSim(Node):
     def _on_rosout(self, msg: Log):
         if not msg.name.endswith('apriltag_control'):
             return
+        text = STAGE_PREFIX_RE.sub('', msg.msg)
         with self.lock:
             if self.run_start_ros is None or Time.from_msg(msg.stamp) < self.run_start_ros:
                 return
             # skip the periodic cmd_vel / feedback logs so state changes stay visible
-            if not msg.msg.startswith(('[publish]', '[action] feedback')):
-                self.control_log = (self.control_log + [msg.msg])[-3:]
-            if self.phase in ACTIVE_PHASES and msg.msg.startswith('Stage 1 aligned') and self.stage == 1:
+            if not text.startswith(('[publish]', '[action] feedback')):
+                self.control_log = (self.control_log + [text])[-3:]
+            if self.phase in ACTIVE_PHASES and text.startswith('Stage 1 aligned') and self.stage == 1:
                 self.stage = 2
                 self.run.stage2_t = time.monotonic() - self.run_start
 
@@ -409,26 +423,27 @@ class VirtualTrackingSim(Node):
     # ---- action -----------------------------------------------------------
 
     def _fetch_stage_distances(self):
-        """Read stage1/2_distance from apriltag_control once it is up."""
+        """Read stage1/2_distance and leave_distance from apriltag_control once it is up."""
         if self._control_param_future is not None or not self.control_param_client.service_is_ready():
             return
-        request = GetParameters.Request(names=['stage1_distance', 'stage2_distance'])
+        request = GetParameters.Request(names=['stage1_distance', 'stage2_distance', 'leave_distance'])
         self._control_param_future = self.control_param_client.call_async(request)
         self._control_param_future.add_done_callback(self._on_stage_distances)
 
     def _on_stage_distances(self, future):
         response = future.result()
         values = [v.double_value for v in response.values] if response is not None else []
-        if len(values) != 2:
+        if len(values) != 3:
             self.get_logger().warn('Cannot read stage distances from apriltag_control, retrying.')
             self._control_param_future = None
             return
         self._control_param_timer.cancel()
         with self.lock:
-            self.stage_distances = (values[0], values[1])
+            self.stage_distances = (values[0], values[1], values[2])
             self.stage_distances_known = True
         self.get_logger().info(
-            f'Stage distances from apriltag_control: stage1={values[0]:.2f}m stage2={values[1]:.2f}m')
+            f'Stage distances from apriltag_control: stage1={values[0]:.2f}m stage2={values[1]:.2f}m '
+            f'leave={values[2]:.2f}m')
 
     def _try_auto_start(self):
         if self.stage_distances_known and self.action_client.server_is_ready():
@@ -465,9 +480,41 @@ class VirtualTrackingSim(Node):
 
     def stop(self):
         with self.lock:
-            handle = self.goal_handle if self.phase in ACTIVE_PHASES else None
-        if handle is not None:
+            if self.phase == 'IN_POSITION':
+                handle = None
+                abandon = True
+            else:
+                handle = self.goal_handle if self.phase in ACTIVE_PHASES else None
+                abandon = False
+        if abandon:
+            self.abandon()
+        elif handle is not None:
             handle.cancel_goal_async()
+
+    def leave(self):
+        """Send leave_cs start=True; only in IN_POSITION."""
+        with self.lock:
+            if self.phase != 'IN_POSITION':
+                return
+            if not self.leave_client.server_is_ready():
+                self.result_message = 'leave_cs action server not available.'
+                return
+            self.phase = 'LEAVING'
+            self.stage = 3
+            self.run.leave_t = time.monotonic() - self.run_start
+        goal = StartTracking.Goal()
+        goal.start = True
+        future = self.leave_client.send_goal_async(goal, feedback_callback=self._on_feedback)
+        future.add_done_callback(self._on_leave_goal_response)
+        self.get_logger().info('leave_cs goal sent.')
+
+    def abandon(self):
+        """Send start_tracking start=False in IN_POSITION: apriltag_control abandons and restores."""
+        goal = StartTracking.Goal()
+        goal.start = False
+        future = self.action_client.send_goal_async(goal)
+        future.add_done_callback(self._on_abandon_goal_response)
+        self.get_logger().info('start_tracking start=False sent (abandon IN_POSITION).')
 
     def reset(self):
         self.stop()
@@ -505,23 +552,77 @@ class VirtualTrackingSim(Node):
             if self.phase in ACTIVE_PHASES:
                 self.run.feedback.append((time.monotonic() - self.run_start, *values))
 
-    def _on_result(self, future):
-        response = future.result()
-        phase = {
+    @staticmethod
+    def _status_phase(status) -> str:
+        return {
             GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED',
             GoalStatus.STATUS_ABORTED: 'ABORTED',
             GoalStatus.STATUS_CANCELED: 'CANCELED',
-        }.get(response.status, f'STATUS_{response.status}')
+        }.get(status, f'STATUS_{status}')
+
+    def _end_run(self, phase: str, message: str, expected_phase: str):
+        """Final result of a run: save it and release headless mode."""
         with self.lock:
-            if self.phase not in ACTIVE_PHASES:
+            if self.phase != expected_phase:
                 return  # reset while running
             self.phase = phase
-            self.result_message = response.result.message
+            self.result_message = message
             self.run_end = time.monotonic()
             self.goal_handle = None
-        self.get_logger().info(f'start_tracking finished: {phase} - {response.result.message}')
         self._save_run(phase)
         self.finished.set()
+
+    def _on_result(self, future):
+        response = future.result()
+        phase = self._status_phase(response.status)
+        self.get_logger().info(f'start_tracking finished: {phase} - {response.result.message}')
+        if phase != 'SUCCEEDED':
+            self._end_run(phase, response.result.message, 'RUNNING')
+            return
+        with self.lock:
+            if self.phase != 'RUNNING':
+                return  # reset while running
+            self.phase = 'IN_POSITION'
+            self.result_message = response.result.message
+            self.goal_handle = None
+        # apriltag_control holds here: AMCL stays closed, lidar safety disabled
+        amcl_on, lidar_safety_disabled = self.fake_g7.state()
+        held = (f"in position: amcl={'on' if amcl_on else 'off'} "
+                f"lidar_safety={'disabled' if lidar_safety_disabled else 'enabled'}")
+        if not amcl_on and lidar_safety_disabled:
+            self.get_logger().info(f'{held} (held)')
+        else:
+            self.get_logger().error(f'{held} (NOT held)')
+        if self.headless:
+            self.leave()
+
+    def _on_leave_goal_response(self, future):
+        handle = future.result()
+        if not handle.accepted:
+            self.get_logger().error('leave_cs goal rejected.')
+            self._end_run('REJECTED', 'leave_cs goal rejected.', 'LEAVING')
+            return
+        with self.lock:
+            self.goal_handle = handle
+        handle.get_result_async().add_done_callback(self._on_leave_result)
+
+    def _on_leave_result(self, future):
+        response = future.result()
+        phase = self._status_phase(response.status)
+        self.get_logger().info(f'leave_cs finished: {phase} - {response.result.message}')
+        self._end_run(phase, response.result.message, 'LEAVING')
+
+    def _on_abandon_goal_response(self, future):
+        handle = future.result()
+        if not handle.accepted:
+            self.get_logger().error('start_tracking start=False rejected.')
+            return
+        handle.get_result_async().add_done_callback(self._on_abandon_result)
+
+    def _on_abandon_result(self, future):
+        response = future.result()
+        self.get_logger().info(f'abandon finished: {response.result.message}')
+        self._end_run('ABANDONED', response.result.message, 'IN_POSITION')
 
     # ---- logging ----------------------------------------------------------
 
@@ -530,7 +631,7 @@ class VirtualTrackingSim(Node):
         base = os.path.join(self.log_dir, time.strftime('%Y%m%d_%H%M%S') + f'_{phase.lower()}')
         with self.lock:
             run = RunLog(list(self.run.samples), list(self.run.feedback), self.run.stage2_t,
-                         list(self.run.cmd_raw))
+                         self.run.leave_t, list(self.run.cmd_raw))
             init = self.initial_pose.copy()
             message = self.result_message
 
@@ -590,6 +691,7 @@ class VirtualTrackingSim(Node):
                 'feedback': list(self.run.feedback),
                 'cmd_raw': list(self.run.cmd_raw),
                 'stage2_t': self.run.stage2_t,
+                'leave_t': self.run.leave_t,
                 'phase': self.phase,
                 'stage': self.stage,
                 'elapsed': elapsed,
@@ -785,13 +887,13 @@ class Dashboard:
             if abs(gy * 2 - round(gy * 2)) < 1e-6:
                 put(target, f'{gy:g}', (x0 + 10, v - 3), DIM, 0.35)
 
-        # stage goals
-        for stage in (1, 2):
+        # stage and leave goals
+        for stage in (1, 2, 3):
             gp = sim.goal_pose(stage)
             u, v = self.w2p(gp)
             cv2.drawMarker(target, (u, v), (160, 160, 255), cv2.MARKER_CROSS, 12, 1)
-            put(target, f'S{stage} {sim.stage_distances[stage - 1]:.2f}m', (u - 30, v - 10 - 14 * (stage - 1)),
-                (160, 160, 255), 0.38)
+            put(target, f'{STAGE_LABELS[stage]} {sim.stage_distances[stage - 1]:.2f}m',
+                (u - 30, v - 10 - 14 * (stage - 1)), (160, 160, 255), 0.38)
 
         # tag
         half = sim.tag_size * 10 / 8 / 2
@@ -845,7 +947,8 @@ class Dashboard:
         samples = np.array(snap['samples'], dtype=float).reshape(-1, 11)
         feedback = np.array(snap['feedback'], dtype=float).reshape(-1, 4)
         t_max = max(5.0, snap['elapsed'] * 1.05)
-        vlines = [(snap['stage2_t'], 'stage 2')] if snap['stage2_t'] is not None else []
+        vlines = [(t, label) for t, label in ((snap['stage2_t'], 'stage 2'), (snap['leave_t'], 'leave'))
+                  if t is not None]
 
         t = samples[:, 0]
         err_values = np.concatenate([samples[:, 4:7].ravel(), feedback[:, 1:4].ravel()])
@@ -877,6 +980,7 @@ class Dashboard:
         cv2.rectangle(img, (x0 + 4, y0 + 4), (x0 + w - 5, y0 + h - 5), PANEL, -1)
         self.buttons = {}
         for i, (name, label, color) in enumerate([('start', 'Start (s)', (60, 140, 60)),
+                                                  ('leave', 'Leave (l)', (150, 110, 40)),
                                                   ('stop', 'Stop (x)', (60, 60, 170)),
                                                   ('reset', 'Reset (r)', (100, 100, 100))]):
             bx, by = x0 + 16 + i * 130, y0 + 16
@@ -886,13 +990,15 @@ class Dashboard:
 
         phase = snap['phase']
         phase_color = {'SUCCEEDED': (80, 220, 80), 'ABORTED': (80, 80, 255), 'CANCELED': (80, 180, 255),
-                       'REJECTED': (80, 80, 255)}.get(phase, TEXT)
-        sx = x0 + 420
+                       'REJECTED': (80, 80, 255), 'IN_POSITION': (80, 220, 220),
+                       'ABANDONED': (80, 180, 255)}.get(phase, TEXT)
+        sx = x0 + 545
+        stage_text = 'leave' if snap['stage'] == 3 else f'stage {snap["stage"]}'
         put(img, f'{phase}', (sx, y0 + 34), phase_color, 0.8, 2)
-        put(img, f'stage {snap["stage"]}   elapsed {snap["elapsed"]:.2f}s', (sx + 190, y0 + 32), TEXT, 0.55)
-        put(img, f"AMCL {'ON' if snap['amcl_on'] else 'OFF'}", (sx + 520, y0 + 32),
+        put(img, f'{stage_text}   elapsed {snap["elapsed"]:.2f}s', (sx + 205, y0 + 32), TEXT, 0.55)
+        put(img, f"AMCL {'ON' if snap['amcl_on'] else 'OFF'}", (sx + 470, y0 + 32),
             (80, 220, 80) if snap['amcl_on'] else (80, 180, 255), 0.55, 2)
-        put(img, f"lidar safety {'DISABLED' if snap['lidar_safety_disabled'] else 'ENABLED'}", (sx + 640, y0 + 32),
+        put(img, f"lidar safety {'DISABLED' if snap['lidar_safety_disabled'] else 'ENABLED'}", (sx + 580, y0 + 32),
             (80, 80, 255) if snap['lidar_safety_disabled'] else (80, 220, 80), 0.55, 2)
 
         cmd = snap['cmd']
@@ -963,6 +1069,8 @@ class Dashboard:
             return False
         if key == ord('s'):
             self.sim.start()
+        elif key == ord('l'):
+            self.sim.leave()
         elif key == ord('x'):
             self.sim.stop()
         elif key == ord('r'):

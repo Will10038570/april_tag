@@ -1,0 +1,3 @@
+  cd /home/cobo/Desktop/Will/work_space/docker
+  docker compose -f docker_compose_UI_off.yml up -d --force-recreate
+

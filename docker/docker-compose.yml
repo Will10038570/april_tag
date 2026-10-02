@@ -1,0 +1,38 @@
+services:
+  ros2:
+    image: ros2_april_tag:v1
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: april_tag_serive
+    privileged: true
+    network_mode: host
+    ipc: host
+    # NOTE: GUI (X11) forwarding assumes:
+    #   1. `docker compose up` is run from a shell inside an active graphical
+    #      login session, so $XAUTHORITY/$DISPLAY are set. Over a plain SSH
+    #      session with no local desktop, $XAUTHORITY won't exist and this
+    #      setup won't work — that needs SSH X11 forwarding instead.
+    #   2. The host is running X11 or XWayland. If the host ever moves to
+    #      pure Wayland (no XWayland), the /tmp/.X11-unix socket approach
+    #      below stops working and must be replaced with a Wayland socket
+    #      mount (e.g. $WAYLAND_DISPLAY under $XDG_RUNTIME_DIR).
+    environment:
+      - DISPLAY=${DISPLAY}
+      - XAUTHORITY=/tmp/.docker.xauth
+      - ROS_DOMAIN_ID=65
+      - ROS_LOCALHOST_ONLY=0
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      # Bind CycloneDDS to the wired NIC (192.168.5.0/24) so it can discover
+      # the robot at 192.168.5.10; by default it picks the Wi-Fi interface.
+      # presence_required="false": if enP8p1s0 is down/unplugged, skip it and
+      # fall back to loopback instead of failing to create the domain.
+      # The interface is chosen once at node startup; re-launch after plugging in.
+      - CYCLONEDDS_URI=<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="enP8p1s0" presence_required="false"/><NetworkInterface name="lo"/></Interfaces></General></Domain></CycloneDDS>
+    volumes:
+      - ..:/mnt/work_space
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /dev:/dev
+      - ${XAUTHORITY:-${HOME}/.Xauthority}:/tmp/.docker.xauth:ro
+    stdin_open: true
+    tty: true

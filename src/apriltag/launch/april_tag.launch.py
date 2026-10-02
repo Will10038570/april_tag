@@ -7,6 +7,14 @@ from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
+# log lines without time; ros2 launch's '[<process>-N] ' prefix is dropped
+LOG_FORMAT = '[{severity}] [{name}]: {message}'
+OUTPUT_FORMAT = '{line}'
+# apriltag_control prefixes every message with '[stage <STATE>] : ', giving
+# '[INFO] [up.apriltag_control][stage LEAVING    ] : ...'
+CONTROL_LOG_ENV = {'RCUTILS_CONSOLE_OUTPUT_FORMAT': '[{severity}] [{name}]{message}'}
+
+
 def generate_launch_description():
     manage_arg = DeclareLaunchArgument(
         'manage_amcl_and_lidar_safety', default_value='false',
@@ -26,6 +34,7 @@ def generate_launch_description():
         name='apriltag_detection',
         namespace='up',
         output='screen',
+        output_format=OUTPUT_FORMAT,
     )
 
     apriltag_control = Node(
@@ -34,12 +43,16 @@ def generate_launch_description():
         name='apriltag_control',
         namespace='up',
         output='screen',
+        output_format=OUTPUT_FORMAT,
+        additional_env=CONTROL_LOG_ENV,
         parameters=[{
             'manage_amcl_and_lidar_safety': ParameterValue(
                 LaunchConfiguration('manage_amcl_and_lidar_safety'), value_type=bool),
             # two-stage target distances from camera to tag (m)
             'stage1_distance': 0.50,
             'stage2_distance': 0.28,
+            # leave_cs: back from IN_POSITION to this distance (m)
+            'leave_distance': 0.40,
             # G7+ AMCL services (absolute names, not affected by namespace 'up')
             'amcl_check_service': '/check_mcl_if_trigger',
             'amcl_close_service': '/close_amcl',
@@ -47,7 +60,7 @@ def generate_launch_description():
             # G7+ PLC lidar safety topic (Bool: true disables the safety field,
             # false enables it; fire-and-forget like G7+ AutoCharging)
             'lidar_safety_topic': '/g7_plc/disable_lidar_safety',
-            # velocity topics: Stage 1 normal, Stage 2 G7+ precision mode
+            # velocity topics: Stage 1 normal, Stage 2 and leaving G7+ precision mode
             'stage1_cmd_vel_topic': '/cmd_vel',
             'stage2_cmd_vel_topic': '/pre_cmd_vel',
         }],
@@ -63,9 +76,8 @@ def generate_launch_description():
 
     return LaunchDescription([
         manage_arg,
-        # shorter log time: '2026-09-30 09:13:00.383' instead of epoch seconds
-        SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT',
-                               '[{severity}] [{date_time_with_ms}] [{name}]: {message}'),
+        # '[INFO] [up.apriltag_detection]: ...' (apriltag_control: see CONTROL_LOG_ENV)
+        SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT', LOG_FORMAT),
         camera,
         apriltag_detection,
         apriltag_control,

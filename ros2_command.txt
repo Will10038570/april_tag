@@ -1,0 +1,66 @@
+
+#start tracking 
+ros2 action send_goal /up/start_tracking apriltag_interfaces/action/StartTracking "{start: true}"
+
+#-------------------------------------------------------
+ source /mnt/work_space/install/setup.bash
+
+ ros2 launch apriltag test_virtual_tracking.launch.py 
+
+ ros2 launch apriltag april_tag.launch.py manage_amcl_and_lidar_safety:=false
+
+- /check_mcl_if_trigger
+
+
+
+#amcl lidar close
+1. ros2 node list 看得到機器的 node，確認 DDS 和 domain 是通的。
+2. ros2 service list | grep mcl 看得到三個 service。
+3. ros2 topic info -v /g7_plc/disable_lidar_safety 看得到 ads_bridge_node 在訂閱。
+4. 用 manage_amcl_and_lidar_safety:=true 跑一次，看 log 是否依序出現 [request]、[response] ... amcl is on、[response] close AMCL、AMCL status: off。
+
+
+  收不到回傳的情況：
+  - service 不存在：印出 service /close_amcl not available。
+  - 超過 external_service_timeout（預設 5 秒）沒回應：印出 timed out。
+
+
+  # 1. 檢查 AMCL 狀態(success: true 代表 AMCL 正在執行)
+  ros2 service call /check_mcl_if_trigger std_srvs/srv/Trigger "{}"
+
+  # 2. 關閉 AMCL
+  ros2 service call /close_amcl std_srvs/srv/Empty "{}"
+
+  # 3. 再檢查一次,確認 success: false
+  ros2 service call /check_mcl_if_trigger std_srvs/srv/Trigger "{}"
+
+  要重新開啟 AMCL:
+
+  ros2 service call /open_amcl std_srvs/srv/Empty "{}"
+
+
+
+
+
+
+
+#-------------------------------------------------------
+
+#build
+
+source /opt/ros/humble/setup.bash
+cd /mnt/work_space
+colcon build --packages-select apriltag
+
+
+#network setting 
+sudo ip addr flush dev enp3s0
+sudo ip addr add 192.168.1.100/24 dev enp3s0
+sudo ip link set enp3s0 up
+
+
+
+#arpil tag library
+https://github.com/christianrauch/apriltag_ros
+
+

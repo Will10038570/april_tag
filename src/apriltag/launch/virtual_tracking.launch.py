@@ -1,6 +1,8 @@
 """End-to-end virtual test: real apriltag_detection + apriltag_control, with the
 camera, the AMR and the G7+ AMCL services / lidar safety topic replaced by
-tools/virtual_tracking_sim.
+tools/virtual_tracking_sim. A run is start_tracking (Stage 1 + 2, IN_POSITION)
+followed by leave_cs; headless + auto_start runs both and checks AMCL / lidar
+safety in IN_POSITION (held) and at the end (restored).
 
 Runs in ROS domain 65, the same as the robot: apriltag_control publishes the
 absolute /cmd_vel, /pre_cmd_vel and /g7_plc/disable_lidar_safety and calls the AMCL
@@ -13,6 +15,14 @@ from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable, Shutdo
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+
+# log lines without time; ros2 launch's '[<process>-N] ' prefix is dropped
+LOG_FORMAT = '[{severity}] [{name}]: {message}'
+OUTPUT_FORMAT = '{line}'
+# apriltag_control prefixes every message with '[stage <STATE>] : ', giving
+# '[INFO] [up.apriltag_control][stage LEAVING    ] : ...'
+CONTROL_LOG_ENV = {'RCUTILS_CONSOLE_OUTPUT_FORMAT': '[{severity}] [{name}]{message}'}
 
 
 def generate_launch_description():
@@ -29,10 +39,11 @@ def generate_launch_description():
         DeclareLaunchArgument('log_dir', default_value='virtual_tracking_logs'),
         DeclareLaunchArgument('manage_amcl_and_lidar_safety', default_value='true',
                               description='false: apriltag_control skips AMCL / lidar safety'),
-        # simulation's own stage distances, independent of launch/april_tag.launch.py;
+        # simulation's own stage / leave distances, independent of launch/april_tag.launch.py;
         # the sim reads them back from apriltag_control
         DeclareLaunchArgument('stage1_distance', default_value='0.50'),
         DeclareLaunchArgument('stage2_distance', default_value='0.28'),
+        DeclareLaunchArgument('leave_distance', default_value='0.40'),
     ]
 
     apriltag_detection = Node(
@@ -41,6 +52,7 @@ def generate_launch_description():
         name='apriltag_detection',
         namespace='up',
         output='screen',
+        output_format=OUTPUT_FORMAT,
     )
 
     apriltag_control = Node(
@@ -49,11 +61,14 @@ def generate_launch_description():
         name='apriltag_control',
         namespace='up',
         output='screen',
+        output_format=OUTPUT_FORMAT,
+        additional_env=CONTROL_LOG_ENV,
         parameters=[{
             'manage_amcl_and_lidar_safety': ParameterValue(
                 LaunchConfiguration('manage_amcl_and_lidar_safety'), value_type=bool),
             'stage1_distance': ParameterValue(LaunchConfiguration('stage1_distance'), value_type=float),
             'stage2_distance': ParameterValue(LaunchConfiguration('stage2_distance'), value_type=float),
+            'leave_distance': ParameterValue(LaunchConfiguration('leave_distance'), value_type=float),
         }],
     )
 
@@ -63,6 +78,7 @@ def generate_launch_description():
         name='virtual_tracking_sim',
         namespace='up',
         output='screen',
+        output_format=OUTPUT_FORMAT,
         parameters=[{
             'init_x': LaunchConfiguration('init_x'),
             'init_y': LaunchConfiguration('init_y'),
@@ -79,9 +95,8 @@ def generate_launch_description():
     return LaunchDescription([
         *args,
         SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id')),
-        # shorter log time: '2026-09-30 09:13:00.383' instead of epoch seconds
-        SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT',
-                               '[{severity}] [{date_time_with_ms}] [{name}]: {message}'),
+        # '[INFO] [up.apriltag_detection]: ...' (apriltag_control: see CONTROL_LOG_ENV)
+        SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT', LOG_FORMAT),
         apriltag_detection,
         apriltag_control,
         virtual_tracking_sim,
