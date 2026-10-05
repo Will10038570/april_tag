@@ -20,7 +20,7 @@ services:
     environment:
       - DISPLAY=${DISPLAY}
       - XAUTHORITY=/tmp/.docker.xauth
-      - ROS_DOMAIN_ID=65
+      - ROS_DOMAIN_ID=63
       - ROS_LOCALHOST_ONLY=0
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       # Bind CycloneDDS to the wired NIC (192.168.5.0/24) so it can discover
@@ -28,7 +28,7 @@ services:
       # presence_required="false": if enP8p1s0 is down/unplugged, skip it and
       # fall back to loopback instead of failing to create the domain.
       # The interface is chosen once at node startup; re-launch after plugging in.
-      - CYCLONEDDS_URI=<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="enP8p1s0" presence_required="false"/><NetworkInterface name="lo"/></Interfaces></General></Domain></CycloneDDS>
+      - CYCLONEDDS_URI=<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="enP8p1s0"/></Interfaces></General><Discovery><Peers><Peer address="192.168.6.10"/></Peers><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>50</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>
     volumes:
       - ..:/mnt/work_space
       - /tmp/.X11-unix:/tmp/.X11-unix:rw

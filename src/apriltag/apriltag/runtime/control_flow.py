@@ -99,3 +99,16 @@ def publish_control(
     publish_twist_fn(vx, vy, vw)
 
     return new_last_time, plan
+
+
+def leave_step(x_error: float, max_vx: float) -> Tuple[bool, float, float, float]:
+    """leave_cs: back straight until the tag is at least leave_distance away.
+
+    x_error = forward - leave_distance (m). Returns (reached, vx, vy, wz):
+    reached -> (True, 0, 0, 0); otherwise (False, -max_vx, 0, 0).
+    """
+    if not np.isfinite(x_error):
+        raise ValueError("Non-finite leave x_error detected")
+    if x_error >= 0.0:
+        return True, 0.0, 0.0, 0.0
+    return False, -max_vx, 0.0, 0.0

@@ -20,7 +20,7 @@ from std_srvs.srv import Empty, SetBool, Trigger
 from apriltag.control import LQRTracker, TrajectoryPlanner
 from apriltag.domain.math_utils import optical_to_control_error, quaternion_to_rotation_matrix
 from apriltag.ros.ros_io import publish_twist
-from apriltag.runtime.control_flow import publish_control
+from apriltag.runtime.control_flow import leave_step, publish_control
 from apriltag.runtime.safety_guard import handle_target_lost
 
 # high-rate messages (cmd_vel, action feedback) are logged at most once per this period
@@ -56,9 +56,6 @@ STOPPABLE_STATES = frozenset({S.STARTING, S.STAGE1, S.STAGE2, S.LEAVING})
 def is_transition_allowed(src: TrackingState, dst: TrackingState) -> bool:
     return dst in ALLOWED_TRANSITIONS.get(src, set())
 
-
-# width of the state in the log prefix, so the messages line up
-STATE_LOG_WIDTH = max(len(s.value) for s in TrackingState)
 
 
 class _StageLogger:
@@ -102,8 +99,9 @@ class AprilTagControlNode(Node):
     /pre_cmd_vel (G7+ precision mode, the motors wait until the steering is
     within 5 deg) (STAGE2). When Stage 2 is aligned the robot stops, the goal
     succeeds and the node holds in IN_POSITION with AMCL closed, lidar safety
-    disabled and detection enabled. A leave_cs goal then tracks back to
-    leave_distance on /pre_cmd_vel (LEAVING). When leaving ends, or when any
+    disabled and detection enabled. A leave_cs goal then backs straight up at
+    max_vx on /pre_cmd_vel, without the planner / LQR, until the tag is at
+    least leave_distance ahead of the camera (LEAVING). When leaving ends, or when any
     stage fails, is cancelled or stopped, the node goes through FINISHING: it
     stops the robot, disables detection, enables lidar safety and restores
     AMCL if it closed it, then returns to IDLE. start_tracking start=False in
@@ -131,9 +129,10 @@ class AprilTagControlNode(Node):
             'stage1_distance', 0.50).value)   # 第一階段：50 cm 對齊
         self.stage2_distance = float(self.declare_parameter(
             'stage2_distance', 0.28).value)   # 第二階段：28 cm 對齊
-        # leave_cs: track back to this distance from IN_POSITION
+        # leave_cs: back straight from IN_POSITION until the camera-to-tag
+        # forward distance reaches this value
         self.leave_distance = float(self.declare_parameter(
-            'leave_distance', 0.40).value)    # 離開：退到 40 cm
+            'leave_distance', 1.0).value)     # 離開：退到 100 cm
         self.desired_distance = self.stage1_distance
         # camera lateral offset in AMR control frame (+left / -right)
         # self.camera_y_offset = 0.036
@@ -274,13 +273,13 @@ class AprilTagControlNode(Node):
     # ---- state machine ----------------------------------------------------------
 
     def _stage(self) -> str:
-        """Prefix of every log message: '[stage LEAVING    ] : '.
+        """Prefix of every log message: '[stage LEAVING] : '.
 
         The launch file sets this node's RCUTILS_CONSOLE_OUTPUT_FORMAT to
         '[{severity}] [{name}]{message}', so a line reads
-        '[INFO] [up.apriltag_control][stage LEAVING    ] : ...'.
+        '[INFO] [up.apriltag_control][stage LEAVING] : ...'.
         """
-        return f'[stage {self._state.value:<{STATE_LOG_WIDTH}}] : '
+        return f'[stage {self._state.value}] : '
 
     def _transition_locked(self, new: TrackingState, reason: str) -> bool:
         """Change state if allowed; the caller must hold _control_lock."""
@@ -317,7 +316,7 @@ class AprilTagControlNode(Node):
     def _finish_motion(self, success: bool, message: str) -> bool:
         """Move a running procedure to FINISHING and report its result.
 
-        Used for leave aligned, target lost, cancel, stop, service failure and
+        Used for leave reached, target lost, cancel, stop, service failure and
         shutdown. Returns False if the state was not stoppable (already ended).
         """
         timed_message = self._elapsed_message(message)
@@ -867,6 +866,10 @@ class AprilTagControlNode(Node):
             if self._stage2_pending:
                 return
 
+        if tracking_state is S.LEAVING:
+            self._leave_step(state.x_error)
+            return
+
         try:
             self._last_stamp, latest_plan = publish_control(
                 best_target=best_target,
@@ -919,8 +922,21 @@ class AprilTagControlNode(Node):
             )
         elif tracking_state is S.STAGE2:
             self._reach_in_position(f'Stage 2 aligned at {self.stage2_distance:.2f}m. {converged}')
-        else:
-            self._finish_motion(True, f'Leave aligned at {self.leave_distance:.2f}m. {converged}')
+
+    def _leave_step(self, x_error: float) -> None:
+        """LEAVING: back straight at max_vx until the tag is leave_distance away."""
+        try:
+            reached, vx, vy, vw = leave_step(x_error, self.max_vx)
+        except ValueError as exc:
+            self.get_logger().warn(self._stage() + f"Leave step failed: {exc}")
+            self._safe_stop()
+            return
+        if reached:
+            forward = x_error + self.leave_distance
+            self._finish_motion(
+                True, f'Leave reached {self.leave_distance:.2f}m (forward={forward:.3f}m).')
+            return
+        self._publish_control_command(vx, vy, vw)
 
 
 def main(args=None):

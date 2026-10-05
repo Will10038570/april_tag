@@ -1,0 +1,45 @@
+apriltag_control:指令 vs. 狀態反應表
+======================================
+依據:src/apriltag/apriltag/control_node.py(工作區版本,含未 commit 的修改)
+      goal callback 在 control_node.py:562-594,start=false 的處理在 :725-777
+整理日期:2026-10-05
+
+----------------------------------------------------------------------------------------------------
+State         | start_tracking true | start_tracking false               | leave_cs true   | leave_cs false
+--------------+---------------------+------------------------------------+-----------------+--------------------
+IDLE          | 接受 -> STARTING    | 接受:發一次停車指令,goal 成功      | 拒絕            | 拒絕
+STARTING      | 拒絕                | 接受:停止 -> FINISHING -> IDLE      | 拒絕            | 拒絕
+STAGE1        | 拒絕                | 接受:停止 -> FINISHING -> IDLE      | 拒絕            | 拒絕
+STAGE2        | 拒絕                | 接受:停止 -> FINISHING -> IDLE      | 拒絕            | 拒絕
+IN_POSITION   | 拒絕                | 接受:放棄對位,關 detection、       | 接受 -> LEAVING | 拒絕
+              |                     |       還原 lidar safety / AMCL -> IDLE |                 |
+LEAVING       | 拒絕                | 接受:停止 leave -> FINISHING -> IDLE | 拒絕            | 接受:停止 leave -> FINISHING -> IDLE
+FINISHING     | 拒絕                | 接受:等清理完成                    | 拒絕            | 拒絕
+----------------------------------------------------------------------------------------------------
+
+
+在 IDLE 送 leave_cs
+-------------------
+goal 直接被拒絕,什麼都不會發生:車不會動,不會開關 detection,也不會碰 AMCL / lidar safety。
+start: true 和 start: false 都一樣。拒絕發生在 goal callback,execute 不會被執行。
+
+apriltag_control 的警告 log:
+  [action] leave_cs goal rejected: start=True state=IDLE (leave_cs start=True is only accepted in IN_POSITION)
+  [action] leave_cs goal rejected: start=False state=IDLE (leave_cs start=False is only accepted in LEAVING)
+
+client 端(ros2 action send_goal)會看到:Goal was rejected.
+
+
+補充
+----
+- start_tracking false 在任何狀態都會被接受,可以當成通用的「停止 / 放棄」指令。
+  leave_cs false 只在 LEAVING 有效。
+- 被 start: false 中斷的那個 goal 以 ABORTED 結束(訊息為 "Tracking stopped." 或 "Leave stopped."),
+  start: false 這個 goal 本身則是 SUCCEEDED。
+- 所有被拒絕的 goal 都會印出:
+  [action] <name> goal rejected: start=... state=... (<rule>)
+- 邊界情況:
+  * Stage 2 剛對齊、start_tracking 的 result 還沒回傳的那一瞬間,狀態已是 IN_POSITION,
+    但上一個 goal 還在執行中,這時送 leave_cs true 也會被拒絕(control_node.py:586)。
+  * IDLE 時如果還有 goal 在執行,start_tracking true 也會被拒絕(control_node.py:568)。
+- 各狀態拒絕 goal 的行為已在虛擬環境用 CLI 驗證過(2026-10-02,見 work_space/CLAUDE.md 第 6 節)。

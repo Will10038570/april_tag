@@ -11,7 +11,7 @@ from launch_ros.substitutions import FindPackageShare
 LOG_FORMAT = '[{severity}] [{name}]: {message}'
 OUTPUT_FORMAT = '{line}'
 # apriltag_control prefixes every message with '[stage <STATE>] : ', giving
-# '[INFO] [up.apriltag_control][stage LEAVING    ] : ...'
+# '[INFO] [up.apriltag_control][stage LEAVING] : ...'
 CONTROL_LOG_ENV = {'RCUTILS_CONSOLE_OUTPUT_FORMAT': '[{severity}] [{name}]{message}'}
 
 
@@ -19,6 +19,9 @@ def generate_launch_description():
     manage_arg = DeclareLaunchArgument(
         'manage_amcl_and_lidar_safety', default_value='false',
         description='false: apriltag_control skips AMCL / lidar safety')
+    tag_family_arg = DeclareLaunchArgument(
+        'tag_family', default_value='tag36h11',
+        description='AprilTag family of the printed tag (pupil_apriltags name, e.g. tag36h11)')
 
     camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -35,6 +38,9 @@ def generate_launch_description():
         namespace='up',
         output='screen',
         output_format=OUTPUT_FORMAT,
+        parameters=[{
+            'tag_family': LaunchConfiguration('tag_family'),
+        }],
     )
 
     apriltag_control = Node(
@@ -52,7 +58,7 @@ def generate_launch_description():
             'stage1_distance': 0.50,
             'stage2_distance': 0.28,
             # leave_cs: back from IN_POSITION to this distance (m)
-            'leave_distance': 0.40,
+            'leave_distance': 1.0,
             # G7+ AMCL services (absolute names, not affected by namespace 'up')
             'amcl_check_service': '/check_mcl_if_trigger',
             'amcl_close_service': '/close_amcl',
@@ -76,6 +82,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         manage_arg,
+        tag_family_arg,
         # '[INFO] [up.apriltag_detection]: ...' (apriltag_control: see CONTROL_LOG_ENV)
         SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT', LOG_FORMAT),
         camera,

@@ -108,8 +108,9 @@ docker exec april_tag_serive bash -ic '
 [state] STAGE2 -> IN_POSITION (Stage 2 aligned)
 [action] start_tracking result: SUCCEEDED success=True message='Stage 2 aligned at 0.28m. ...'
 in position: amcl=off lidar_safety=disabled (held)
-[state] IN_POSITION -> LEAVING (leave_cs goal accepted, back to 0.40m)
-[action] leave_cs result: SUCCEEDED success=True message='Leave aligned at 0.40m. ...'
+[state] IN_POSITION -> LEAVING (leave_cs goal accepted, back to 1.00m)
+[publish] /pre_cmd_vel vx=-0.100 vy=+0.000 wz=+0.000
+[action] leave_cs result: SUCCEEDED success=True message='Leave reached 1.00m (forward=1.0xxm). ...'
 after goal: amcl=on lidar_safety=enabled (restored)
 Run saved to .../virtual_tracking_logs/<time>_succeeded_*.csv
 ```
@@ -135,7 +136,7 @@ docker exec -it april_tag_serive bash -ic '
 | `headless` / `auto_start` | `false` / `false` |
 | `log_dir` | `virtual_tracking_logs` |
 | `manage_amcl_and_lidar_safety` | `true`(注意:與 `april_tag.launch.py` 的預設 `false` 不同) |
-| `stage1_distance` / `stage2_distance` / `leave_distance` | `0.50` / `0.28` / `0.40`(sim 會從 `apriltag_control` 讀回,不直接設在 sim 上) |
+| `stage1_distance` / `stage2_distance` / `leave_distance` | `0.50` / `0.28` / `1.0`(sim 會從 `apriltag_control` 讀回,不直接設在 sim 上) |
 
 手動送 goal 測試(另開終端,同樣設 `ROS_DOMAIN_ID=99` 與 `lo` 的 `CYCLONEDDS_URI`):用 `headless:=true auto_start:=false` 啟動,sim 的物理與相機照常運作,但不會自己送 goal。
 
@@ -180,7 +181,7 @@ docker exec -it april_tag_serive bash -ic '
 
 `apriltag_control` 是狀態機:`IDLE → STARTING → STAGE1 → STAGE2 → IN_POSITION → LEAVING → FINISHING → IDLE`(詳見 README 的 State Machine)。`start_tracking` `start:true` 只在 `IDLE` 接受;`leave_cs` `start:true` 只在 `IN_POSITION`、`start:false` 只在 `LEAVING` 接受;其餘會被拒絕並印 `[action] … goal rejected: … state=…`。`IN_POSITION` 沒有 timeout。
 
-`april_tag.launch.py` 的 `manage_amcl_and_lidar_safety` 預設為 `false`(不動 AMCL / lidar safety);距離寫死在 launch 裡(`stage1_distance=0.50`、`stage2_distance=0.28`、`leave_distance=0.40`),Stage 1 速度發到 `/cmd_vel`,Stage 2 與 leave 發到 `/pre_cmd_vel`(G7+ 精準模式)。
+`april_tag.launch.py` 的 `manage_amcl_and_lidar_safety` 預設為 `false`(不動 AMCL / lidar safety);距離寫死在 launch 裡(`stage1_distance=0.50`、`stage2_distance=0.28`、`leave_distance=1.0`),Stage 1 速度發到 `/cmd_vel`,Stage 2 與 leave 發到 `/pre_cmd_vel`(G7+ 精準模式)。leave 不用 planner / LQR:固定發 `vx=-max_vx`(-0.1 m/s)、`vy=wz=0`,直到 camera→tag 前向距離 ≥ `leave_distance` 立即停(不檢查 y / yaw、無 hold)。
 
 `apriltag_detection` 啟動時是 **disabled**,不訂閱相機;收到 goal 後由 `apriltag_control` 呼叫 `/up/apriltag_detection/enable`(`std_srvs/srv/SetBool`)才開始偵測,`IN_POSITION` 期間維持開啟,流程結束(`FINISHING`)才關。所以沒送 goal 時 `/up/apriltag_pose` 沒有資料是正常的。
 
@@ -239,6 +240,12 @@ ros2 run rqt_image_view rqt_image_view /up/apriltag/marked_image
 - 虛擬測試 headless(`domain_id:=99`、`lo`):`STAGE2 -> IN_POSITION`、`(held)`、`Leave aligned at 0.40m`、`SUCCEEDED`、`(restored)`
 - CLI 情境:各狀態拒絕 goal 並有 log;`IN_POSITION` 時 `start_tracking start:false` 放棄對位並還原;`LEAVING` 時 `start_tracking`/`leave_cs` `start:false` 停止 leave 並還原;`IN_POSITION` / `STAGE1` / `LEAVING` 時 SIGINT,還原順序為 lidar enable → open AMCL → disable detection;AMCL service 不存在時 `STARTING -> FINISHING -> IDLE`
 - 實機尚未測(G7+ `/pre_cmd_vel` 收到負 vx 的實際動作未確認)
+
+2026-10-05 leave 改為「直線後退」(不用 planner / LQR,`leave_distance=1.0`)後,在同一 container 內實測:
+
+- `colcon test --packages-select apriltag`:63 tests(含 `test_leave_step.py` 4 個),0 failures
+- 虛擬測試 headless(`domain_id:=99`、`lo`):`(held)`、`IN_POSITION -> LEAVING (… back to 1.00m)`、leave 期間 `*_cmd_raw.csv` 只有 `(-0.1, 0, 0)` 與結束時的零速、`Leave reached 1.00m (forward=1.005m)`(leave elapsed 7.0 s)、`SUCCEEDED`、`(restored)`
+- 實機尚未測
 
 ## 7. `src/apriltag/README.md` 與實際不一致之處
 

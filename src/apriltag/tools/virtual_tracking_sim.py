@@ -244,7 +244,7 @@ class VirtualTrackingSim(Node):
         # the sim always follows its parameters; these values only fill the
         # dashboard until then, and no goal is started before they are read.
         # Index stage - 1: Stage 1, Stage 2, leave (stage 3)
-        self.stage_distances = (0.50, 0.28, 0.40)
+        self.stage_distances = (0.50, 0.28, 1.0)
         self.stage_distances_known = False
         self.tag_id = int(param('tag_id', 0))
 

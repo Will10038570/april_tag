@@ -32,11 +32,14 @@ class AprilTagDetectionNode(Node):
             depth=1
         )
 
-        # initialize AprilTag detector
-        self.detector = build_detector(tag_family="tag36h11")
+        # initialize AprilTag detector; must match the printed tag
+        self.tag_family = str(self.declare_parameter('tag_family', 'tag36h11').value)
+        self.detector = build_detector(tag_family=self.tag_family)
 
         # meters, adjust to your tag's real size
         self.tag_size = 0.0635
+        # only this tag ID is tracked; -1 tracks the closest tag of any ID
+        self.tag_id = int(self.declare_parameter('tag_id', -1).value)
 
         # camera intrinsics (filled by camera_info)
         self.fx = None
@@ -56,6 +59,10 @@ class AprilTagDetectionNode(Node):
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         self.enable_srv = self.create_service(SetBool, '~/enable', self._on_enable)
+        self.get_logger().info(
+            f'tag_family={self.tag_family}, '
+            + (f'tracking tag_id={self.tag_id}' if self.tag_id >= 0
+               else 'tag_id=-1: tracking the closest tag of any ID'))
         self.get_logger().info('Detection is disabled. Waiting for apriltag_control to enable it.')
 
     def _on_enable(self, request: SetBool.Request, response: SetBool.Response):
@@ -136,6 +143,8 @@ class AprilTagDetectionNode(Node):
             self.get_logger(),
         )
 
+        if self.tag_id >= 0:
+            targets = [t for t in targets if t["id"] == self.tag_id]
         best = choose_best_target(targets)
         if best is not None:
             publish_pose_and_tf(

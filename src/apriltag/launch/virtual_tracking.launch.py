@@ -21,7 +21,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 LOG_FORMAT = '[{severity}] [{name}]: {message}'
 OUTPUT_FORMAT = '{line}'
 # apriltag_control prefixes every message with '[stage <STATE>] : ', giving
-# '[INFO] [up.apriltag_control][stage LEAVING    ] : ...'
+# '[INFO] [up.apriltag_control][stage LEAVING] : ...'
 CONTROL_LOG_ENV = {'RCUTILS_CONSOLE_OUTPUT_FORMAT': '[{severity}] [{name}]{message}'}
 
 
@@ -43,7 +43,7 @@ def generate_launch_description():
         # the sim reads them back from apriltag_control
         DeclareLaunchArgument('stage1_distance', default_value='0.50'),
         DeclareLaunchArgument('stage2_distance', default_value='0.28'),
-        DeclareLaunchArgument('leave_distance', default_value='0.40'),
+        DeclareLaunchArgument('leave_distance', default_value='1.0'),
     ]
 
     apriltag_detection = Node(

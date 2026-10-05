@@ -7,7 +7,7 @@ A ROS 2 Python package that detects [AprilTag](https://april.eecs.umich.edu/soft
 The package runs as two nodes under the `up` namespace:
 
 - **`apriltag_detection`** — detects tags and publishes the closest tag's pose. It starts disabled and only subscribes to the camera while enabled.
-- **`apriltag_control`** — orchestrator, run as a state machine. It owns the `start_tracking` and `leave_cs` actions. `start_tracking` closes AMCL and enables detection, runs the planner + LQR, publishes `/cmd_vel` in Stage 1 and `/pre_cmd_vel` (G7+ precision mode) in Stage 2 and disables the PLC lidar safety field before Stage 2. When Stage 2 is aligned the goal succeeds and the node holds in `IN_POSITION` with AMCL closed, lidar safety disabled and detection enabled. `leave_cs` then tracks back to `leave_distance` on `/pre_cmd_vel`; when it ends, or whenever a stage fails, is cancelled or is stopped, the node disables detection, enables lidar safety and restores AMCL.
+- **`apriltag_control`** — orchestrator, run as a state machine. It owns the `start_tracking` and `leave_cs` actions. `start_tracking` closes AMCL and enables detection, runs the planner + LQR, publishes `/cmd_vel` in Stage 1 and `/pre_cmd_vel` (G7+ precision mode) in Stage 2 and disables the PLC lidar safety field before Stage 2. When Stage 2 is aligned the goal succeeds and the node holds in `IN_POSITION` with AMCL closed, lidar safety disabled and detection enabled. `leave_cs` then backs straight up at `max_vx` on `/pre_cmd_vel` (no planner / LQR) until the tag is `leave_distance` ahead of the camera; when it ends, or whenever a stage fails, is cancelled or is stopped, the node disables detection, enables lidar safety and restores AMCL.
 
 ```
  client ──start_tracking──► apriltag_control ──SetBool /up/apriltag_detection/enable──► apriltag_detection
@@ -36,7 +36,7 @@ start_tracking start=True
  └─ 4. Stage 2 converged: stop, goal succeeds → IN_POSITION
        (AMCL stays closed, lidar safety stays disabled, detection stays enabled)
 leave_cs start=True (only in IN_POSITION)
- └─ 5. track back to leave_distance (40 cm) on /pre_cmd_vel
+ └─ 5. back straight at -max_vx on /pre_cmd_vel until tag forward distance >= leave_distance (1.0 m)
 
 procedure end (leave ended / tag lost / cancelled / start=false / failure / node shutdown):
        stop → disable detection → publish Bool(false) (always) → open AMCL → check
@@ -70,7 +70,7 @@ IDLE ──start_tracking(true)──► STARTING ──AMCL closed + detection 
 | `STAGE1` | Tracking to `stage1_distance` on `/cmd_vel`. After it converges the robot stays stopped (still `STAGE1`) until lidar safety is disabled |
 | `STAGE2` | Tracking to `stage2_distance` on `/pre_cmd_vel` |
 | `IN_POSITION` | Stage 2 aligned, stopped and holding; no velocity is published |
-| `LEAVING` | `leave_cs`: tracking back to `leave_distance` on `/pre_cmd_vel` (same controller and tolerances as Stage 2) |
+| `LEAVING` | `leave_cs`: backing straight at `-max_vx` on `/pre_cmd_vel` until the camera-to-tag forward distance ≥ `leave_distance` (no planner / LQR) |
 | `FINISHING` | Procedure ended: stop, disable detection, restore AMCL / lidar safety, then `IDLE` |
 
 Velocity commands are only published in `STAGE1`, `STAGE2` and `LEAVING`, and the target-loss watchdog only runs there.
@@ -91,7 +91,7 @@ A goal stopped by `start: false` ends ABORTED (`Tracking stopped.` / `Leave stop
 
 - Real-time AprilTag detection via `pupil_apriltags`
 - Two-stage docking: align at 50 cm (Stage 1), then at 28 cm (Stage 2), then hold in `IN_POSITION`
-- Leaving: `leave_cs` tracks back to 40 cm, then restores AMCL and lidar safety
+- Leaving: `leave_cs` backs straight up until the tag is 1.0 m away, then restores AMCL and lidar safety
 - Discrete-time LQR controller with DARE-based gain computation
 - Safety watchdog: safe-stop when the target is lost for too long
 - G7+ integration: closes AMCL during the procedure and disables the PLC lidar safety field from Stage 2 until leaving ends, restoring both on every exit path
@@ -248,7 +248,7 @@ The sim's camera intrinsics, camera mount offset, tag size and stage distances a
 | Action | Type | Description |
 |---|---|---|
 | `/up/start_tracking` | `apriltag_interfaces/action/StartTracking` | Served by `apriltag_control`. `start: true` (only in `IDLE`) closes AMCL, enables detection, resets controller state and tracks Stage 1 + 2 until aligned (succeed → `IN_POSITION`, nothing restored) or the tag is lost / a service fails (abort, restored). `start: false` stops tracking or leaving, abandons `IN_POSITION`, and publishes a zero velocity command. Feedback: `tracking: x_err=… y_err=… yaw_err=… state=… amcl=… lidar_safety=…` |
-| `/up/leave_cs` | `apriltag_interfaces/action/StartTracking` | Served by `apriltag_control`. `start: true` (only in `IN_POSITION`) tracks back to `leave_distance` on `/pre_cmd_vel` until aligned (succeed) or the tag is lost (abort); either way detection is disabled and lidar safety / AMCL are restored, then `IDLE`. `start: false` (only in `LEAVING`) stops leaving. Same feedback as `start_tracking` |
+| `/up/leave_cs` | `apriltag_interfaces/action/StartTracking` | Served by `apriltag_control`. `start: true` (only in `IN_POSITION`) backs straight up at `-max_vx` on `/pre_cmd_vel` until the camera-to-tag forward distance ≥ `leave_distance` (succeed) or the tag is lost (abort); either way detection is disabled and lidar safety / AMCL are restored, then `IDLE`. `start: false` (only in `LEAVING`) stops leaving. Same feedback as `start_tracking` |
 
 ### TF Transforms
 
@@ -256,10 +256,10 @@ Broadcasts `camera_frame → apriltag_<tag_id>` for each detected tag.
 
 ## Logging
 
-Both launch files print log lines without time and without ros2 launch's `[<process>-N]` prefix (`output_format='{line}'`). Every `apriltag_control` message starts with its current state, padded so the messages line up:
+Both launch files print log lines without time and without ros2 launch's `[<process>-N]` prefix (`output_format='{line}'`). Every `apriltag_control` message starts with its current state:
 
 ```
-[INFO] [up.apriltag_control][stage LEAVING    ] : [publish] /pre_cmd_vel vx=-0.021 vy=+0.000 wz=+0.001
+[INFO] [up.apriltag_control][stage LEAVING] : [publish] /pre_cmd_vel vx=-0.100 vy=+0.000 wz=+0.000
 [INFO] [up.apriltag_detection]: Detection is disabled. Waiting for apriltag_control to enable it.
 ```
 
@@ -286,7 +286,8 @@ Parameters are hard-coded in `AprilTagDetectionNode.__init__()` (`apriltag/detec
 |---|---|---|---|
 | `tag_size` | `0.0635` m | `detection_node.py` | **Edge of the tag's black square (8 × 8 cells, without the white border). Must match the printed tag** |
 | `camera_y_offset` | `0.026` m (= `0.036` mount + `y_offset` `-0.01` trim) | `control_node.py` | Camera lateral offset from the robot centre line, + = left |
-| Tag family | `tag36h11` | `detection_node.py` | AprilTag family |
+| `tag_family` | `tag36h11` (ROS parameter, launch arg `tag_family:=` in `april_tag.launch.py`) | `detection_node.py` | AprilTag family of the printed tag. The virtual test sim always draws `tag36h11` |
+| `tag_id` | `-1` (ROS parameter, not in the launch files) | `detection_node.py` | Only this tag ID is tracked; `-1` tracks the closest tag of any ID |
 | `stop_x/y/yaw_error_tolerance` | `0.05` m / `0.05` m / `0.05` rad | `control_node.py` | A stage is aligned when all errors stay within these |
 | `stop_hold_seconds` | `1.0` s | `control_node.py` | ... for this long |
 | `max_vx`, `max_vy` | `0.5` m/s | `control_node.py` | Linear velocity saturation |
@@ -304,7 +305,7 @@ ROS parameters of `apriltag_control`:
 |---|---|
 | `stage1_distance` | `0.50` m (Stage 1 target distance to the tag) |
 | `stage2_distance` | `0.28` m (Stage 2, final target distance to the tag) |
-| `leave_distance` | `0.40` m (`leave_cs` target distance to the tag) |
+| `leave_distance` | `1.0` m (`leave_cs` stops once the camera-to-tag forward distance reaches it) |
 | `manage_amcl_and_lidar_safety` | `true` (`false` skips every AMCL and lidar safety call; tracking is never blocked by them) |
 | `amcl_check_service` | `/check_mcl_if_trigger` |
 | `amcl_close_service` | `/close_amcl` |
@@ -363,11 +364,11 @@ apriltag_ws/
 
 1. **Stage 1** — track to `stage1_distance` (0.50 m). When all errors stay within tolerance for `stop_hold_seconds`, the robot stops and the lidar safety field is disabled.
 2. **Stage 2** — track to `stage2_distance` (0.28 m). When converged the robot stops, the goal succeeds and the node holds in `IN_POSITION` (AMCL closed, lidar safety disabled).
-3. **Leave** (`leave_cs`) — track to `leave_distance` (0.40 m) with the same controller and tolerances as Stage 2; the robot moves backward because the target is farther than Stage 2. When converged the robot stops, detection is disabled and AMCL / lidar safety are restored.
+3. **Leave** (`leave_cs`) — no planner / LQR: every tag pose publishes `vx = -max_vx, vy = 0, wz = 0` on `/pre_cmd_vel` until the camera-to-tag forward distance ≥ `leave_distance` (1.0 m); y / yaw are not checked and there is no hold time. Then the robot stops (`Leave reached 1.00m (forward=…m).`), detection is disabled and AMCL / lidar safety are restored. Losing the tag for `lost_target_timeout` stops the robot and aborts the leave.
 
 ### Trajectory Planner
 
-The reference for x, y and yaw starts at the current error and slides toward zero on all three axes at once, with first-order smoothing (`smooth_tau = 0.5 s`). It is reset at the start of each stage and of leaving.
+The reference for x, y and yaw starts at the current error and slides toward zero on all three axes at once, with first-order smoothing (`smooth_tau = 0.5 s`). It is reset at the start of each stage. Leaving does not use it.
 
 ### LQR Controller
 
