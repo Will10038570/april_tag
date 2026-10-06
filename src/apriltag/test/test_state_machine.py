@@ -1,23 +1,30 @@
-"""Transition table of apriltag_control's TrackingState machine."""
+"""Transition table and goal rules of apriltag_control's TrackingState machine."""
 
 import pytest
 
 from apriltag.control_node import (
+    ACTIVE_STATES,
     ALLOWED_TRANSITIONS,
-    CONTROL_ACTIVE_STATES,
-    STOPPABLE_STATES,
+    GOAL_RULES,
+    Step,
     TrackingState as S,
+    is_goal_accepted,
     is_transition_allowed,
 )
 
 EXPECTED = {
-    S.IDLE: {S.STARTING},
-    S.STARTING: {S.STAGE1, S.FINISHING},
-    S.STAGE1: {S.STAGE2, S.FINISHING},
-    S.STAGE2: {S.IN_POSITION, S.FINISHING},
-    S.IN_POSITION: {S.LEAVING, S.FINISHING},
-    S.LEAVING: {S.FINISHING},
-    S.FINISHING: {S.IDLE},
+    S.IDLE: {S.STAGE1, S.LEAVING},
+    S.STAGE1: {S.STAGE2, S.IDLE},
+    S.STAGE2: {S.IDLE},
+    S.LEAVING: {S.IDLE},
+}
+
+# (action, start) -> states in which the goal is accepted
+EXPECTED_GOALS = {
+    ('start_tracking', True): {S.IDLE},
+    ('start_tracking', False): {S.STAGE1, S.STAGE2},
+    ('leave_cs', True): {S.IDLE},
+    ('leave_cs', False): {S.LEAVING},
 }
 
 
@@ -36,18 +43,31 @@ def test_is_transition_allowed(src, dst):
 
 
 @pytest.mark.parametrize('src, dst', [
-    (S.IDLE, S.FINISHING),         # STARTING ends through FINISHING, IDLE never does
-    (S.IDLE, S.STAGE1),            # must go through STARTING
-    (S.STAGE2, S.IDLE),            # cleanup always goes through FINISHING
-    (S.STAGE2, S.LEAVING),
-    (S.FINISHING, S.IN_POSITION),  # Stage 2 success goes straight to IN_POSITION
-    (S.IN_POSITION, S.IDLE),
-    (S.LEAVING, S.IN_POSITION),
+    (S.IDLE, S.STAGE2),       # Stage 2 only follows Stage 1
+    (S.IDLE, S.IDLE),
+    (S.STAGE1, S.LEAVING),    # leave_cs only starts from IDLE
+    (S.STAGE2, S.STAGE1),
+    (S.STAGE2, S.LEAVING),    # Stage 2 aligned goes back to IDLE first
+    (S.LEAVING, S.STAGE1),
 ])
 def test_rejected_transitions(src, dst):
     assert not is_transition_allowed(src, dst)
 
 
-def test_control_and_stoppable_states():
-    assert CONTROL_ACTIVE_STATES == {S.STAGE1, S.STAGE2, S.LEAVING}
-    assert STOPPABLE_STATES == {S.STARTING, S.STAGE1, S.STAGE2, S.LEAVING}
+def test_active_states_and_steps():
+    assert ACTIVE_STATES == {S.STAGE1, S.STAGE2, S.LEAVING}
+    assert [s.value for s in Step] == ['preparing', 'running', 'ending']
+
+
+def test_goal_rules_match_design():
+    assert GOAL_RULES == EXPECTED_GOALS
+
+
+@pytest.mark.parametrize('action, start', list(EXPECTED_GOALS))
+@pytest.mark.parametrize('state', list(S))
+def test_is_goal_accepted(action, start, state):
+    assert is_goal_accepted(action, start, state) == (state in EXPECTED_GOALS[(action, start)])
+
+
+def test_unknown_action_is_rejected():
+    assert not is_goal_accepted('dock', True, S.IDLE)

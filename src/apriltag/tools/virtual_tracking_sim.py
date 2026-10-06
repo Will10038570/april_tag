@@ -9,11 +9,12 @@ apriltag_detection and apriltag_control nodes run unmodified:
   /cmd_vel (Stage 1) and /pre_cmd_vel (Stage 2 and leaving);
 - a synthetic camera image of the tag is rendered from the AMR/tag relative
   pose and published with camera_info, so apriltag_detection really detects it;
-- Start sends the start_tracking goal. When it succeeds apriltag_control holds in
-  IN_POSITION (AMCL closed, lidar safety disabled, checked here as "held");
-  Leave then sends the leave_cs goal (headless: sent automatically) and the run
-  ends with its result, where AMCL and lidar safety must be restored. Stop in
-  IN_POSITION abandons the alignment (start_tracking start=False);
+- Start sends the start_tracking goal. When it succeeds apriltag_control is
+  back in IDLE with AMCL closed and lidar safety disabled (checked here as
+  "held"); the sim waits in ALIGNED. Leave then sends the leave_cs goal
+  (headless: sent automatically) and the run ends with its result, where AMCL
+  and lidar safety must be restored. Leave without a previous Start runs a
+  leave-only run (leave_cs is accepted in IDLE);
 - a fake G7+ node (FakeG7Services) stands in for AMCL and the PLC lidar safety.
   It only keeps two bool flags, switched through the same AMCL services and lidar
   safety topic apriltag_control uses on the robot, so the call order and restores
@@ -26,8 +27,8 @@ cmd_vel commands. Each finished run is saved as CSV + PNG.
 Controls:
     top view   drag AMR body = move, drag the round handle in front = rotate,
                mouse wheel or a / d = rotate 2 deg (only while not running)
-    keys       s = start, l = leave (in IN_POSITION), x = stop (cancel goal, or
-               abandon in IN_POSITION), r = reset to initial pose,
+    keys       s = start, l = leave (in ALIGNED, or a leave-only run when idle),
+               x = stop (cancel the running goal), r = reset to initial pose,
                + / - = zoom top view, q or Esc = quit
 """
 
@@ -64,9 +65,9 @@ WINDOW_NAME = 'AprilTag virtual tracking'
 FEEDBACK_RE = re.compile(r'x_err=(\S+)\s+y_err=(\S+)\s+yaw_err=(\S+)')
 # apriltag_control prefixes its log messages with '[stage <STATE>] : '
 STAGE_PREFIX_RE = re.compile(r'^\[stage [A-Z_0-9 ]+\] : ')
-# STARTING / RUNNING: start_tracking goal; IN_POSITION: waiting for leave;
-# LEAVING: leave_cs goal
-ACTIVE_PHASES = ('STARTING', 'RUNNING', 'IN_POSITION', 'LEAVING')
+# STARTING / RUNNING: start_tracking goal; ALIGNED: start_tracking succeeded,
+# waiting for leave; LEAVING: leave_cs goal
+ACTIVE_PHASES = ('STARTING', 'RUNNING', 'ALIGNED', 'LEAVING')
 STAGE_LABELS = {1: 'S1', 2: 'S2', 3: 'L'}
 
 
@@ -460,17 +461,8 @@ class VirtualTrackingSim(Node):
             if not self.stage_distances_known:
                 self.result_message = 'Stage distances not read from apriltag_control yet.'
                 return
-            self.initial_pose = self.pose.copy()
-            self.run = RunLog()
-            self.trail = [(self.pose[0], self.pose[1])]
-            self.stage = 1
-            self.control_log = []
-            self.result_message = ''
-            self.run_start = time.monotonic()
-            self.run_start_ros = self.get_clock().now()
-            self.run_end = None
+            self._begin_run_locked(stage=1)
             self.phase = 'STARTING'
-            self.finished.clear()
 
         goal = StartTracking.Goal()
         goal.start = True
@@ -478,43 +470,52 @@ class VirtualTrackingSim(Node):
         future.add_done_callback(self._on_goal_response)
         self.get_logger().info('start_tracking goal sent.')
 
+    def _begin_run_locked(self, stage: int):
+        """Start a new run log from the current pose; the caller must hold self.lock."""
+        self.initial_pose = self.pose.copy()
+        self.run = RunLog()
+        self.trail = [(self.pose[0], self.pose[1])]
+        self.stage = stage
+        self.control_log = []
+        self.result_message = ''
+        self.run_start = time.monotonic()
+        self.run_start_ros = self.get_clock().now()
+        self.run_end = None
+        self.finished.clear()
+
     def stop(self):
         with self.lock:
-            if self.phase == 'IN_POSITION':
-                handle = None
-                abandon = True
-            else:
-                handle = self.goal_handle if self.phase in ACTIVE_PHASES else None
-                abandon = False
-        if abandon:
-            self.abandon()
+            aligned = self.phase == 'ALIGNED'
+            handle = self.goal_handle if self.phase in ACTIVE_PHASES else None
+        if aligned:
+            # apriltag_control is in IDLE: start_tracking start=False would be rejected
+            self.get_logger().info('ALIGNED: nothing to stop; press l to leave (restores AMCL / lidar safety).')
         elif handle is not None:
             handle.cancel_goal_async()
 
     def leave(self):
-        """Send leave_cs start=True; only in IN_POSITION."""
+        """Send leave_cs start=True: continues the run in ALIGNED, else starts a leave-only run."""
         with self.lock:
-            if self.phase != 'IN_POSITION':
+            if self.phase in ACTIVE_PHASES and self.phase != 'ALIGNED':
                 return
             if not self.leave_client.server_is_ready():
                 self.result_message = 'leave_cs action server not available.'
                 return
+            if self.phase == 'ALIGNED':
+                self.run.leave_t = time.monotonic() - self.run_start
+            else:
+                if not self.stage_distances_known:
+                    self.result_message = 'Stage distances not read from apriltag_control yet.'
+                    return
+                self._begin_run_locked(stage=3)
+                self.run.leave_t = 0.0
             self.phase = 'LEAVING'
             self.stage = 3
-            self.run.leave_t = time.monotonic() - self.run_start
         goal = StartTracking.Goal()
         goal.start = True
         future = self.leave_client.send_goal_async(goal, feedback_callback=self._on_feedback)
         future.add_done_callback(self._on_leave_goal_response)
         self.get_logger().info('leave_cs goal sent.')
-
-    def abandon(self):
-        """Send start_tracking start=False in IN_POSITION: apriltag_control abandons and restores."""
-        goal = StartTracking.Goal()
-        goal.start = False
-        future = self.action_client.send_goal_async(goal)
-        future.add_done_callback(self._on_abandon_goal_response)
-        self.get_logger().info('start_tracking start=False sent (abandon IN_POSITION).')
 
     def reset(self):
         self.stop()
@@ -582,12 +583,12 @@ class VirtualTrackingSim(Node):
         with self.lock:
             if self.phase != 'RUNNING':
                 return  # reset while running
-            self.phase = 'IN_POSITION'
+            self.phase = 'ALIGNED'
             self.result_message = response.result.message
             self.goal_handle = None
-        # apriltag_control holds here: AMCL stays closed, lidar safety disabled
+        # apriltag_control is back in IDLE with AMCL closed, lidar safety disabled
         amcl_on, lidar_safety_disabled = self.fake_g7.state()
-        held = (f"in position: amcl={'on' if amcl_on else 'off'} "
+        held = (f"aligned: amcl={'on' if amcl_on else 'off'} "
                 f"lidar_safety={'disabled' if lidar_safety_disabled else 'enabled'}")
         if not amcl_on and lidar_safety_disabled:
             self.get_logger().info(f'{held} (held)')
@@ -611,18 +612,6 @@ class VirtualTrackingSim(Node):
         phase = self._status_phase(response.status)
         self.get_logger().info(f'leave_cs finished: {phase} - {response.result.message}')
         self._end_run(phase, response.result.message, 'LEAVING')
-
-    def _on_abandon_goal_response(self, future):
-        handle = future.result()
-        if not handle.accepted:
-            self.get_logger().error('start_tracking start=False rejected.')
-            return
-        handle.get_result_async().add_done_callback(self._on_abandon_result)
-
-    def _on_abandon_result(self, future):
-        response = future.result()
-        self.get_logger().info(f'abandon finished: {response.result.message}')
-        self._end_run('ABANDONED', response.result.message, 'IN_POSITION')
 
     # ---- logging ----------------------------------------------------------
 
@@ -734,13 +723,6 @@ DIM = (140, 140, 140)
 C_X = (230, 150, 40)     # blue
 C_Y = (40, 150, 255)     # orange
 C_YAW = (80, 200, 80)    # green
-
-
-def shade(color, k):
-    """k < 1 darkens, k > 1 lightens towards white."""
-    if k <= 1:
-        return tuple(int(c * k) for c in color)
-    return tuple(int(c + (255 - c) * (k - 1)) for c in color)
 C_ROBOT = (255, 200, 120)
 C_CAM = (0, 220, 255)
 C_TOL = (55, 75, 55)
@@ -932,7 +914,7 @@ class Dashboard:
         cv2.rectangle(img, (x0 + 4, y0 + 4), (x0 + w - 5, y0 + h - 5), PANEL, -1)
         frame = snap['image']
         title = ('marked_image from apriltag_detection' if snap['image_is_marked']
-                 else 'synthetic camera image (detection disabled)')
+                 else 'synthetic camera image (no marked_image yet)')
         put(img, title, (x0 + 12, y0 + 22), scale=0.5)
         if frame is None:
             return
@@ -963,14 +945,12 @@ class Dashboard:
             legend=[('x_err m', C_X), ('y_err m', C_Y), ('yaw_err rad', C_YAW)],
         )
         cmd_raw = np.array(snap['cmd_raw'], dtype=float).reshape(-1, 4)
-        applied = [(t, samples[:, 7 + i], shade(c, 0.55), 4) for i, c in enumerate((C_X, C_Y, C_YAW))]
-        raw_lines = [(cmd_raw[:, 0], cmd_raw[:, 1 + i], shade(c, 1.35), 1) for i, c in enumerate((C_X, C_Y, C_YAW))]
-        raw_dots = [(cmd_raw[:, 0], cmd_raw[:, 1 + i], shade(c, 1.35), 2, True)
-                    for i, c in enumerate((C_X, C_Y, C_YAW))]
+        raw_lines = [(cmd_raw[:, 0], cmd_raw[:, 1 + i], c, 1) for i, c in enumerate((C_X, C_Y, C_YAW))]
+        raw_dots = [(cmd_raw[:, 0], cmd_raw[:, 1 + i], c, 2, True) for i, c in enumerate((C_X, C_Y, C_YAW))]
         draw_plot(
-            img, CMD_RECT, 'cmd_vel   thick = applied by sim (50Hz),  thin+dot = raw from control',
+            img, CMD_RECT, 'cmd_vel / pre_cmd_vel sent by control   dot = one message',
             t_max, (-0.6, 0.6),
-            lines=applied + raw_lines, dots=raw_dots,
+            lines=raw_lines, dots=raw_dots,
             hlines=[(0.5, C_LIMIT), (-0.5, C_LIMIT)], vlines=vlines,
             legend=[('vx m/s', C_X), ('vy m/s', C_Y), ('wz rad/s', C_YAW), ('limit', C_LIMIT)],
         )
@@ -990,8 +970,7 @@ class Dashboard:
 
         phase = snap['phase']
         phase_color = {'SUCCEEDED': (80, 220, 80), 'ABORTED': (80, 80, 255), 'CANCELED': (80, 180, 255),
-                       'REJECTED': (80, 80, 255), 'IN_POSITION': (80, 220, 220),
-                       'ABANDONED': (80, 180, 255)}.get(phase, TEXT)
+                       'REJECTED': (80, 80, 255), 'ALIGNED': (80, 220, 220)}.get(phase, TEXT)
         sx = x0 + 545
         stage_text = 'leave' if snap['stage'] == 3 else f'stage {snap["stage"]}'
         put(img, f'{phase}', (sx, y0 + 34), phase_color, 0.8, 2)

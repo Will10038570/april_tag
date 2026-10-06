@@ -1,11 +1,12 @@
 """ROS I/O helpers for message conversion and publishing."""
 
 import array
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
+from apriltag_interfaces.msg import TagPose, TagPoseArray
+from geometry_msgs.msg import TransformStamped, Twist
 from sensor_msgs.msg import Image
 
 from apriltag.domain.app_types import CameraIntrinsics
@@ -90,52 +91,64 @@ def publish_twist(cmd_pub, vx: float, vy: float, vw: float) -> None:
     cmd_pub.publish(twist)
 
 
-def publish_pose_and_tf(
+def _quaternion_from_rotation(r_mat: Optional[np.ndarray]) -> Tuple[float, float, float, float]:
+    """Return (qx, qy, qz, qw) for a rotation matrix; identity if missing or invalid."""
+    if r_mat is None:
+        return 0.0, 0.0, 0.0, 1.0
+    try:
+        return rotation_matrix_to_quaternion(np.asarray(r_mat))
+    except Exception:
+        return 0.0, 0.0, 0.0, 1.0
+
+
+def publish_tag_poses(
     stamp,
     camera_frame: str,
-    pose_pub,
+    poses_pub,
     tf_broadcaster,
-    tag_id,
-    t_vec,
-    r_mat: Optional[np.ndarray] = None,
+    targets: List[dict],
 ) -> None:
-    """Publish PoseStamped and TF for one AprilTag target.
+    """Publish one TagPoseArray with all targets and a TF per target.
 
-    `stamp` should be the source image's header stamp so consumers can compute
-    dt from capture time.
+    `targets` are dictionaries with family, id (str), t and R from
+    draw_detections_and_collect_targets; an empty list publishes an empty
+    array. `stamp` should be the source image's header stamp so consumers can
+    compute dt from capture time. TF child frames are `<family>_<id>`.
     """
-    pose_msg = PoseStamped()
-    pose_msg.header.stamp = stamp
-    pose_msg.header.frame_id = camera_frame
-    pose_msg.pose.position.x = float(t_vec[0])
-    pose_msg.pose.position.y = float(t_vec[1])
-    pose_msg.pose.position.z = float(t_vec[2])
+    array_msg = TagPoseArray()
+    array_msg.header.stamp = stamp
+    array_msg.header.frame_id = camera_frame
+    transforms = []
 
-    if r_mat is not None:
-        try:
-            qx, qy, qz, qw = rotation_matrix_to_quaternion(np.asarray(r_mat))
-        except Exception:
-            qx = qy = qz = 0.0
-            qw = 1.0
-    else:
-        qx = qy = qz = 0.0
-        qw = 1.0
+    for target in targets:
+        t_vec = target["t"]
+        qx, qy, qz, qw = _quaternion_from_rotation(target.get("R", None))
 
-    pose_msg.pose.orientation.x = qx
-    pose_msg.pose.orientation.y = qy
-    pose_msg.pose.orientation.z = qz
-    pose_msg.pose.orientation.w = qw
-    pose_pub.publish(pose_msg)
+        tag = TagPose()
+        tag.family = target["family"]
+        tag.id = target["id"]
+        tag.pose.position.x = float(t_vec[0])
+        tag.pose.position.y = float(t_vec[1])
+        tag.pose.position.z = float(t_vec[2])
+        tag.pose.orientation.x = qx
+        tag.pose.orientation.y = qy
+        tag.pose.orientation.z = qz
+        tag.pose.orientation.w = qw
+        array_msg.tags.append(tag)
 
-    tf_msg = TransformStamped()
-    tf_msg.header.stamp = stamp
-    tf_msg.header.frame_id = camera_frame
-    tf_msg.child_frame_id = f"apriltag_{tag_id}"
-    tf_msg.transform.translation.x = float(t_vec[0])
-    tf_msg.transform.translation.y = float(t_vec[1])
-    tf_msg.transform.translation.z = float(t_vec[2])
-    tf_msg.transform.rotation.x = qx
-    tf_msg.transform.rotation.y = qy
-    tf_msg.transform.rotation.z = qz
-    tf_msg.transform.rotation.w = qw
-    tf_broadcaster.sendTransform(tf_msg)
+        tf_msg = TransformStamped()
+        tf_msg.header.stamp = stamp
+        tf_msg.header.frame_id = camera_frame
+        tf_msg.child_frame_id = f"{target['family']}_{target['id']}"
+        tf_msg.transform.translation.x = float(t_vec[0])
+        tf_msg.transform.translation.y = float(t_vec[1])
+        tf_msg.transform.translation.z = float(t_vec[2])
+        tf_msg.transform.rotation.x = qx
+        tf_msg.transform.rotation.y = qy
+        tf_msg.transform.rotation.z = qz
+        tf_msg.transform.rotation.w = qw
+        transforms.append(tf_msg)
+
+    poses_pub.publish(array_msg)
+    if transforms:
+        tf_broadcaster.sendTransform(transforms)

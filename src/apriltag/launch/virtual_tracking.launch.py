@@ -1,8 +1,9 @@
 """End-to-end virtual test: real apriltag_detection + apriltag_control, with the
 camera, the AMR and the G7+ AMCL services / lidar safety topic replaced by
-tools/virtual_tracking_sim. A run is start_tracking (Stage 1 + 2, IN_POSITION)
-followed by leave_cs; headless + auto_start runs both and checks AMCL / lidar
-safety in IN_POSITION (held) and at the end (restored).
+tools/virtual_tracking_sim. A run is start_tracking (Stage 1 + 2, back to IDLE
+with AMCL closed and lidar safety disabled) followed by leave_cs; headless +
+auto_start runs both and checks AMCL / lidar safety after start_tracking
+(held) and at the end (restored).
 
 Runs in ROS domain 65, the same as the robot: apriltag_control publishes the
 absolute /cmd_vel, /pre_cmd_vel and /g7_plc/disable_lidar_safety and calls the AMCL
@@ -41,6 +42,10 @@ def generate_launch_description():
                               description='false: apriltag_control skips AMCL / lidar safety'),
         # simulation's own stage / leave distances, independent of launch/april_tag.launch.py;
         # the sim reads them back from apriltag_control
+        # detection families and the tag apriltag_control tracks; the sim draws tag36h11 id 0
+        DeclareLaunchArgument('detect_tag_families', default_value='tag36h11'),
+        DeclareLaunchArgument('tag_family', default_value='tag36h11'),
+        DeclareLaunchArgument('tag_id', default_value='0', description='-1 = any id'),
         DeclareLaunchArgument('stage1_distance', default_value='0.50'),
         DeclareLaunchArgument('stage2_distance', default_value='0.28'),
         DeclareLaunchArgument('leave_distance', default_value='1.0'),
@@ -53,6 +58,9 @@ def generate_launch_description():
         namespace='up',
         output='screen',
         output_format=OUTPUT_FORMAT,
+        parameters=[{
+            'tag_families': ParameterValue(LaunchConfiguration('detect_tag_families'), value_type=str),
+        }],
     )
 
     apriltag_control = Node(
@@ -69,6 +77,8 @@ def generate_launch_description():
             'stage1_distance': ParameterValue(LaunchConfiguration('stage1_distance'), value_type=float),
             'stage2_distance': ParameterValue(LaunchConfiguration('stage2_distance'), value_type=float),
             'leave_distance': ParameterValue(LaunchConfiguration('leave_distance'), value_type=float),
+            'tag_family': ParameterValue(LaunchConfiguration('tag_family'), value_type=str),
+            'tag_id': ParameterValue(LaunchConfiguration('tag_id'), value_type=str),
         }],
     )
 

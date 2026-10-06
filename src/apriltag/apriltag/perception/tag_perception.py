@@ -37,6 +37,17 @@ def extract_detection_data(raw_detection) -> Tuple[Optional[int], np.ndarray, Op
     return tag_id, corners, center
 
 
+def detection_family(raw_detection) -> str:
+    """Return the detection's tag family name; pupil_apriltags gives it as bytes."""
+    if isinstance(raw_detection, dict):
+        family = raw_detection.get("tag_family")
+    else:
+        family = getattr(raw_detection, "tag_family", None)
+    if isinstance(family, bytes):
+        return family.decode()
+    return str(family) if family is not None else ""
+
+
 def estimate_tag_pose(raw_detection, intrinsics: CameraIntrinsics, tag_size: float, detector) -> Optional[AprilTagPose]:
     """從 detection 物件提取位姿；需在 detect 時啟用 estimate_tag_pose。"""
     _ = intrinsics
@@ -74,7 +85,11 @@ def draw_detections_and_collect_targets(
     tag_size: float,
     logger,
 ):
-    """Draw detections and return target dictionaries (id, t, R) for publishing."""
+    """Draw detections and return target dictionaries (family, id, t, R) for publishing.
+
+    `id` is the decoded tag id as a decimal string, so it can be compared with
+    TagPose.id.
+    """
     targets = []
 
     for det in detections:
@@ -103,7 +118,8 @@ def draw_detections_and_collect_targets(
 
             t_vec = pose.t
             distance = float(np.linalg.norm(t_vec))
-            text = f"id:{tag_id} {distance:.2f} m"
+            family = detection_family(det)
+            text = f"{family}:{tag_id} {distance:.2f} m"
             if center_i:
                 cv2.putText(
                     img,
@@ -118,7 +134,8 @@ def draw_detections_and_collect_targets(
             # logger.info(text)
             targets.append(
                 {
-                    "id": tag_id,
+                    "family": family,
+                    "id": str(int(tag_id)),
                     "t": t_vec,
                     "R": pose.R,
                 }

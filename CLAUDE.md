@@ -66,7 +66,7 @@ docker exec april_tag_serive bash -ic '
 ```
 
 只 build 單一套件:`colcon build --symlink-install --packages-select apriltag`。
-改了 `apriltag_interfaces/action/*.action` 要先 build `apriltag_interfaces`。
+改了 `apriltag_interfaces/action/*.action` 或 `msg/*.msg`(`TagPose`、`TagPoseArray`)要先 build `apriltag_interfaces`。
 `realsense` 套件 build 時會有 stderr 輸出,不影響結果。
 
 ---
@@ -84,7 +84,7 @@ docker exec april_tag_serive bash -ic '
 
 ### 3.2 虛擬端到端測試(建議每次改 code 後必跑)
 
-`virtual_tracking.launch.py` 會啟動真正的 `apriltag_detection`、`apriltag_control`,以及取代相機 / AMR / G7+ AMCL 與 lidar safety 的 `virtual_tracking_sim`。一次 run = `start_tracking`(Stage 1 → Stage 2 → `IN_POSITION`)接著 `leave_cs`(退到 `leave_distance` 後還原 AMCL / lidar safety)。
+`virtual_tracking.launch.py` 會啟動真正的 `apriltag_detection`、`apriltag_control`,以及取代相機 / AMR / G7+ AMCL 與 lidar safety 的 `virtual_tracking_sim`。一次 run = `start_tracking`(Stage 1 → Stage 2 → 回 `IDLE`,AMCL 關、lidar safety disabled)接著 `leave_cs`(退到 `leave_distance` 後還原 AMCL / lidar safety)。
 
 **安全注意:** 預設 domain 是 65(與機器人相同),而 `apriltag_control` 會發 `/cmd_vel`、`/pre_cmd_vel`、`/g7_plc/disable_lidar_safety` 並呼叫 AMCL service。跑虛擬測試時:
 
@@ -105,17 +105,19 @@ docker exec april_tag_serive bash -ic '
 通過標準(看 log):
 
 ```
-[state] STAGE2 -> IN_POSITION (Stage 2 aligned)
-[action] start_tracking result: SUCCEEDED success=True message='Stage 2 aligned at 0.28m. ...'
-in position: amcl=off lidar_safety=disabled (held)
-[state] IN_POSITION -> LEAVING (leave_cs goal accepted, back to 1.00m)
+[step] STAGE2 running -> ending (Stage 2 aligned at 0.28m)
+[state] STAGE2 -> IDLE (cleanup done)
+[action] start_tracking result: SUCCEEDED success=True message='Stage 2 aligned at 0.28m. ... AMCL off, lidar safety disabled; send leave_cs to restore. ...'
+aligned: amcl=off lidar_safety=disabled (held)
+[state] IDLE -> LEAVING (leave_cs goal accepted, back to 1.00m)
 [publish] /pre_cmd_vel vx=-0.100 vy=+0.000 wz=+0.000
 [action] leave_cs result: SUCCEEDED success=True message='Leave reached 1.00m (forward=1.0xxm). ...'
 after goal: amcl=on lidar_safety=enabled (restored)
 Run saved to .../virtual_tracking_logs/<time>_succeeded_*.csv
 ```
 
-`(held)` 表示 `IN_POSITION` 時 AMCL 仍關、lidar safety 仍 disabled(正確);若印 `(NOT held)` 表示太早還原。
+`(held)` 表示 Stage 2 成功回 `IDLE` 後 AMCL 仍關、lidar safety 仍 disabled(正確);若印 `(NOT held)` 表示太早還原。
+結束時 `apriltag_control` 的 shutdown 一律還原(AMCL check / open),此時 sim 的 fake AMCL 可能已經結束,會印 `Cannot check AMCL: service /check_mcl_if_trigger not available.`、`Restore failed` 與 launch 的 `escalating to 'SIGTERM'`,不影響測試結果。
 
 輸出檔在**執行目錄**下的 `virtual_tracking_logs/`(`log_dir` 預設是相對路徑):`*_sim.csv`、`*_feedback.csv`、`*_cmd_raw.csv`、`*.png`。所以請先 `cd /mnt/work_space` 再 launch,否則 log 會散落到別的目錄(例如 `src/apriltag/launch/`、`src/apriltag/tools/` 底下)。
 
@@ -127,7 +129,7 @@ docker exec -it april_tag_serive bash -ic '
   ros2 launch apriltag virtual_tracking.launch.py'
 ```
 
-按鍵:`s` 開始、`l` 離開(送 `leave_cs`,僅 `IN_POSITION`)、`x` 取消(`IN_POSITION` 時為放棄對位,送 `start_tracking` `start:false`)、`r` 重置、`a`/`d` 旋轉初始 yaw(±2°,僅未執行時)、`+`(或 `=`)/`-` 縮放、`q` 或 `Esc` 離開(會連同整個 launch 一起結束)。未執行時,上半部畫面可用滑鼠拖曳車體移動、拖曳把手或滾輪旋轉,也可點畫面上的按鈕。
+按鍵:`s` 開始、`l` 離開(送 `leave_cs`;sim 在 `ALIGNED` 時接續同一個 run,沒有 run 時為只有 leave 的 run)、`x` 取消進行中的 goal(`ALIGNED` 時沒有東西可停)、`r` 重置、`a`/`d` 旋轉初始 yaw(±2°,僅未執行時)、`+`(或 `=`)/`-` 縮放、`q` 或 `Esc` 離開(會連同整個 launch 一起結束)。未執行時,上半部畫面可用滑鼠拖曳車體移動、拖曳把手或滾輪旋轉,也可點畫面上的按鈕。
 
 | Launch 參數 | 預設 |
 |---|---|
@@ -137,6 +139,7 @@ docker exec -it april_tag_serive bash -ic '
 | `log_dir` | `virtual_tracking_logs` |
 | `manage_amcl_and_lidar_safety` | `true`(注意:與 `april_tag.launch.py` 的預設 `false` 不同) |
 | `stage1_distance` / `stage2_distance` / `leave_distance` | `0.50` / `0.28` / `1.0`(sim 會從 `apriltag_control` 讀回,不直接設在 sim 上) |
+| `detect_tag_families` / `tag_family` / `tag_id` | `tag36h11` / `tag36h11` / `0`(sim 畫的是 tag36h11 id 0;`tag_id:=5` 可測過濾:約 1 s 後 `AprilTag lost` ABORTED 並還原) |
 
 手動送 goal 測試(另開終端,同樣設 `ROS_DOMAIN_ID=99` 與 `lo` 的 `CYCLONEDDS_URI`):用 `headless:=true auto_start:=false` 啟動,sim 的物理與相機照常運作,但不會自己送 goal。
 
@@ -155,7 +158,7 @@ docker exec april_tag_serive bash -ic '
   colcon test --packages-select apriltag && colcon test-result --all'
 ```
 
-`src/apriltag/test/test_state_machine.py` 測 `TrackingState` 轉移表(59 tests)。新增的 pytest 請放在 `src/apriltag/test/`,同樣用上面的指令在 container 內執行。
+`src/apriltag/test/test_state_machine.py` 測 `TrackingState` 轉移表與 goal 接受表(43 tests),加上 `test_leave_step.py`(4)與 `test_target_flow.py`(6,tag 選擇)共 53。新增的 pytest 請放在 `src/apriltag/test/`,同樣用上面的指令在 container 內執行。
 
 ---
 
@@ -167,23 +170,29 @@ docker exec april_tag_serive bash -ic '
 # 終端 1:相機 + detection + control
 docker exec -it april_tag_serive bash -ic '
   ros2 launch apriltag april_tag.launch.py manage_amcl_and_lidar_safety:=true'
+# 指定要追的 tag / 偵測多個 family:tag_family:=tag36h11 tag_id:=3 detect_tag_families:="tag36h11 tag25h9"
 
-# 終端 2:開始對位(成功後停在 IN_POSITION,AMCL 關、lidar safety disabled)
+# 終端 2:開始對位(成功後回 IDLE,AMCL 關、lidar safety disabled)
 docker exec -it april_tag_serive bash -ic '
   ros2 action send_goal /up/start_tracking apriltag_interfaces/action/StartTracking "{start: true}"'
-# 離開(退到 leave_distance,完成後開 AMCL、enable lidar safety)
+# 離開(IDLE 時接受,不需先對位;退到 leave_distance,完成後開 AMCL、enable lidar safety)
 docker exec -it april_tag_serive bash -ic '
   ros2 action send_goal /up/leave_cs apriltag_interfaces/action/StartTracking "{start: true}"'
-# 停止任何進行中的對位 / 離開;在 IN_POSITION 時為放棄對位並還原
+# 停止對位(僅 STAGE1 / STAGE2 接受,停止並還原)
 docker exec -it april_tag_serive bash -ic '
   ros2 action send_goal /up/start_tracking apriltag_interfaces/action/StartTracking "{start: false}"'
+# 停止離開(僅 LEAVING 接受,停止並還原)
+docker exec -it april_tag_serive bash -ic '
+  ros2 action send_goal /up/leave_cs apriltag_interfaces/action/StartTracking "{start: false}"'
 ```
 
-`apriltag_control` 是狀態機:`IDLE → STARTING → STAGE1 → STAGE2 → IN_POSITION → LEAVING → FINISHING → IDLE`(詳見 README 的 State Machine)。`start_tracking` `start:true` 只在 `IDLE` 接受;`leave_cs` `start:true` 只在 `IN_POSITION`、`start:false` 只在 `LEAVING` 接受;其餘會被拒絕並印 `[action] … goal rejected: … state=…`。`IN_POSITION` 沒有 timeout。
+`apriltag_control` 依 launch 參數 `tag_family` / `tag_id`(預設 `tag36h11` / `0`,`-1` = 任何 id)從 `/up/apriltag_poses` 挑要追的 tag,同時有多個符合時取前向距離 z 最小(且 > 0)的;沒有符合的就當作 tag 不見(`lost_target_timeout` 1 s 後 abort)。
+
+`apriltag_control` 是狀態機:`IDLE → STAGE1 → STAGE2 → IDLE`(`start_tracking`)與 `IDLE → LEAVING → IDLE`(`leave_cs`),每個非 IDLE state 內有 `preparing → running → ending` 三個步驟(詳見 README 的 State Machine)。AMCL / lidar safety 由各 state 自己切換:`STAGE1` 準備時 enable lidar、關 AMCL;`STAGE2` 準備時 disable lidar;Stage 2 成功只停車就回 `IDLE`(AMCL 維持關、lidar 維持 disabled);`LEAVING` 結束、任何失敗 / 取消 / 停止與 shutdown 都會 enable lidar 並確保 AMCL 打開(不記錄是誰關的)。接受規則:`start_tracking` `start:true` / `leave_cs` `start:true` 只在 `IDLE`;`start_tracking` `start:false` 只在 `STAGE1` / `STAGE2`;`leave_cs` `start:false` 只在 `LEAVING`;action cancel 一律接受。其餘會被拒絕並印 `[action] … goal rejected: … state=…`。
 
 `april_tag.launch.py` 的 `manage_amcl_and_lidar_safety` 預設為 `false`(不動 AMCL / lidar safety);距離寫死在 launch 裡(`stage1_distance=0.50`、`stage2_distance=0.28`、`leave_distance=1.0`),Stage 1 速度發到 `/cmd_vel`,Stage 2 與 leave 發到 `/pre_cmd_vel`(G7+ 精準模式)。leave 不用 planner / LQR:固定發 `vx=-max_vx`(-0.1 m/s)、`vy=wz=0`,直到 camera→tag 前向距離 ≥ `leave_distance` 立即停(不檢查 y / yaw、無 hold)。
 
-`apriltag_detection` 啟動時是 **disabled**,不訂閱相機;收到 goal 後由 `apriltag_control` 呼叫 `/up/apriltag_detection/enable`(`std_srvs/srv/SetBool`)才開始偵測,`IN_POSITION` 期間維持開啟,流程結束(`FINISHING`)才關。所以沒送 goal 時 `/up/apriltag_pose` 沒有資料是正常的。
+`apriltag_detection` 啟動後就一直偵測,不受 `apriltag_control` 控制(沒有 enable service)。每張影像(收到 `camera_info` 之後)發一則 `apriltag_interfaces/msg/TagPoseArray` 到 `/up/apriltag_poses`,包含 `tag_families`(launch 參數 `detect_tag_families`,以空白分隔,預設 `tag36h11`;每個 family 一個 detector,CPU 隨數量增加)內所有偵測到的 tag(`family`、`id` 字串、`pose`),沒有 tag 時 `tags` 為空;每個 tag 廣播 TF `<camera_frame> → <family>_<id>`(如 `tag36h11_0`)。沒送 goal 時 `apriltag_control` 會忽略這些資料。
 
 ### 連線 / G7+ 介面檢查(在 container 內)
 
@@ -200,10 +209,11 @@ ros2 service call /open_amcl  std_srvs/srv/Empty "{}"
 除錯用:
 
 ```bash
-ros2 topic echo /up/apriltag_pose        # 只有 tracking 中才有資料
+ros2 topic echo /up/apriltag_poses       # 一直有資料(沒 tag 時 tags: [])
+ros2 run apriltag detection_viewer --ros-args -r __ns:=/up   # 最多 5 Hz 印 TagPoseArray:一行 header + 每個 tag 一行
 ros2 topic echo /cmd_vel                 # Stage 1
 ros2 topic echo /pre_cmd_vel             # Stage 2 / leave(leave 時 vx 為負)
-ros2 service call /up/apriltag_detection/enable std_srvs/srv/SetBool "{data: true}"   # 手動開偵測
+ros2 run tf2_ros tf2_echo camera_color_optical_frame tag36h11_0   # 單一 tag 的 TF(frame 依相機而定)
 ros2 run rqt_image_view rqt_image_view /up/apriltag/marked_image
 ```
 
@@ -247,8 +257,21 @@ ros2 run rqt_image_view rqt_image_view /up/apriltag/marked_image
 - 虛擬測試 headless(`domain_id:=99`、`lo`):`(held)`、`IN_POSITION -> LEAVING (… back to 1.00m)`、leave 期間 `*_cmd_raw.csv` 只有 `(-0.1, 0, 0)` 與結束時的零速、`Leave reached 1.00m (forward=1.005m)`(leave elapsed 7.0 s)、`SUCCEEDED`、`(restored)`
 - 實機尚未測
 
+2026-10-06 狀態機改為 `IDLE` / `STAGE1` / `STAGE2` / `LEAVING`(移除 `STARTING` / `IN_POSITION` / `FINISHING`,改用 state 內步驟)後,在同一 container 內實測:
+
+- `colcon test --packages-select apriltag`:47 tests,0 failures
+- 虛擬測試 headless(`domain_id:=99`、`lo`):`STAGE2 -> IDLE (cleanup done)`、`aligned: … (held)`、`IDLE -> LEAVING`、`Leave reached 1.00m`、`SUCCEEDED`、`(restored)`;leave 期間 `*_cmd_raw.csv` 只有 `(-0.1, 0, 0)` 與零速
+- CLI 情境(`headless:=true auto_start:=false`):`IDLE` 拒絕 `start_tracking`/`leave_cs` `start:false`;`IDLE` 直接 `leave_cs` 成功(AMCL 已開,不呼叫 open);`STAGE1` 拒絕兩個 `start:true`,`start_tracking false` 停止並還原;Stage 2 成功後再 `start_tracking` 會先 enable lidar;`LEAVING` 拒絕 `start_tracking false`,`leave_cs false` 停止並還原;`STAGE2` 時 action cancel → `CANCELED` 並還原;Stage 2 成功後在 `IDLE` SIGINT → enable lidar、AMCL check off → open → check on
+- 未測:`STAGE1` preparing 期間 SIGINT(sim 的 fake AMCL 回應太快,難以卡在該時間點);實機尚未測
+
+2026-10-06 detection 改為持續偵測、發布所有 tag(`TagPoseArray` on `/up/apriltag_poses`,移除 `/up/apriltag_pose` 與 `~/enable`,control 以 `tag_family` / `tag_id` 選 tag,刪除 `tools/print_tag_pose.py`)後,在同一 container 內實測:
+
+- `colcon test --packages-select apriltag`:53 tests,0 failures
+- 虛擬測試 headless(`domain_id:=99`、`lo`):`STAGE2 -> IDLE`、`(held)`、`Leave reached 1.00m (forward=1.000m)`、`SUCCEEDED`、`(restored)`
+- `auto_start:=false` 沒送 goal 時 `/up/apriltag_poses` 有資料(`family: tag36h11`、`id: '0'`)、沒有 `apriltag_detection` 的 enable service、`tf2_echo … tag36h11_0` 有 transform
+- `tag_id:=5`:`AprilTag lost for 1.00s` → ABORTED、`max |cmd|` 全 0、`(restored)`(過濾有效,`tag_id:=5` 以字串傳入無型別錯誤)
+- `tag_families:="tag36h11 tag25h9"` 啟動正常(多 family 實際偵測未測,sim 只畫 tag36h11);實機尚未測
+
 ## 7. `src/apriltag/README.md` 與實際不一致之處
 
-- README 寫 `test_virtual_tracking.launch.py`,實際檔名是 `launch/virtual_tracking.launch.py`。
-- README 的 Project Structure 列了 `test/` 目錄,實際不存在。
-- README 的指令(第 138、163 行)也用 `test_virtual_tracking.launch.py`,照抄會找不到檔案。
+- (2026-10-06 已修正 launch 檔名與 `test/` 目錄;目前無已知不一致)

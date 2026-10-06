@@ -19,9 +19,16 @@ def generate_launch_description():
     manage_arg = DeclareLaunchArgument(
         'manage_amcl_and_lidar_safety', default_value='false',
         description='false: apriltag_control skips AMCL / lidar safety')
+    detect_tag_families_arg = DeclareLaunchArgument(
+        'detect_tag_families', default_value='tag36h11',
+        description='AprilTag families apriltag_detection detects, space separated '
+                    '(pupil_apriltags names, e.g. "tag36h11 tag25h9"); each adds CPU load')
     tag_family_arg = DeclareLaunchArgument(
         'tag_family', default_value='tag36h11',
-        description='AprilTag family of the printed tag (pupil_apriltags name, e.g. tag36h11)')
+        description='family of the tag apriltag_control tracks')
+    tag_id_arg = DeclareLaunchArgument(
+        'tag_id', default_value='0',
+        description='id of the tag apriltag_control tracks, decimal string; -1 = any id')
 
     camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -39,7 +46,7 @@ def generate_launch_description():
         output='screen',
         output_format=OUTPUT_FORMAT,
         parameters=[{
-            'tag_family': LaunchConfiguration('tag_family'),
+            'tag_families': ParameterValue(LaunchConfiguration('detect_tag_families'), value_type=str),
         }],
     )
 
@@ -54,10 +61,13 @@ def generate_launch_description():
         parameters=[{
             'manage_amcl_and_lidar_safety': ParameterValue(
                 LaunchConfiguration('manage_amcl_and_lidar_safety'), value_type=bool),
+            # tracked tag; str so tag_id:=0 is not read as an int
+            'tag_family': ParameterValue(LaunchConfiguration('tag_family'), value_type=str),
+            'tag_id': ParameterValue(LaunchConfiguration('tag_id'), value_type=str),
             # two-stage target distances from camera to tag (m)
             'stage1_distance': 0.50,
             'stage2_distance': 0.28,
-            # leave_cs: back from IN_POSITION to this distance (m)
+            # leave_cs: back straight until the tag is this far away (m)
             'leave_distance': 1.0,
             # G7+ AMCL services (absolute names, not affected by namespace 'up')
             'amcl_check_service': '/check_mcl_if_trigger',
@@ -72,21 +82,14 @@ def generate_launch_description():
         }],
     )
 
-    # print_tag_pose = Node(
-    #     package='apriltag',
-    #     executable='print_tag_pose',
-    #     name='tag_pose_printer',
-    #     namespace='up',
-    #     output='screen',
-    # )
-
     return LaunchDescription([
         manage_arg,
+        detect_tag_families_arg,
         tag_family_arg,
+        tag_id_arg,
         # '[INFO] [up.apriltag_detection]: ...' (apriltag_control: see CONTROL_LOG_ENV)
         SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT', LOG_FORMAT),
         camera,
         apriltag_detection,
         apriltag_control,
-        # print_tag_pose,
     ])

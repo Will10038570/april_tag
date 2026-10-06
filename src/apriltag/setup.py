@@ -30,7 +30,7 @@ setup(
         'console_scripts': [
             'apriltag_detection = apriltag.detection_node:main',
             'apriltag_control = apriltag.control_node:main',
-            'print_tag_pose = tools.print_tag_pose:main',
+            'detection_viewer = tools.detection_viewer:main',
             'virtual_tracking_sim = tools.virtual_tracking_sim:main',
         ],
     },

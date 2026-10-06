@@ -1,26 +1,25 @@
 import cv2
 import rclpy
 import tf2_ros
-from geometry_msgs.msg import PoseStamped
+from apriltag_interfaces.msg import TagPoseArray
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile
 from sensor_msgs.msg import CameraInfo, Image
-from std_srvs.srv import SetBool
 
 from apriltag.perception.tag_perception import (
     build_detector,
     draw_detections_and_collect_targets,
 )
-from apriltag.ros.ros_io import make_camera_intrinsics, msg_to_cv2, publish_image, publish_pose_and_tf
-from apriltag.runtime.target_flow import choose_best_target
+from apriltag.ros.ros_io import make_camera_intrinsics, msg_to_cv2, publish_image, publish_tag_poses
 
 
 class AprilTagDetectionNode(Node):
-    """Detect AprilTags in camera images and publish the closest tag's pose.
+    """Detect AprilTags in camera images and publish all of them.
 
-    Starts disabled. apriltag_control enables it through the `~/enable`
-    (std_srvs/SetBool) service only while a start_tracking goal is running;
-    while disabled the camera subscriptions are destroyed so no image is processed.
+    Runs continuously from startup. Every image with camera intrinsics known
+    gives one TagPoseArray on `apriltag_poses` with every detected tag of the
+    configured families (empty when none is visible) and a TF per tag. It does
+    not choose a tag: apriltag_control picks the one it tracks.
     """
 
     def __init__(self):
@@ -32,14 +31,16 @@ class AprilTagDetectionNode(Node):
             depth=1
         )
 
-        # initialize AprilTag detector; must match the printed tag
-        self.tag_family = str(self.declare_parameter('tag_family', 'tag36h11').value)
-        self.detector = build_detector(tag_family=self.tag_family)
+        # AprilTag families to detect, space separated. pupil_apriltags loads
+        # only one family per Detector, so each family gets its own detector.
+        families_param = str(self.declare_parameter('tag_families', 'tag36h11').value)
+        self.tag_families = list(dict.fromkeys(families_param.split()))
+        if not self.tag_families:
+            raise ValueError('Parameter tag_families is empty; give at least one family, e.g. tag36h11.')
+        self.detectors = [build_detector(tag_family=family) for family in self.tag_families]
 
-        # meters, adjust to your tag's real size
+        # meters, adjust to your tag's real size (same for all families)
         self.tag_size = 0.0635
-        # only this tag ID is tracked; -1 tracks the closest tag of any ID
-        self.tag_id = int(self.declare_parameter('tag_id', -1).value)
 
         # camera intrinsics (filled by camera_info)
         self.fx = None
@@ -50,51 +51,21 @@ class AprilTagDetectionNode(Node):
         self.cam_height = None
         self.camera_frame = 'camera_link'
 
-        # camera subscriptions exist only while enabled
-        self.image_sub = None
-        self.info_sub = None
-
-        self.pose_pub = self.create_publisher(PoseStamped, 'apriltag_pose', 1)
+        self.poses_pub = self.create_publisher(TagPoseArray, 'apriltag_poses', 1)
         self.image_pub = self.create_publisher(Image, 'apriltag/marked_image', self.image_qos)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
-        self.enable_srv = self.create_service(SetBool, '~/enable', self._on_enable)
+        self.image_sub = self.create_subscription(Image,
+                                                  'camera/camera/color/image_raw',
+                                                  self.image_callback,
+                                                  self.image_qos)
+        self.info_sub = self.create_subscription(CameraInfo,
+                                                 'camera/camera/color/camera_info',
+                                                 self.info_callback,
+                                                 10)
         self.get_logger().info(
-            f'tag_family={self.tag_family}, '
-            + (f'tracking tag_id={self.tag_id}' if self.tag_id >= 0
-               else 'tag_id=-1: tracking the closest tag of any ID'))
-        self.get_logger().info('Detection is disabled. Waiting for apriltag_control to enable it.')
-
-    def _on_enable(self, request: SetBool.Request, response: SetBool.Response):
-        if request.data:
-            self._enable()
-            response.message = 'Detection enabled.'
-        else:
-            self._disable()
-            response.message = 'Detection disabled.'
-        response.success = True
-        self.get_logger().info(response.message)
-        return response
-
-    def _enable(self) -> None:
-        if self.image_sub is None:
-            self.image_sub = self.create_subscription(Image,
-                                                      'camera/camera/color/image_raw',
-                                                      self.image_callback,
-                                                      self.image_qos)
-        if self.fx is None and self.info_sub is None:
-            self.info_sub = self.create_subscription(CameraInfo,
-                                                     'camera/camera/color/camera_info',
-                                                     self.info_callback,
-                                                     10)
-
-    def _disable(self) -> None:
-        if self.image_sub is not None:
-            self.destroy_subscription(self.image_sub)
-            self.image_sub = None
-        if self.info_sub is not None:
-            self.destroy_subscription(self.info_sub)
-            self.info_sub = None
+            f'tag_families={" ".join(self.tag_families)}. Detecting continuously; '
+            'publishing all tags on apriltag_poses.')
 
     # callback to receive camera intrinsics
     def info_callback(self, msg: CameraInfo):
@@ -111,7 +82,7 @@ class AprilTagDetectionNode(Node):
             self.destroy_subscription(self.info_sub)
             self.info_sub = None
 
-    # callback to process incoming images and publish the best tag pose
+    # callback to process incoming images and publish all tag poses
     def image_callback(self, msg: Image):
         intrinsics = make_camera_intrinsics(
             self.fx,
@@ -127,35 +98,31 @@ class AprilTagDetectionNode(Node):
 
         frame = msg_to_cv2(msg)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        detections = self.detector.detect(
-            gray,
-            estimate_tag_pose=True,
-            camera_params=(intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy),
-            tag_size=self.tag_size,
-        )
+        detections = []
+        for detector in self.detectors:
+            detections.extend(detector.detect(
+                gray,
+                estimate_tag_pose=True,
+                camera_params=(intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy),
+                tag_size=self.tag_size,
+            ))
 
         vis, targets = draw_detections_and_collect_targets(
             frame.copy(),
             detections,
             intrinsics,
-            self.detector,
+            None,  # detector: unused, pose comes from detect(estimate_tag_pose=True)
             self.tag_size,
             self.get_logger(),
         )
 
-        if self.tag_id >= 0:
-            targets = [t for t in targets if t["id"] == self.tag_id]
-        best = choose_best_target(targets)
-        if best is not None:
-            publish_pose_and_tf(
-                stamp=msg.header.stamp,
-                camera_frame=self.camera_frame,
-                pose_pub=self.pose_pub,
-                tf_broadcaster=self.tf_broadcaster,
-                tag_id=best["id"],
-                t_vec=best["t"],
-                r_mat=best.get("R", None),
-            )
+        publish_tag_poses(
+            stamp=msg.header.stamp,
+            camera_frame=self.camera_frame,
+            poses_pub=self.poses_pub,
+            tf_broadcaster=self.tf_broadcaster,
+            targets=targets,
+        )
 
         publish_image(self.image_pub, vis, header=msg.header, resize_to=(640, 360))
 

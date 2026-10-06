@@ -1,7 +1,7 @@
 
 #start tracking 
 ros2 action send_goal /up/start_tracking apriltag_interfaces/action/StartTracking "{start: true}"
-
+ros2 action send_goal /up/leave_cs apriltag_interfaces/action/StartTracking "{start: true}"
 #-------------------------------------------------------
  source /mnt/work_space/install/setup.bash
 
@@ -37,6 +37,12 @@ ros2 action send_goal /up/start_tracking apriltag_interfaces/action/StartTrackin
   要重新開啟 AMCL:
 
   ros2 service call /open_amcl std_srvs/srv/Empty "{}"
+
+
+
+
+#docker
+docker compose -f docker-compose.yml up  -d --force-recreate
 
 
 

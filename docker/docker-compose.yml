@@ -28,7 +28,7 @@ services:
       # presence_required="false": if enP8p1s0 is down/unplugged, skip it and
       # fall back to loopback instead of failing to create the domain.
       # The interface is chosen once at node startup; re-launch after plugging in.
-      - CYCLONEDDS_URI=<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="enP8p1s0"/></Interfaces></General><Discovery><Peers><Peer address="192.168.6.10"/></Peers><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>50</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>
+      - CYCLONEDDS_URI=<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="enP8p1s0" presence_required="false"/><NetworkInterface name="lo"/></Interfaces></General><Discovery><Peers><Peer address="192.168.6.10"/><Peer address="127.0.0.1"/></Peers><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>50</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>
     volumes:
       - ..:/mnt/work_space
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
