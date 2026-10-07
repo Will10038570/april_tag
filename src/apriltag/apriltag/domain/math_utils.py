@@ -94,3 +94,28 @@ def optical_to_control_error(
     return ControlState(x_error=x_error, y_error=y_error, yaw_error=yaw_error)
 
 
+
+
+def parse_tag_sizes(text: str) -> dict:
+    """Parse the tag_sizes parameter 'id:size id:size ...' (m) into {id: size}.
+
+    Example: '3:0.095 5:0.05'. An empty string gives {}.
+    """
+    sizes = {}
+    for item in str(text).split():
+        tag_id, sep, size = item.partition(':')
+        if not sep:
+            raise ValueError(f"tag_sizes item {item!r} is not 'id:size'")
+        value = float(size)
+        if value <= 0.0:
+            raise ValueError(f'tag_sizes item {item!r}: size must be positive')
+        sizes[int(tag_id)] = value
+    return sizes
+
+
+def tag_size_for(tag_id, tag_sizes: dict, tag_size: float) -> float:
+    """Real black-border side (m) of tag_id: tag_sizes[tag_id], else tag_size."""
+    try:
+        return float(tag_sizes.get(int(tag_id), tag_size))
+    except (TypeError, ValueError):
+        return float(tag_size)

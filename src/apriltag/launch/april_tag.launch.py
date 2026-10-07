@@ -28,7 +28,14 @@ def generate_launch_description():
         description='family of the tag apriltag_control tracks')
     tag_id_arg = DeclareLaunchArgument(
         'tag_id', default_value='0',
-        description='id of the tag apriltag_control tracks, decimal string; -1 = any id')
+        description='id of the tag apriltag_control tracks, decimal string; -1 = any id '
+                    '(a start_tracking goal target_id >= 0 overrides it)')
+    tag_size_arg = DeclareLaunchArgument(
+        'tag_size', default_value='0.0635',
+        description='real black-border side of the tags (m)')
+    tag_sizes_arg = DeclareLaunchArgument(
+        'tag_sizes', default_value='',
+        description="per-id tag sizes 'id:size ...' (m), e.g. '3:0.095'; other ids use tag_size")
 
     camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -47,6 +54,11 @@ def generate_launch_description():
         output_format=OUTPUT_FORMAT,
         parameters=[{
             'tag_families': ParameterValue(LaunchConfiguration('detect_tag_families'), value_type=str),
+            'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
+            'tag_sizes': ParameterValue(LaunchConfiguration('tag_sizes'), value_type=str),
+            # debug image outlines the tags apriltag_control tracks by these
+            'tag_family': ParameterValue(LaunchConfiguration('tag_family'), value_type=str),
+            'tag_id': ParameterValue(LaunchConfiguration('tag_id'), value_type=str),
         }],
     )
 
@@ -64,6 +76,8 @@ def generate_launch_description():
             # tracked tag; str so tag_id:=0 is not read as an int
             'tag_family': ParameterValue(LaunchConfiguration('tag_family'), value_type=str),
             'tag_id': ParameterValue(LaunchConfiguration('tag_id'), value_type=str),
+            'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
+            'tag_sizes': ParameterValue(LaunchConfiguration('tag_sizes'), value_type=str),
             # two-stage target distances from camera to tag (m)
             'stage1_distance': 0.50,
             'stage2_distance': 0.28,
@@ -87,6 +101,8 @@ def generate_launch_description():
         detect_tag_families_arg,
         tag_family_arg,
         tag_id_arg,
+        tag_size_arg,
+        tag_sizes_arg,
         # '[INFO] [up.apriltag_detection]: ...' (apriltag_control: see CONTROL_LOG_ENV)
         SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT', LOG_FORMAT),
         camera,

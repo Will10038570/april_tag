@@ -107,10 +107,13 @@ def publish_tag_poses(
     poses_pub,
     tf_broadcaster,
     targets: List[dict],
+    image_width: int = 0,
+    image_height: int = 0,
 ) -> None:
     """Publish one TagPoseArray with all targets and a TF per target.
 
-    `targets` are dictionaries with family, id (str), t and R from
+    `targets` are dictionaries with family, id (str), t, R and optionally
+    corners, decision_margin and hamming from
     draw_detections_and_collect_targets; an empty list publishes an empty
     array. `stamp` should be the source image's header stamp so consumers can
     compute dt from capture time. TF child frames are `<family>_<id>`.
@@ -118,6 +121,8 @@ def publish_tag_poses(
     array_msg = TagPoseArray()
     array_msg.header.stamp = stamp
     array_msg.header.frame_id = camera_frame
+    array_msg.image_width = int(image_width)
+    array_msg.image_height = int(image_height)
     transforms = []
 
     for target in targets:
@@ -134,6 +139,11 @@ def publish_tag_poses(
         tag.pose.orientation.y = qy
         tag.pose.orientation.z = qz
         tag.pose.orientation.w = qw
+        corners = target.get("corners", None)
+        if corners is not None and np.size(corners) == 8:
+            tag.corners = [float(v) for v in np.asarray(corners, dtype=float).reshape(8)]
+        tag.decision_margin = float(target.get("decision_margin", 0.0))
+        tag.hamming = int(target.get("hamming", 0))
         array_msg.tags.append(tag)
 
         tf_msg = TransformStamped()

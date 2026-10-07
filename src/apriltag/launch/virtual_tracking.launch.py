@@ -46,6 +46,9 @@ def generate_launch_description():
         DeclareLaunchArgument('detect_tag_families', default_value='tag36h11'),
         DeclareLaunchArgument('tag_family', default_value='tag36h11'),
         DeclareLaunchArgument('tag_id', default_value='0', description='-1 = any id'),
+        # the sim draws its tag with the same size
+        DeclareLaunchArgument('tag_size', default_value='0.0635'),
+        DeclareLaunchArgument('tag_sizes', default_value=''),
         DeclareLaunchArgument('stage1_distance', default_value='0.50'),
         DeclareLaunchArgument('stage2_distance', default_value='0.28'),
         DeclareLaunchArgument('leave_distance', default_value='1.0'),
@@ -60,6 +63,11 @@ def generate_launch_description():
         output_format=OUTPUT_FORMAT,
         parameters=[{
             'tag_families': ParameterValue(LaunchConfiguration('detect_tag_families'), value_type=str),
+            'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
+            'tag_sizes': ParameterValue(LaunchConfiguration('tag_sizes'), value_type=str),
+            # debug image outlines the tags apriltag_control tracks by these
+            'tag_family': ParameterValue(LaunchConfiguration('tag_family'), value_type=str),
+            'tag_id': ParameterValue(LaunchConfiguration('tag_id'), value_type=str),
         }],
     )
 
@@ -79,6 +87,8 @@ def generate_launch_description():
             'leave_distance': ParameterValue(LaunchConfiguration('leave_distance'), value_type=float),
             'tag_family': ParameterValue(LaunchConfiguration('tag_family'), value_type=str),
             'tag_id': ParameterValue(LaunchConfiguration('tag_id'), value_type=str),
+            'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
+            'tag_sizes': ParameterValue(LaunchConfiguration('tag_sizes'), value_type=str),
         }],
     )
 
@@ -96,6 +106,7 @@ def generate_launch_description():
             'headless': LaunchConfiguration('headless'),
             'auto_start': LaunchConfiguration('auto_start'),
             'log_dir': LaunchConfiguration('log_dir'),
+            'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
         }],
         # quitting the dashboard ends the whole test, so no detection/control
         # is left running

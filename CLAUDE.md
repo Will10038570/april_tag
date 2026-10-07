@@ -15,9 +15,9 @@
 | Container | `april_tag_serive`(拼字照 compose 設定,不是 service) |
 | Workspace 掛載 | host `Will/work_space` → container `/mnt/work_space` |
 | 網路 | `network_mode: host`、`ipc: host`、`privileged: true`(RealSense 走 `/dev`) |
-| `ROS_DOMAIN_ID` | `65`(與機器人相同) |
+| `ROS_DOMAIN_ID` | `63`(與機器人相同) |
 | `RMW_IMPLEMENTATION` | `rmw_cyclonedds_cpp` |
-| `CYCLONEDDS_URI` | 綁定有線網卡 `enP8p1s0`(192.168.5.0/24,機器人在 192.168.5.10),另加 `lo`;`enP8p1s0` 設 `presence_required="false"`,網路線沒插時自動只用 `lo`(node 啟動時決定一次,插線後要重新 launch) |
+| `CYCLONEDDS_URI` | 只綁有線網卡 `enP8p1s0`(192.168.6.0/24,本機 192.168.6.11,機器人在 192.168.6.10),peer 為 `192.168.6.10`、`MaxAutoParticipantIndex=50`。**不要再加 `lo`**:多網卡時 Cyclone 會從 `lo` 的 socket 送 unicast 到 192.168.6.10,kernel 拒絕(`ddsi_udp_conn_write to udp/192.168.6.10:… failed with retcode -3`),實測會導致完全找不到機器人 node(2026-10-06)。網路線沒插時 node 會建不起來,離線測試請照 3.2 把 `CYCLONEDDS_URI` 改成只用 `lo` |
 | 已安裝 | librealsense2、`pyrealsense2`、`realsense2_camera`、`cv_bridge`、`python3-opencv`、`rqt_image_view`、`rmw_cyclonedds_cpp`、`pupil-apriltags`、`scipy`、`numpy<2` |
 
 `numpy` 必須維持 `<2`:`cv_bridge` 是以 numpy 1.x C-API 編譯的。
@@ -86,7 +86,7 @@ docker exec april_tag_serive bash -ic '
 
 `virtual_tracking.launch.py` 會啟動真正的 `apriltag_detection`、`apriltag_control`,以及取代相機 / AMR / G7+ AMCL 與 lidar safety 的 `virtual_tracking_sim`。一次 run = `start_tracking`(Stage 1 → Stage 2 → 回 `IDLE`,AMCL 關、lidar safety disabled)接著 `leave_cs`(退到 `leave_distance` 後還原 AMCL / lidar safety)。
 
-**安全注意:** 預設 domain 是 65(與機器人相同),而 `apriltag_control` 會發 `/cmd_vel`、`/pre_cmd_vel`、`/g7_plc/disable_lidar_safety` 並呼叫 AMCL service。跑虛擬測試時:
+**安全注意:** `virtual_tracking.launch.py` 的 `domain_id` 預設是 65(機器人在 63,但仍請勿依賴這點),而 `apriltag_control` 會發 `/cmd_vel`、`/pre_cmd_vel`、`/g7_plc/disable_lidar_safety` 並呼叫 AMCL service。跑虛擬測試時:
 
 - 拔掉機器人網路線,**或**
 - 改用其他 domain(`domain_id:=99`)並讓 DDS 只走 loopback(見下方指令)。
@@ -223,8 +223,8 @@ ros2 run rqt_image_view rqt_image_view /up/apriltag/marked_image
 
 | 現象 | 原因 / 處理 |
 |---|---|
-| `rmw_create_node: failed to create domain` / `rcl node's rmw handle is invalid` | `CYCLONEDDS_URI` 綁的 `enP8p1s0` 是 DOWN(網路線沒插),且 container 是 fallback 設定之前建立的。`docker compose up -d --force-recreate`(在桌面 session 執行),或照 3.2 把 `CYCLONEDDS_URI` 改成 `lo` |
-| `enP8p1s0: optional interface was not found` | 網路線沒插,已 fallback 到 `lo`(正常);實機請接上網路線後重新 launch |
+| `rmw_create_node: failed to create domain` / `rcl node's rmw handle is invalid` | `CYCLONEDDS_URI` 綁的 `enP8p1s0` 是 DOWN 或不存在(網路線沒插)。接上網路線,或照 3.2 把 `CYCLONEDDS_URI` 改成 `lo` |
+| `ddsi_udp_conn_write to udp/192.168.6.10:… failed with retcode -3`,且 `ros2 node list` 看不到機器人(ping 卻通) | `CYCLONEDDS_URI` 同時有 `enP8p1s0` 與 `lo`(或 peer 有 `127.0.0.1`),從 `lo` socket 送往外部位址被 kernel 拒絕。只留 `enP8p1s0`(見第 1 節),改 compose 後 `docker compose up -d --force-recreate` |
 | `selected interface "lo" is not multicast-capable` | 用 `lo` 時的正常警告,可忽略 |
 | headless 測試結束時 `virtual_tracking_sim` `exit code -11` | 已知:存完 CSV / PNG 後 process 結束時 segfault,不影響測試結果 |
 | `ros2: command not found` | `bash -lc` 不會 source ROS;改用 `bash -ic '…'`、`docker exec -it … bash`,或手動 source |

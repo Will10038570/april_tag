@@ -6,6 +6,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile
 from sensor_msgs.msg import CameraInfo, Image
 
+from apriltag.domain.math_utils import parse_tag_sizes, tag_size_for
 from apriltag.perception.tag_perception import (
     build_detector,
     draw_detections_and_collect_targets,
@@ -39,8 +40,17 @@ class AprilTagDetectionNode(Node):
             raise ValueError('Parameter tag_families is empty; give at least one family, e.g. tag36h11.')
         self.detectors = [build_detector(tag_family=family) for family in self.tag_families]
 
-        # meters, adjust to your tag's real size (same for all families)
-        self.tag_size = 0.0635
+        # real black-border side of the tags (m); tag_sizes 'id:size ...'
+        # overrides it per id (any family), e.g. '3:0.095'
+        self.tag_size = float(self.declare_parameter('tag_size', 0.0635).value)
+        if self.tag_size <= 0.0:
+            raise ValueError('Parameter tag_size must be positive.')
+        self.tag_sizes = parse_tag_sizes(self.declare_parameter('tag_sizes', '').value)
+        # only for the debug image: tags apriltag_control would track by its
+        # tag_family / tag_id parameters are outlined in yellow ('-1': any id;
+        # a target_id given in a goal is not known here)
+        self.tag_family = str(self.declare_parameter('tag_family', 'tag36h11').value)
+        self.tag_id = str(self.declare_parameter('tag_id', '0').value)
 
         # camera intrinsics (filled by camera_info)
         self.fx = None
@@ -64,8 +74,11 @@ class AprilTagDetectionNode(Node):
                                                  self.info_callback,
                                                  10)
         self.get_logger().info(
-            f'tag_families={" ".join(self.tag_families)}. Detecting continuously; '
-            'publishing all tags on apriltag_poses.')
+            f'tag_families={" ".join(self.tag_families)} tag_size={self.tag_size} '
+            f'tag_sizes={self.tag_sizes}. Detecting continuously; publishing all tags on apriltag_poses.')
+
+    def _is_tracked(self, family: str, tag_id: int) -> bool:
+        return family == self.tag_family and self.tag_id in ('-1', str(tag_id))
 
     # callback to receive camera intrinsics
     def info_callback(self, msg: CameraInfo):
@@ -114,6 +127,8 @@ class AprilTagDetectionNode(Node):
             None,  # detector: unused, pose comes from detect(estimate_tag_pose=True)
             self.tag_size,
             self.get_logger(),
+            size_of=lambda tag_id: tag_size_for(tag_id, self.tag_sizes, self.tag_size),
+            is_tracked=self._is_tracked,
         )
 
         publish_tag_poses(
@@ -122,6 +137,8 @@ class AprilTagDetectionNode(Node):
             poses_pub=self.poses_pub,
             tf_broadcaster=self.tf_broadcaster,
             targets=targets,
+            image_width=frame.shape[1],
+            image_height=frame.shape[0],
         )
 
         publish_image(self.image_pub, vis, header=msg.header, resize_to=(640, 360))

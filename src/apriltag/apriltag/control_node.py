@@ -9,6 +9,7 @@ import rclpy
 from apriltag_interfaces.action import StartTracking
 from apriltag_interfaces.msg import TagPoseArray
 from geometry_msgs.msg import Twist
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -19,11 +20,18 @@ from std_msgs.msg import Bool
 from std_srvs.srv import Empty, Trigger
 
 from apriltag.control import LQRTracker, TrajectoryPlanner
-from apriltag.domain.math_utils import optical_to_control_error, quaternion_to_rotation_matrix
+from apriltag.domain.math_utils import (
+    optical_to_control_error,
+    parse_tag_sizes,
+    quaternion_to_rotation_matrix,
+    tag_size_for,
+)
 from apriltag.ros.ros_io import publish_twist
 from apriltag.runtime.control_flow import leave_step, publish_control
 from apriltag.runtime.safety_guard import handle_target_lost
-from apriltag.runtime.target_flow import ANY_TAG_ID, choose_best_target
+from apriltag.runtime.target_flow import ANY_TAG_ID, TargetSelector, resolve_target_id
+from apriltag.runtime.yaw_probe import YawProbe, YawProbeConfig
+from apriltag.yaw_estimator import YawEstimator, YawEstimatorConfig
 
 # high-rate messages (cmd_vel, action feedback) are logged at most once per this period
 LOG_THROTTLE_SEC = 1.0
@@ -145,8 +153,72 @@ class AprilTagControlNode(Node):
 
         ## tracked tag: detection publishes all tags, this node picks one
         self.tag_family = str(self.declare_parameter('tag_family', 'tag36h11').value)
-        # decimal string as in TagPose.id; '-1' tracks any id of tag_family
-        self.tag_id = str(self.declare_parameter('tag_id', '0').value)
+        # decimal string as in TagPose.id; '-1' tracks any id of tag_family.
+        # A start goal's target_id (>= 0) overrides it for that goal. Can be
+        # changed at run time: ros2 param set /up/apriltag_control tag_id 3
+        self.tag_id = self._parse_tag_id(self.declare_parameter(
+            'tag_id', '0', ParameterDescriptor(dynamic_typing=True)).value)
+        self._goal_target_id = -1
+        # S0: same-id hysteresis of the target selection
+        self.target_selector = TargetSelector(
+            switch_ratio=float(self.declare_parameter('target_switch_distance_ratio', 0.85).value),
+            switch_frames=int(self.declare_parameter('target_switch_frames', 5).value),
+            lost_frames=int(self.declare_parameter('target_lost_frames', 5).value),
+            max_jump_ratio=float(self.declare_parameter('target_max_jump_ratio', 0.5).value),
+        )
+        self._target_key = None
+        ## tag size: real black-border side (m), tag_sizes 'id:size ...' per id;
+        # must match apriltag_detection. Only the S4 table conversion uses it here.
+        self.tag_size = float(self.declare_parameter('tag_size', 0.0635).value)
+        self.tag_sizes = parse_tag_sizes(self.declare_parameter('tag_sizes', '').value)
+        if self.tag_size <= 0.0:
+            raise ValueError('Parameter tag_size must be positive.')
+
+        def p(name, default):
+            return self.declare_parameter(name, default).value
+
+        ## yaw estimator (S1 quality, S2 sign confidence, S4 precision, S5 filter)
+        self.yaw_estimator = YawEstimator(YawEstimatorConfig(
+            border_px=float(p('quality_border_px', 10.0)),
+            margin_lo=float(p('decision_margin_lo', 20.0)),
+            margin_hi=float(p('decision_margin_hi', 60.0)),
+            sigma_dh=float(p('sigma_dh', 0.39)),
+            snr_lo=float(p('c_sign_snr_lo', 1.0)),
+            snr_hi=float(p('c_sign_snr_hi', 2.0)),
+            s4_distances=[float(v) for v in p('s4_distances', [0.3, 0.5, 0.7])],
+            s4_sigmas_deg=[float(v) for v in p('s4_sigmas_deg', [1.0, 2.0, 3.0])],
+            # base size of the S4 table, not the tag in use: change only when
+            # the table is recalibrated
+            ref_tag_size=float(p('ref_tag_size', 0.0475)),
+            q_proc=float(p('yaw_q_proc', 0.02 ** 2)),
+            gate_sigma=float(p('yaw_gate_sigma', 3.0)),
+            gate_min_deg=float(p('yaw_gate_min_deg', 3.0)),
+            accept_frames=int(p('yaw_accept_frames', 5)),
+            consistency_deg=float(p('yaw_consistency_deg', 3.0)),
+            abs_window=int(p('yaw_abs_window', 9)),
+            xy_tau=float(p('xy_ema_tau', 0.1)),
+        ))
+        cfg = self.yaw_estimator.cfg
+        if len(cfg.s4_distances) != len(cfg.s4_sigmas_deg) or not cfg.s4_distances:
+            raise ValueError('s4_distances and s4_sigmas_deg must be non-empty and of equal length.')
+        ## S3 stuck protection (probe turns in Stage 1)
+        self.yaw_probe = YawProbe(YawProbeConfig(
+            trigger_frames=int(p('probe_trigger_frames', 10)),
+            c_sign_low=float(p('probe_c_sign_low', 0.5)),
+            trigger_yaw=float(p('probe_trigger_yaw', 0.05)),
+            wz=float(p('probe_wz', 0.03)),
+            turn_time=float(p('probe_turn_time', 1.0)),
+            settle_frames=int(p('probe_settle_frames', 9)),
+            end_yaw_deg=float(p('probe_end_yaw_deg', 1.5)),
+            change_deg=float(p('probe_change_deg', 0.5)),
+            initial_direction=float(p('probe_initial_direction', 1.0)),
+            max_turns=int(p('probe_max_turns', 8)),
+        ))
+        # capture time (s) of the last frame given to the yaw estimator
+        self._last_estimate_stamp = None
+        # wz actually published last (0 after a stop), for the yaw filter
+        self._last_wz_cmd = 0.0
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         ## AprilTag distance parameters
         # two-stage desired forward distances to tag (m), ROS parameters
@@ -282,6 +354,28 @@ class AprilTagControlNode(Node):
             self._stage() + f'State {self._state.value}. Send the start_tracking or leave_cs action to start.'
         )
 
+    @staticmethod
+    def _parse_tag_id(value) -> str:
+        text = str(value).strip()
+        if int(text) < -1:
+            raise ValueError(f'tag_id {text} must be >= 0, or -1 for any id')
+        return str(int(text))
+
+    def _on_set_parameters(self, params):
+        for param in params:
+            if param.name == 'tag_id':
+                try:
+                    tag_id = self._parse_tag_id(param.value)
+                except (TypeError, ValueError) as exc:
+                    return SetParametersResult(successful=False, reason=str(exc))
+                self.tag_id = tag_id
+                self.get_logger().info(self._stage() + f'tag_id parameter set to {tag_id}')
+        return SetParametersResult(successful=True)
+
+    def _tracked_tag_id(self) -> str:
+        """Goal target_id if given, else the tag_id parameter ('-1': any id)."""
+        return resolve_target_id(self._goal_target_id, self.tag_id)
+
     # ---- state machine ----------------------------------------------------------
 
     def _stage(self) -> str:
@@ -374,6 +468,7 @@ class AprilTagControlNode(Node):
 
     def _publish_zero_on_all(self, label: str) -> None:
         # stops go to both topics, so the robot stops whichever stage is active
+        self._last_wz_cmd = 0.0
         for pub in (self.stage1_cmd_pub, self.stage2_cmd_pub):
             publish_twist(pub, 0.0, 0.0, 0.0)
             self.get_logger().info(self._stage() + f'[publish] {pub.topic_name} {label} vx=0 vy=0 wz=0')
@@ -389,6 +484,7 @@ class AprilTagControlNode(Node):
                 return
             pub = self.stage1_cmd_pub if self._state is S.STAGE1 else self.stage2_cmd_pub
             publish_twist(pub, vx, vy, vw)
+            self._last_wz_cmd = float(vw)
         self.get_logger().info(
             self._stage() + f'[publish] {pub.topic_name} vx={vx:+.3f} vy={vy:+.3f} wz={vw:+.3f}',
             throttle_duration_sec=LOG_THROTTLE_SEC,
@@ -520,13 +616,19 @@ class AprilTagControlNode(Node):
 
     def _goal_callback(self, action: str, goal_request: StartTracking.Goal):
         start = bool(goal_request.start)
-        self.get_logger().info(self._stage() + f'[action] {action} goal received: start={start}')
+        target_id = int(goal_request.target_id)
+        self.get_logger().info(
+            self._stage() + f'[action] {action} goal received: start={start} target_id={target_id}')
         with self._control_lock:
             state = self._state
             # decided under the lock, so of two start=True goals only one leaves IDLE
             if not is_goal_accepted(action, start, state):
                 return self._reject_goal(action, start, state)
             if start:
+                # a new goal selects its target from scratch
+                self._goal_target_id = target_id
+                self.target_selector.reset()
+                self._target_key = None
                 self._tracking_done.clear()
                 self._tracking_result = {}
                 self._tracking_start_time = time.monotonic()
@@ -536,7 +638,8 @@ class AprilTagControlNode(Node):
                     self._transition_locked(
                         S.LEAVING, Step.PREPARING,
                         f'leave_cs goal accepted, back to {self.leave_distance:.2f}m')
-        self.get_logger().info(self._stage() + f'[action] {action} goal accepted: start={start}')
+        self.get_logger().info(self._stage() + f'[action] {action} goal accepted: start={start}'
+                               + (f', tracking {self.tag_family} id {self._tracked_tag_id()}' if start else ''))
         return GoalResponse.ACCEPT
 
     def _cancel_callback(self, goal_handle):
@@ -761,9 +864,21 @@ class AprilTagControlNode(Node):
                 return
             tracking_state = self._state
 
-        tag = choose_best_target(msg.tags, self.tag_family, self.tag_id)
-        if tag is None:
+        # S0: one target tag; other tags (and frames without it) do not
+        # count as seeing the target
+        selected = self.target_selector.select(msg.tags, self.tag_family, self._tracked_tag_id())
+        if selected is None:
             return
+        tag = selected.tag
+        if selected.key != self._target_key:
+            self.get_logger().info(
+                self._stage() + f'[target] tracking {tag.family} id {tag.id} '
+                f'(instance {selected.key[2]}, z={tag.pose.position.z:.3f}m), yaw estimator reset')
+            self._target_key = selected.key
+            # filter state belongs to one target; Stage 1 -> 2 keeps it
+            self.yaw_estimator.reset()
+            self.yaw_probe.reset()
+            self._last_estimate_stamp = None
 
         now = time.monotonic()
         stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
@@ -773,17 +888,45 @@ class AprilTagControlNode(Node):
         t_vec = np.array([p.x, p.y, p.z], dtype=float)
         r_mat = quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w)
         state = optical_to_control_error(t_vec, self.desired_distance, r_mat, self.camera_y_offset)
-        best_target = {
-            'x_error': state.x_error,
-            'y_error': state.y_error,
-            'yaw_error': state.yaw_error,
-        }
-        self._latest_best_target = best_target
         self._last_target_time = now
 
         if tracking_state is S.LEAVING:
+            self._latest_best_target = {
+                'x_error': state.x_error, 'y_error': state.y_error, 'yaw_error': state.yaw_error}
             self._leave_step(state.x_error)
             return
+
+        # S1 / S2 / S4 / S5. x is filtered as the forward distance, so the
+        # Stage 1 -> 2 switch of desired_distance is not smoothed.
+        dt = 0.0 if self._last_estimate_stamp is None else min(max(stamp - self._last_estimate_stamp, 0.0),
+                                                                self.max_dt)
+        self._last_estimate_stamp = stamp
+        est = self.yaw_estimator.update(
+            x=state.x_error + self.desired_distance, y=state.y_error, yaw_meas=state.yaw_error,
+            d=p.z, corners=tag.corners, image_width=msg.image_width, image_height=msg.image_height,
+            hamming=tag.hamming, decision_margin=tag.decision_margin,
+            tag_size=tag_size_for(tag.id, self.tag_sizes, self.tag_size),
+            wz_cmd=self._last_wz_cmd, dt=dt)
+        x_f = est.x_f - self.desired_distance
+        best_target = {
+            'x_error': x_f,
+            'y_error': est.y_f,
+            'yaw_error': est.yaw_f,
+        }
+        self._latest_best_target = best_target
+
+        # S3: probe turns when Stage 1 is in x / y tolerance but the yaw
+        # direction cannot be told
+        wz_override = self.yaw_probe.step(
+            now=now,
+            enabled=(tracking_state is S.STAGE1
+                     and abs(x_f) <= self.stop_x_error_tolerance
+                     and abs(est.y_f) <= self.stop_y_error_tolerance),
+            c_sign=est.c_sign,
+            yaw_abs_f=est.yaw_abs_f,
+        )
+        if self.yaw_probe.last_event:
+            self.get_logger().info(self._stage() + f'[S3] {self.yaw_probe.last_event}')
 
         try:
             self._last_stamp, latest_plan = publish_control(
@@ -798,14 +941,28 @@ class AprilTagControlNode(Node):
                 max_vw=self.max_vw,
                 publish_twist_fn=self._publish_control_command,
                 logger=self._stage_logger,
+                wz_override=wz_override,
             )
         except Exception as exc:
             self.get_logger().warn(self._stage() + f"Control publish failed: {exc}")
             self._safe_stop(reset_planner=True)
             return
+        self.get_logger().debug(
+            self._stage() + f'[yaw] d={p.z:.3f} dh={est.dh:+.3f} snr={est.snr:.2f} c_sign={est.c_sign:.2f} '
+            f'c_quality={est.c_quality:.2f} yaw_meas={est.yaw_meas:+.4f} yaw_f={est.yaw_f:+.4f} '
+            f'yaw_abs_f={est.yaw_abs_f:.4f} accepted={est.accepted} wz_cmd={self._last_wz_cmd:+.4f}'
+            + (' (S3 probe)' if wz_override is not None else ''))
 
         self.latest_plan = latest_plan
-        if not self._error_is_zero(best_target):
+        # in-position check on the filtered x / y and the size of the yaw
+        # (yaw_abs_f), never on yaw_f, which is pulled to 0 when the
+        # direction is unknown
+        done_target = {
+            'x_error': x_f,
+            'y_error': est.y_f,
+            'yaw_error': est.yaw_abs_f,
+        }
+        if not self._error_is_zero(done_target):
             self._error_zero_since = None
             return
 
@@ -818,9 +975,9 @@ class AprilTagControlNode(Node):
 
         converged = (
             f'Error converged within tol: '
-            f'x_error={state.x_error:.6f} (<= {self.stop_x_error_tolerance:.3f}), '
-            f'y_error={state.y_error:.6f} (<= {self.stop_y_error_tolerance:.3f}), '
-            f'yaw_error={state.yaw_error:.6f} (<= {self.stop_yaw_error_tolerance:.3f}), '
+            f'x_f={x_f:.6f} (<= {self.stop_x_error_tolerance:.3f}), '
+            f'y_f={est.y_f:.6f} (<= {self.stop_y_error_tolerance:.3f}), '
+            f'yaw_abs_f={est.yaw_abs_f:.6f} (<= {self.stop_yaw_error_tolerance:.3f}), '
             f'held_for={hold_time:.2f}s (>= {self.stop_hold_seconds:.2f}s).'
         )
         if tracking_state is S.STAGE1:

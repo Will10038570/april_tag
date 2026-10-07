@@ -1,6 +1,6 @@
 """Control pipeline helpers extracted from AprilTag ROS node."""
 
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -88,12 +88,18 @@ def publish_control(
     max_vw: float,
     publish_twist_fn,
     logger,
+    wz_override: Optional[float] = None,
 ):
-    """Run one control step and publish twist; return state updates."""
+    """Run one control step and publish twist; return state updates.
+
+    wz_override (S3 probe turn) replaces the LQR's wz; vx / vy stay the LQR's.
+    """
     dt, new_last_time = compute_dt(now, last_time, max_dt)
     state = extract_control_state(best_target)
     plan = plan_reference(trajectory_planner, state, dt)
     vx, vy, vw = compute_backend_control(lqr_tracker, state, plan, dt, logger)
+    if wz_override is not None:
+        vw = float(wz_override)
     vx, vy, vw = sanitize_control(vx, vy, vw, logger)
     vx, vy, vw = clamp_control(vx, vy, vw, max_vx, max_vy, max_vw)
     publish_twist_fn(vx, vy, vw)

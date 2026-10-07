@@ -1,6 +1,6 @@
 """AprilTag 感知層：偵測資料提取、位姿估計。"""
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -84,23 +84,34 @@ def draw_detections_and_collect_targets(
     detector,
     tag_size: float,
     logger,
+    size_of: Optional[Callable[[int], float]] = None,
+    is_tracked: Optional[Callable[[str, int], bool]] = None,
 ):
-    """Draw detections and return target dictionaries (family, id, t, R) for publishing.
+    """Draw detections and return target dictionaries for publishing.
 
-    `id` is the decoded tag id as a decimal string, so it can be compared with
-    TagPose.id.
+    Each target has family, id (decimal string, comparable with TagPose.id),
+    t, R, corners (4x2 px), decision_margin and hamming. detect() was run
+    with `tag_size`; since the pose translation is proportional to the tag
+    size, t is scaled by size_of(id) / tag_size so every id gets its own real
+    size (size_of None: all tags are tag_size). Tags for which is_tracked
+    (family, id) is true are outlined in yellow instead of green.
     """
     targets = []
 
     for det in detections:
         tag_id, corners, center = extract_detection_data(det)
+        tracked = (
+            tag_id is not None and is_tracked is not None
+            and is_tracked(detection_family(det), int(tag_id))
+        )
+        outline = (0, 255, 255) if tracked else (0, 255, 0)
 
         if corners is not None and corners.size > 0:
             pts = corners.astype(int)
             for i in range(4):
                 pt1 = tuple(pts[i])
                 pt2 = tuple(pts[(i + 1) % 4])
-                cv2.line(img, pt1, pt2, (0, 255, 0), 2)
+                cv2.line(img, pt1, pt2, outline, 3 if tracked else 2)
 
         if center:
             center_i = (int(center[0]), int(center[1]))
@@ -116,7 +127,8 @@ def draw_detections_and_collect_targets(
             if pose is None:
                 continue
 
-            t_vec = pose.t
+            real_size = size_of(int(tag_id)) if size_of is not None else tag_size
+            t_vec = pose.t * (float(real_size) / float(tag_size))
             distance = float(np.linalg.norm(t_vec))
             family = detection_family(det)
             text = f"{family}:{tag_id} {distance:.2f} m"
@@ -138,6 +150,9 @@ def draw_detections_and_collect_targets(
                     "id": str(int(tag_id)),
                     "t": t_vec,
                     "R": pose.R,
+                    "corners": corners,
+                    "decision_margin": float(getattr(det, "decision_margin", 0.0) or 0.0),
+                    "hamming": int(getattr(det, "hamming", 0) or 0),
                 }
             )
         except Exception as exc:

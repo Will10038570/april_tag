@@ -1,4 +1,6 @@
 bool start
+# tag id to track; -1: use apriltag_control's tag_id parameter (-1 there too: any id)
+int32 target_id -1
 ---
 bool success
 string message
