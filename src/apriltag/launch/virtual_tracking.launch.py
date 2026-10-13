@@ -1,9 +1,10 @@
 """End-to-end virtual test: real apriltag_detection + apriltag_control, with the
 camera, the AMR and the G7+ AMCL services / lidar safety topic replaced by
-tools/virtual_tracking_sim. A run is start_tracking (Stage 1 + 2, back to IDLE
-with AMCL closed and lidar safety disabled) followed by leave_cs; headless +
-auto_start runs both and checks AMCL / lidar safety after start_tracking
-(held) and at the end (restored).
+tools/virtual_tracking_sim. A run is dock_wheelchair (Stage 1 + 2, back to IDLE
+with AMCL closed and lidar safety disabled) followed by undock_wheelchair;
+headless + auto_start runs both and checks AMCL / lidar safety after the dock
+(held) and at the end (restored). tag_family / tag_id / distance_m only go
+into the sim's goals.
 
 Runs in ROS domain 65, the same as the robot: apriltag_control publishes the
 absolute /cmd_vel, /pre_cmd_vel and /g7_plc/disable_lidar_safety and calls the AMCL
@@ -36,22 +37,31 @@ def generate_launch_description():
         DeclareLaunchArgument('headless', default_value='false',
                               description='no UI; run one goal and save CSV + PNG'),
         DeclareLaunchArgument('auto_start', default_value='false',
-                              description='send start_tracking as soon as the action server is up'),
+                              description='send dock_wheelchair as soon as the action server is up'),
         DeclareLaunchArgument('log_dir', default_value='virtual_tracking_logs'),
         DeclareLaunchArgument('manage_amcl_and_lidar_safety', default_value='true',
                               description='false: apriltag_control skips AMCL / lidar safety'),
-        # simulation's own stage / leave distances, independent of launch/april_tag.launch.py;
-        # the sim reads them back from apriltag_control
-        # detection families and the tag apriltag_control tracks; the sim draws tag36h11 id 0
+        # detection families; the sim draws tag36h11 id 0
         DeclareLaunchArgument('detect_tag_families', default_value='tag36h11'),
-        DeclareLaunchArgument('tag_family', default_value='tag36h11'),
-        DeclareLaunchArgument('tag_id', default_value='0', description='-1 = any id'),
+        # tag apriltag_detection publishes on tag_tracing (tracking_tag_id:=5: the
+        # drawn id 0 is never tracked, tag_tracing is always valid=false)
+        DeclareLaunchArgument('tracking_tag_family', default_value='tag36h11'),
+        DeclareLaunchArgument('tracking_tag_id', default_value='0', description='-1 = any id'),
+        # goals the sim sends (tag_id:=5 tests the tag filter: apriltag_control
+        # does not match the tracked id 0 and ends with TAG_LOST)
+        DeclareLaunchArgument('tag_family', default_value='tag36h11', description='goal tag_family'),
+        DeclareLaunchArgument('tag_id', default_value='0', description='goal tag_id, -1 = any id'),
+        DeclareLaunchArgument('distance_m', default_value='1.0', description='undock goal distance_m'),
         # the sim draws its tag with the same size
         DeclareLaunchArgument('tag_size', default_value='0.0635'),
         DeclareLaunchArgument('tag_sizes', default_value=''),
+        # simulation's own stage distances, independent of launch/april_tag.launch.py;
+        # the sim reads them back from apriltag_control
         DeclareLaunchArgument('stage1_distance', default_value='0.50'),
         DeclareLaunchArgument('stage2_distance', default_value='0.28'),
-        DeclareLaunchArgument('leave_distance', default_value='1.0'),
+        DeclareLaunchArgument('dock_timeout', default_value='60.0'),
+        DeclareLaunchArgument('undock_timeout', default_value='60.0'),
+        DeclareLaunchArgument('lost_target_timeout', default_value='1.0'),
     ]
 
     apriltag_detection = Node(
@@ -63,11 +73,10 @@ def generate_launch_description():
         output_format=OUTPUT_FORMAT,
         parameters=[{
             'tag_families': ParameterValue(LaunchConfiguration('detect_tag_families'), value_type=str),
+            'tracking_tag_family': ParameterValue(LaunchConfiguration('tracking_tag_family'), value_type=str),
+            'tracking_tag_id': ParameterValue(LaunchConfiguration('tracking_tag_id'), value_type=int),
             'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
             'tag_sizes': ParameterValue(LaunchConfiguration('tag_sizes'), value_type=str),
-            # debug image outlines the tags apriltag_control tracks by these
-            'tag_family': ParameterValue(LaunchConfiguration('tag_family'), value_type=str),
-            'tag_id': ParameterValue(LaunchConfiguration('tag_id'), value_type=str),
         }],
     )
 
@@ -84,9 +93,9 @@ def generate_launch_description():
                 LaunchConfiguration('manage_amcl_and_lidar_safety'), value_type=bool),
             'stage1_distance': ParameterValue(LaunchConfiguration('stage1_distance'), value_type=float),
             'stage2_distance': ParameterValue(LaunchConfiguration('stage2_distance'), value_type=float),
-            'leave_distance': ParameterValue(LaunchConfiguration('leave_distance'), value_type=float),
-            'tag_family': ParameterValue(LaunchConfiguration('tag_family'), value_type=str),
-            'tag_id': ParameterValue(LaunchConfiguration('tag_id'), value_type=str),
+            'dock_timeout': ParameterValue(LaunchConfiguration('dock_timeout'), value_type=float),
+            'undock_timeout': ParameterValue(LaunchConfiguration('undock_timeout'), value_type=float),
+            'lost_target_timeout': ParameterValue(LaunchConfiguration('lost_target_timeout'), value_type=float),
             'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
             'tag_sizes': ParameterValue(LaunchConfiguration('tag_sizes'), value_type=str),
         }],
@@ -107,6 +116,9 @@ def generate_launch_description():
             'auto_start': LaunchConfiguration('auto_start'),
             'log_dir': LaunchConfiguration('log_dir'),
             'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
+            'goal_tag_family': ParameterValue(LaunchConfiguration('tag_family'), value_type=str),
+            'goal_tag_id': ParameterValue(LaunchConfiguration('tag_id'), value_type=int),
+            'goal_distance_m': ParameterValue(LaunchConfiguration('distance_m'), value_type=float),
         }],
         # quitting the dashboard ends the whole test, so no detection/control
         # is left running

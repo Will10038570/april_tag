@@ -1,0 +1,64 @@
+AprilTag 套件 topic / action 介面摘要(2026-10-12)
+============================================================
+namespace  : /up
+
+[Topic Publish]
+  /up/tag_tracing             apriltag_interfaces/msg/TagTracing    每張影像發一則，只放被追蹤的那個 tag(tracking_tag_family / tracking_tag_id, 取前向距離 z 最小的);找不到時 valid=false
+  
+  example : [detection_viewer-1] [INFO] [1791793302.506869264] [up.detection_viewer]: stamp=1791793302.388626709 frame_id=camera_color_optical_frame valid=True image=1280x720
+	    [detection_viewer-1]   family=tag36h11 id=0 position=(+0.048, -0.034, +0.162) orientation=(-0.016, -0.016, +0.702, +0.712)	
+	    
+	    
+  
+  /up/apriltag_poses          apriltag_interfaces/msg/TagPoseArray  每張影像發一則，包含所有偵測到的 tag(detect_tag_families);沒有 tag 時 tags: [] 只供參考 / 除錯
+  
+  example : [INFO] [1791794114.512272611] [up.detection_viewer]: stamp=1791794114.407559082 frame_id=camera_color_optical_frame tags=2
+	    [0] family=tag36h11 id=0 position=(+0.124, +0.027, +0.350) orientation=(+0.129, +0.010, +0.815, +0.565)
+            [1] family=tag36h11 id=0 position=(-0.126, -0.040, +0.734) orientation=(-0.044, -0.075, +0.073, +0.994)
+
+  
+  /up/apriltag/marked_image   sensor_msgs/Image                     debug 影像(tag 畫綠框)
+  /tf                         TF                                    <camera_frame> → <family>_<id>(例如 tag36h11_0)     
+  /cmd_vel                        geometry_msgs/Twist   Stage 1 
+  /pre_cmd_vel                    geometry_msgs/Twist   Stage 2 與 undock(G7+ 精準模式)
+  
+  
+  
+  
+============================================================
+[Action server]
+  /up/dock_wheelchair         apriltag_interfaces/action/DockWheelchair
+  
+  example : feedback: seq=10 stamp=16:39:33.720 stage=STAGE_1 x=-0.237 y=+0.010 yaw=+0.093 last_frame_age=0.125s
+	    
+	    result: SUCCEEDED success=True error_code=0 message='Stage 2 aligned at 0.28m. offset converged within tol: x_f=-0.035065 (<= 0.050), y_f=-0.043872 (<= 0.050), yaw_abs_f=0.036105 (<= 0.050), 		held_for=1.02s (>= 1.00s). AMCL / lidar safety unmanaged. elapsed=39.64s'
+	    
+	    result: ABORTED success=False error_code=1 message='AprilTag lost for 1.00s. Tracking stopped. elapsed=4.15s'
+
+
+  
+  
+  
+  /up/undock_wheelchair       apriltag_interfaces/action/UndockWheelchair
+  
+   example : feedback: seq=20 stamp=16:43:52.119 stage=LEAVING x_error=-0.714 y_shift=-0.071 yaw_shift=-0.088 last_frame_age=0.105s
+   
+	     result: SUCCEEDED success=True error_code=0 message='Leave reached 1.00m (forward=1.011m). elapsed=15.27s'
+
+  	     result: ABORTED success=False error_code=1 message='AprilTag lost for 1.00s. Tracking stopped. elapsed=3.70s'
+  
+  
+============================================================
+[Service client](std_srvs)
+  /check_mcl_if_trigger       -----  To Be Discussed
+  /close_amcl                 ----- To Be Discussed 
+  /open_amcl                  ----- To Be Discussed
+  /disable_lidar_safety	      ----- To Be Discussed
+  /enable_lidar_safety	      ----- To Be Discussed
+  /check_lidar_safety         ----- To Be Discussed
+  
+  
+  
+  
+  
+  

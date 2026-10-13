@@ -19,12 +19,10 @@ EXPECTED = {
     S.LEAVING: {S.IDLE},
 }
 
-# (action, start) -> states in which the goal is accepted
+# action -> states in which its goal is accepted (stopping is an action cancel)
 EXPECTED_GOALS = {
-    ('start_tracking', True): {S.IDLE},
-    ('start_tracking', False): {S.STAGE1, S.STAGE2},
-    ('leave_cs', True): {S.IDLE},
-    ('leave_cs', False): {S.LEAVING},
+    'dock': {S.IDLE},
+    'undock': {S.IDLE},
 }
 
 
@@ -45,7 +43,7 @@ def test_is_transition_allowed(src, dst):
 @pytest.mark.parametrize('src, dst', [
     (S.IDLE, S.STAGE2),       # Stage 2 only follows Stage 1
     (S.IDLE, S.IDLE),
-    (S.STAGE1, S.LEAVING),    # leave_cs only starts from IDLE
+    (S.STAGE1, S.LEAVING),    # undock only starts from IDLE
     (S.STAGE2, S.STAGE1),
     (S.STAGE2, S.LEAVING),    # Stage 2 aligned goes back to IDLE first
     (S.LEAVING, S.STAGE1),
@@ -63,11 +61,11 @@ def test_goal_rules_match_design():
     assert GOAL_RULES == EXPECTED_GOALS
 
 
-@pytest.mark.parametrize('action, start', list(EXPECTED_GOALS))
+@pytest.mark.parametrize('action', list(EXPECTED_GOALS))
 @pytest.mark.parametrize('state', list(S))
-def test_is_goal_accepted(action, start, state):
-    assert is_goal_accepted(action, start, state) == (state in EXPECTED_GOALS[(action, start)])
+def test_is_goal_accepted(action, state):
+    assert is_goal_accepted(action, state) == (state in EXPECTED_GOALS[action])
 
 
 def test_unknown_action_is_rejected():
-    assert not is_goal_accepted('dock', True, S.IDLE)
+    assert not is_goal_accepted('start_tracking', S.IDLE)

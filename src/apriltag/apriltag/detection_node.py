@@ -1,7 +1,7 @@
 import cv2
 import rclpy
 import tf2_ros
-from apriltag_interfaces.msg import TagPoseArray
+from apriltag_interfaces.msg import TagPoseArray, TagTracing
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile
 from sensor_msgs.msg import CameraInfo, Image
@@ -11,16 +11,26 @@ from apriltag.perception.tag_perception import (
     build_detector,
     draw_detections_and_collect_targets,
 )
-from apriltag.ros.ros_io import make_camera_intrinsics, msg_to_cv2, publish_image, publish_tag_poses
+from apriltag.ros.ros_io import (
+    make_camera_intrinsics,
+    msg_to_cv2,
+    publish_image,
+    publish_tag_poses,
+    publish_tag_tracing,
+)
+from apriltag.runtime.action_flow import tag_id_filter
+from apriltag.runtime.target_flow import ANY_TAG_ID, choose_best_target
 
 
 class AprilTagDetectionNode(Node):
-    """Detect AprilTags in camera images and publish all of them.
+    """Detect AprilTags in camera images, publish all of them and the tracked one.
 
     Runs continuously from startup. Every image with camera intrinsics known
     gives one TagPoseArray on `apriltag_poses` with every detected tag of the
-    configured families (empty when none is visible) and a TF per tag. It does
-    not choose a tag: apriltag_control picks the one it tracks.
+    configured families (empty when none is visible) and a TF per tag, and one
+    TagTracing on `tag_tracing` with the closest tag (smallest positive
+    forward z) of tracking_tag_family / tracking_tag_id (-1: any id), or
+    valid=false when there is none.
     """
 
     def __init__(self):
@@ -46,11 +56,17 @@ class AprilTagDetectionNode(Node):
         if self.tag_size <= 0.0:
             raise ValueError('Parameter tag_size must be positive.')
         self.tag_sizes = parse_tag_sizes(self.declare_parameter('tag_sizes', '').value)
-        # only for the debug image: tags apriltag_control would track by its
-        # tag_family / tag_id parameters are outlined in yellow ('-1': any id;
-        # a target_id given in a goal is not known here)
-        self.tag_family = str(self.declare_parameter('tag_family', 'tag36h11').value)
-        self.tag_id = str(self.declare_parameter('tag_id', '0').value)
+
+        # the tag published on tag_tracing: closest one of this family / id
+        self.tracking_tag_family = str(self.declare_parameter('tracking_tag_family', 'tag36h11').value).strip()
+        if self.tracking_tag_family not in self.tag_families:
+            raise ValueError(
+                f"Parameter tracking_tag_family '{self.tracking_tag_family}' is not in "
+                f"tag_families ({' '.join(self.tag_families)}).")
+        tracking_tag_id = int(self.declare_parameter('tracking_tag_id', 0).value)
+        if tracking_tag_id < -1:
+            raise ValueError('Parameter tracking_tag_id must be >= 0, or -1 for any id.')
+        self.tracking_tag_id = tag_id_filter(tracking_tag_id)
 
         # camera intrinsics (filled by camera_info)
         self.fx = None
@@ -62,6 +78,7 @@ class AprilTagDetectionNode(Node):
         self.camera_frame = 'camera_link'
 
         self.poses_pub = self.create_publisher(TagPoseArray, 'apriltag_poses', 1)
+        self.tracing_pub = self.create_publisher(TagTracing, 'tag_tracing', 1)
         self.image_pub = self.create_publisher(Image, 'apriltag/marked_image', self.image_qos)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
@@ -75,10 +92,9 @@ class AprilTagDetectionNode(Node):
                                                  10)
         self.get_logger().info(
             f'tag_families={" ".join(self.tag_families)} tag_size={self.tag_size} '
-            f'tag_sizes={self.tag_sizes}. Detecting continuously; publishing all tags on apriltag_poses.')
-
-    def _is_tracked(self, family: str, tag_id: int) -> bool:
-        return family == self.tag_family and self.tag_id in ('-1', str(tag_id))
+            f'tag_sizes={self.tag_sizes} tracking={self.tracking_tag_family} id '
+            f'{"any" if self.tracking_tag_id == ANY_TAG_ID else self.tracking_tag_id}. '
+            'Detecting continuously; publishing all tags on apriltag_poses, the tracked one on tag_tracing.')
 
     # callback to receive camera intrinsics
     def info_callback(self, msg: CameraInfo):
@@ -95,7 +111,7 @@ class AprilTagDetectionNode(Node):
             self.destroy_subscription(self.info_sub)
             self.info_sub = None
 
-    # callback to process incoming images and publish all tag poses
+    # callback to process incoming images and publish all tag poses and the tracked one
     def image_callback(self, msg: Image):
         intrinsics = make_camera_intrinsics(
             self.fx,
@@ -128,10 +144,9 @@ class AprilTagDetectionNode(Node):
             self.tag_size,
             self.get_logger(),
             size_of=lambda tag_id: tag_size_for(tag_id, self.tag_sizes, self.tag_size),
-            is_tracked=self._is_tracked,
         )
 
-        publish_tag_poses(
+        array_msg = publish_tag_poses(
             stamp=msg.header.stamp,
             camera_frame=self.camera_frame,
             poses_pub=self.poses_pub,
@@ -140,6 +155,10 @@ class AprilTagDetectionNode(Node):
             image_width=frame.shape[1],
             image_height=frame.shape[0],
         )
+        # picked from the same TagPose objects, so both topics carry the same values
+        tracked = choose_best_target(array_msg.tags, self.tracking_tag_family, self.tracking_tag_id)
+        publish_tag_tracing(self.tracing_pub, array_msg.header, tracked,
+                            array_msg.image_width, array_msg.image_height)
 
         publish_image(self.image_pub, vis, header=msg.header, resize_to=(640, 360))
 

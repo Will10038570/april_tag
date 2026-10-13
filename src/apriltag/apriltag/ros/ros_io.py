@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-from apriltag_interfaces.msg import TagPose, TagPoseArray
+from apriltag_interfaces.msg import TagPose, TagPoseArray, TagTracing
 from geometry_msgs.msg import TransformStamped, Twist
 from sensor_msgs.msg import Image
 
@@ -109,8 +109,8 @@ def publish_tag_poses(
     targets: List[dict],
     image_width: int = 0,
     image_height: int = 0,
-) -> None:
-    """Publish one TagPoseArray with all targets and a TF per target.
+) -> TagPoseArray:
+    """Publish one TagPoseArray with all targets and a TF per target, and return it.
 
     `targets` are dictionaries with family, id (str), t, R and optionally
     corners, decision_margin and hamming from
@@ -162,3 +162,21 @@ def publish_tag_poses(
     poses_pub.publish(array_msg)
     if transforms:
         tf_broadcaster.sendTransform(transforms)
+    return array_msg
+
+
+def publish_tag_tracing(tracing_pub, header, tag: Optional[TagPose],
+                        image_width: int, image_height: int) -> None:
+    """Publish one TagTracing with the tracked tag of an image.
+
+    `header` is the image's (stamp and camera frame, as in its TagPoseArray);
+    `tag` None publishes valid=false with an empty tag.
+    """
+    msg = TagTracing()
+    msg.header = header
+    msg.image_width = int(image_width)
+    msg.image_height = int(image_height)
+    if tag is not None:
+        msg.valid = True
+        msg.tag = tag
+    tracing_pub.publish(msg)

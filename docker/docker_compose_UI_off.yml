@@ -19,6 +19,7 @@ services:
       - ROS_DOMAIN_ID=63
       - ROS_LOCALHOST_ONLY=0
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - TZ=Asia/Taipei   # local time for logs (tzdata is in the image)
       # Bind CycloneDDS to the wired NIC (192.168.5.0/24) so it can discover
       # the robot at 192.168.5.10; by default it picks the Wi-Fi interface.
       # presence_required="false": if enP8p1s0 is down/unplugged, skip it and
