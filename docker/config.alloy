@@ -1,0 +1,26 @@
+// Ship april_tag_serive stdout/stderr unchanged to Grafana Cloud Loki.
+discovery.docker "april_tag" {
+  host = "unix:///var/run/docker.sock"
+  filter {
+    name   = "name"
+    values = ["april_tag_serive"]
+  }
+}
+
+loki.source.docker "april_tag" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.docker.april_tag.targets
+  // Loki needs at least one label per stream; this is only the query selector.
+  labels     = {container = "april_tag_serive"}
+  forward_to = [loki.write.grafana_cloud.receiver]
+}
+
+loki.write "grafana_cloud" {
+  endpoint {
+    url = sys.env("GRAFANA_CLOUD_LOKI_URL")
+    basic_auth {
+      username = sys.env("GRAFANA_CLOUD_LOKI_USER")
+      password = sys.env("GRAFANA_CLOUD_API_KEY")
+    }
+  }
+}

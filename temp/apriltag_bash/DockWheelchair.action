@@ -1,0 +1,35 @@
+# Dock: Stage 1 (stage1_distance on /cmd_vel) then Stage 2 (stage2_distance on
+# /pre_cmd_vel). Accepted only in IDLE; stop it with an action cancel.
+# Goal
+int32  tag_id        # -1 = any id (whatever apriltag_detection tracks); >= 0 = that id, must match tracking_tag_id
+string tag_family    # must match apriltag_detection's tracking_tag_family, else TAG_LOST
+---
+# Result
+bool    success
+uint8   error_code
+string  message
+float32 final_x_error    # m   forward (control frame), relative to the stage distance when it ended; NaN if never seen
+float32 final_y_error    # m
+float32 final_yaw_error  # rad
+
+uint8 OK = 0
+uint8 TAG_LOST = 1            # tag not seen for lost_target_timeout (launch parameter, default 1 s) while running
+uint8 AMCL_SERVICE_FAIL = 2   # AMCL service missing / no response / wrong state; also when the restore fails
+uint8 LIDAR_SERVICE_FAIL = 3  # reserved, not reported yet (lidar safety is fire-and-forget)
+uint8 TIMEOUT = 4             # dock_timeout (launch parameter) from goal accepted until ending
+uint8 ACTION_CANCELED = 5     # action cancel
+uint8 OTHER = 6               # any other failure
+uint8 NODE_SHUTDOWN = 7       # apriltag_control shut down
+---
+# Feedback (fixed 10 Hz timer, not tied to camera frames; also a heartbeat)
+uint32 seq                     # per goal, from 0
+builtin_interfaces/Time stamp  # node clock when published
+uint8   stage                  # STAGE_IDLE / STAGE_1 / STAGE_2
+float32 x_error                # m, NaN if no data
+float32 y_error                # m
+float32 yaw_error              # rad
+float32 last_frame_age         # s, now - header.stamp of the newest frame with the tracked tag; NaN if none
+
+uint8 STAGE_IDLE = 0
+uint8 STAGE_1 = 1
+uint8 STAGE_2 = 2

@@ -1,0 +1,7 @@
+ 設計原則
+1.​ 只用 std_msgs 和 std_srvs。 車上 ROS1 和 ROS2 之間靠 ros1_bridge 互通。標準型別只要在 bridge.yaml 加
+一筆設定。自訂 msg 要重新編 ros1_bridge 和兩邊的 interface 套件，所以請不要用。
+2.​ 不要用 ROS2 action。 ros1_bridge 不支援橋接 action。
+3.​ 狀態要持續發布： 我們用「多久沒收到狀態」來判斷 ROS2 節點是否還活著。
+4.​ 指令要有編號： 每個指令帶 cmd_id，狀態要回傳目前處理的是哪一個 cmd_id，避免把上一次的結果當成這次的。 > design_rule.txt
+
