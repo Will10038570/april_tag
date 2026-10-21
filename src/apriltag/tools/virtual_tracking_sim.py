@@ -9,32 +9,35 @@ apriltag_detection and apriltag_control nodes run unmodified:
   /cmd_vel (Stage 1) and /pre_cmd_vel (Stage 2 and leaving);
 - a synthetic camera image of the tag is rendered from the AMR/tag relative
   pose and published with camera_info, so apriltag_detection really detects it;
-- Start sends the dock_wheelchair goal. When it succeeds apriltag_control is
-  back in IDLE with AMCL closed and lidar safety disabled (checked here as
-  "held"); the sim waits in ALIGNED. Leave then sends the undock_wheelchair goal
-  (headless: sent automatically) and the run ends with its result, where AMCL
-  and lidar safety must be restored. Leave without a previous Start runs a
-  leave-only run (undock_wheelchair is accepted in IDLE). The goals carry the
-  sim parameters goal_tag_family / goal_tag_id / goal_distance_m;
+- Start calls the /wheelchair/attach service (std_srvs/Trigger), whose response
+  gives the cmd_id (or rejects it: the run ends as REJECTED). When /wheelchair/status shows
+  IDLE with its cmd_id and error_code 0, apriltag_control is back in IDLE with
+  AMCL closed and lidar safety disabled (checked here as "held"); the sim waits
+  in ALIGNED. Leave then calls /wheelchair/detach (headless: automatically) and
+  the run ends with its status, where AMCL and lidar safety must be restored.
+  Leave without a previous Start runs a leave-only run (detach is accepted in
+  IDLE). A cmd service without a response within cmd_reject_timeout ends the
+  run as REJECTED;
 - a fake G7+ node (FakeG7Services) stands in for AMCL and the PLC lidar safety.
   It only keeps two bool flags, switched through the same AMCL services and lidar
   safety topic apriltag_control uses on the robot, so the call order and restores
   can be checked.
 
 The OpenCV dashboard shows a top view (drag the AMR to set the initial pose),
-the camera image, pose errors (ground truth vs. controller feedback) and the
+the camera image, pose errors (ground truth vs. controller status) and the
 cmd_vel commands. Each finished run is saved as CSV + PNG.
 
 Controls:
     top view   drag AMR body = move, drag the round handle in front = rotate,
                mouse wheel or a / d = rotate 2 deg (only while not running)
     keys       s = start, l = leave (in ALIGNED, or a leave-only run when idle),
-               x = stop (cancel the running goal), r = reset to initial pose,
+               x = stop (call /wheelchair/cancel), r = reset to initial pose,
                + / - = zoom top view, q or Esc = quit
 """
 
 import array
 import csv
+import json
 import math
 import os
 import re
@@ -46,18 +49,15 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import rclpy
-from action_msgs.msg import GoalStatus
-from apriltag_interfaces.action import DockWheelchair, UndockWheelchair
 from geometry_msgs.msg import Twist
 from rcl_interfaces.msg import Log
 from rcl_interfaces.srv import GetParameters
-from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import QoSHistoryPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, QoSHistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from std_srvs.srv import Empty, Trigger
 
 from apriltag.domain.math_utils import optical_to_control_error
@@ -65,9 +65,14 @@ from apriltag.domain.math_utils import optical_to_control_error
 WINDOW_NAME = 'AprilTag virtual tracking'
 # apriltag_control prefixes its log messages with '[stage <STATE>] : '
 STAGE_PREFIX_RE = re.compile(r'^\[stage [A-Z_0-9 ]+\] : ')
-# STARTING / RUNNING: dock goal; ALIGNED: dock succeeded, waiting for leave;
-# LEAVING: undock goal
+# STARTING / RUNNING: attach cmd; ALIGNED: attach succeeded, waiting for leave;
+# LEAVING: detach cmd
 ACTIVE_PHASES = ('STARTING', 'RUNNING', 'ALIGNED', 'LEAVING')
+# status state as a number, so the feedback rows stay numeric
+STATE_NUMBERS = {'IDLE': 0, 'STAGE1': 1, 'STAGE2': 2, 'LEAVING': 3}
+# same QoS as apriltag_control (PDF interface: status transient_local)
+STATUS_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                        durability=DurabilityPolicy.TRANSIENT_LOCAL)
 STAGE_LABELS = {1: 'S1', 2: 'S2', 3: 'L'}
 
 
@@ -222,7 +227,7 @@ class FakeG7Services(Node):
 class RunLog:
     # physics samples: (t, x, y, yaw, gt_x_err, gt_y_err, gt_yaw_err, vx, vy, wz, stage)
     samples: List[tuple] = field(default_factory=list)
-    # controller feedback: (t, x_err, y_err, yaw_err, seq, stage, last_frame_age)
+    # controller status: (t, x_err, y_err, yaw_err, cmd_id, state number, last_frame_age)
     feedback: List[tuple] = field(default_factory=list)
     stage2_t: Optional[float] = None
     leave_t: Optional[float] = None
@@ -241,16 +246,11 @@ class VirtualTrackingSim(Node):
 
         # must match apriltag_detection / apriltag_control
         self.tag_size = float(param('tag_size', 0.0635))
-        # goals sent to apriltag_control; tag_id below is the drawn tag, so a
-        # different goal_tag_id tests the tag filter
-        self.goal_tag_family = str(param('goal_tag_family', 'tag36h11'))
-        self.goal_tag_id = int(param('goal_tag_id', 0))
-        self.goal_distance_m = float(param('goal_distance_m', 1.0))
-        # stage distances are read from apriltag_control at startup, so the
-        # sim always follows its parameters; these values only fill the
-        # dashboard until then, and no goal is started before they are read.
-        # Index stage - 1: Stage 1, Stage 2, leave (stage 3, the undock goal's distance_m)
-        self.stage_distances = (0.50, 0.28, self.goal_distance_m)
+        # stage / leave distances are read from apriltag_control at startup, so
+        # the sim always follows its parameters; these values only fill the
+        # dashboard until then, and no cmd is sent before they are read.
+        # Index stage - 1: Stage 1, Stage 2, leave (stage 3, leave_distance)
+        self.stage_distances = (0.50, 0.28, 1.0)
         self.stage_distances_known = False
         self.tag_id = int(param('tag_id', 0))
 
@@ -278,6 +278,8 @@ class VirtualTrackingSim(Node):
         self.headless = bool(param('headless', False))
         self.auto_start = bool(param('auto_start', False))
         self.log_dir = os.path.abspath(os.path.expanduser(str(param('log_dir', 'virtual_tracking_logs'))))
+        # a cmd service call without a response by then ends the run as REJECTED (s)
+        self.cmd_reject_timeout = float(param('cmd_reject_timeout', 2.0))
 
         self.board = make_tag_board(self.tag_id)
 
@@ -295,7 +297,12 @@ class VirtualTrackingSim(Node):
         self.run_end: Optional[float] = None
         self.result_message = ''
         self.control_log: List[str] = []
-        self.goal_handle = None
+        # cmd_id from the last accepted cmd service response (0: none yet)
+        self.sent_cmd_id = 0
+        self.sent_time = 0.0
+        # a cmd service call waits for its response
+        self.cmd_pending = False
+        self.status_seen = False
         self.raw_image: Optional[np.ndarray] = None
         self.marked_image: Optional[np.ndarray] = None
         self.marked_time = 0.0
@@ -311,8 +318,9 @@ class VirtualTrackingSim(Node):
         self.create_subscription(Twist, '/pre_cmd_vel', self._on_cmd_vel, 10)
         self.create_subscription(Image, 'apriltag/marked_image', self._on_marked_image, image_qos)
         self.create_subscription(Log, '/rosout', self._on_rosout, 100)
-        self.action_client = ActionClient(self, DockWheelchair, 'dock_wheelchair')
-        self.leave_client = ActionClient(self, UndockWheelchair, 'undock_wheelchair')
+        self.cmd_clients = {c: self.create_client(Trigger, c) for c in ('attach', 'detach', 'cancel')}
+        self.create_subscription(String, 'status', self._on_status, STATUS_QOS)
+        self.create_timer(0.2, self._check_rejected)
         self.control_param_client = self.create_client(GetParameters, 'apriltag_control/get_parameters')
         self._control_param_future = None
         self._control_param_timer = self.create_timer(1.0, self._fetch_stage_distances)
@@ -362,8 +370,8 @@ class VirtualTrackingSim(Node):
         with self.lock:
             if self.run_start_ros is None or Time.from_msg(msg.stamp) < self.run_start_ros:
                 return
-            # skip the periodic cmd_vel / feedback logs so state changes stay visible
-            if not text.startswith(('[publish]', '[action] feedback')):
+            # skip the periodic cmd_vel / status logs so state changes stay visible
+            if not text.startswith(('[publish]', '[status]')):
                 self.control_log = (self.control_log + [text])[-3:]
             if self.phase in ACTIVE_PHASES and text.startswith('Stage 1 aligned') and self.stage == 1:
                 self.stage = 2
@@ -426,53 +434,81 @@ class VirtualTrackingSim(Node):
             self.raw_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
             self.tag_visible = visible
 
-    # ---- action -----------------------------------------------------------
+    # ---- cmd / status -----------------------------------------------------
 
     def _fetch_stage_distances(self):
-        """Read stage1/2_distance from apriltag_control once it is up."""
+        """Read stage1/2_distance and leave_distance from apriltag_control once it is up."""
         if self._control_param_future is not None or not self.control_param_client.service_is_ready():
             return
-        request = GetParameters.Request(names=['stage1_distance', 'stage2_distance'])
+        request = GetParameters.Request(names=['stage1_distance', 'stage2_distance', 'leave_distance'])
         self._control_param_future = self.control_param_client.call_async(request)
         self._control_param_future.add_done_callback(self._on_stage_distances)
 
     def _on_stage_distances(self, future):
         response = future.result()
         values = [v.double_value for v in response.values] if response is not None else []
-        if len(values) != 2:
+        if len(values) != 3:
             self.get_logger().warn('Cannot read stage distances from apriltag_control, retrying.')
             self._control_param_future = None
             return
         self._control_param_timer.cancel()
         with self.lock:
-            self.stage_distances = (values[0], values[1], self.goal_distance_m)
+            self.stage_distances = tuple(values)
             self.stage_distances_known = True
         self.get_logger().info(
             f'Stage distances from apriltag_control: stage1={values[0]:.2f}m stage2={values[1]:.2f}m '
-            f'(undock goal distance_m={self.goal_distance_m:.2f}m)')
+            f'leave={values[2]:.2f}m')
 
     def _try_auto_start(self):
-        if self.stage_distances_known and self.action_client.server_is_ready():
+        if self.stage_distances_known and self.status_seen:
             self._auto_start_timer.cancel()
             self.start()
+
+    def _prepare_cmd_locked(self):
+        """Forget the last cmd_id before a new cmd call; the caller must hold self.lock."""
+        self.sent_cmd_id = 0
+        self.sent_time = time.monotonic()
+        self.cmd_pending = True
+
+    def _call_cmd(self, cmd: str, phase: str):
+        """Call the attach / detach service; called without self.lock (the done callback takes it)."""
+        future = self.cmd_clients[cmd].call_async(Trigger.Request())
+        future.add_done_callback(lambda f: self._on_cmd_response(cmd, phase, f))
+        self.get_logger().info(f'{cmd} service called.')
+
+    def _on_cmd_response(self, cmd: str, phase: str, future):
+        response = future.result()
+        try:
+            reply = json.loads(response.message)
+        except ValueError:
+            reply = {'cmd_id': None, 'msg': response.message}
+        with self.lock:
+            if self.phase != phase or not self.cmd_pending:
+                return  # reset (or timed out) meanwhile
+            self.cmd_pending = False
+            if response.success:
+                self.sent_cmd_id = int(reply['cmd_id'])
+        if response.success:
+            self.get_logger().info(f'{cmd} accepted: cmd_id={reply["cmd_id"]}.')
+            return
+        message = f'{cmd} rejected: {reply.get("msg")}'
+        self.get_logger().error(message)
+        self._end_run('REJECTED', message, phase)
 
     def start(self):
         with self.lock:
             if self.phase in ACTIVE_PHASES:
                 return
-            if not self.action_client.server_is_ready():
-                self.result_message = 'dock_wheelchair action server not available.'
+            if not self.status_seen:
+                self.result_message = 'No status from apriltag_control yet.'
                 return
             if not self.stage_distances_known:
                 self.result_message = 'Stage distances not read from apriltag_control yet.'
                 return
             self._begin_run_locked(stage=1)
             self.phase = 'STARTING'
-
-        goal = DockWheelchair.Goal(tag_id=self.goal_tag_id, tag_family=self.goal_tag_family)
-        future = self.action_client.send_goal_async(goal, feedback_callback=self._on_feedback)
-        future.add_done_callback(self._on_goal_response)
-        self.get_logger().info(f'dock_wheelchair goal sent: tag_family={goal.tag_family} tag_id={goal.tag_id}.')
+            self._prepare_cmd_locked()
+        self._call_cmd('attach', 'STARTING')
 
     def _begin_run_locked(self, stage: int):
         """Start a new run log from the current pose; the caller must hold self.lock."""
@@ -490,20 +526,22 @@ class VirtualTrackingSim(Node):
     def stop(self):
         with self.lock:
             aligned = self.phase == 'ALIGNED'
-            handle = self.goal_handle if self.phase in ACTIVE_PHASES else None
+            active = self.phase in ACTIVE_PHASES
         if aligned:
-            # apriltag_control is in IDLE: no goal to cancel
+            # apriltag_control is in IDLE: no cmd to cancel
             self.get_logger().info('ALIGNED: nothing to stop; press l to leave (restores AMCL / lidar safety).')
-        elif handle is not None:
-            handle.cancel_goal_async()
+        elif active:
+            future = self.cmd_clients['cancel'].call_async(Trigger.Request())
+            future.add_done_callback(lambda f: self.get_logger().info(
+                f'cancel: success={f.result().success} message={f.result().message}'))
 
     def leave(self):
-        """Send undock_wheelchair: continues the run in ALIGNED, else starts a leave-only run."""
+        """Send detach: continues the run in ALIGNED, else starts a leave-only run."""
         with self.lock:
             if self.phase in ACTIVE_PHASES and self.phase != 'ALIGNED':
                 return
-            if not self.leave_client.server_is_ready():
-                self.result_message = 'undock_wheelchair action server not available.'
+            if not self.status_seen:
+                self.result_message = 'No status from apriltag_control yet.'
                 return
             if self.phase == 'ALIGNED':
                 self.run.leave_t = time.monotonic() - self.run_start
@@ -515,12 +553,9 @@ class VirtualTrackingSim(Node):
                 self.run.leave_t = 0.0
             self.phase = 'LEAVING'
             self.stage = 3
-        goal = UndockWheelchair.Goal(tag_id=self.goal_tag_id, tag_family=self.goal_tag_family,
-                                     distance_m=self.goal_distance_m)
-        future = self.leave_client.send_goal_async(goal, feedback_callback=self._on_feedback)
-        future.add_done_callback(self._on_leave_goal_response)
-        self.get_logger().info(f'undock_wheelchair goal sent: tag_family={goal.tag_family} tag_id={goal.tag_id} '
-                               f'distance_m={goal.distance_m:.2f}.')
+            self._prepare_cmd_locked()
+        self._call_cmd('detach', 'LEAVING')
+        self.get_logger().info(f'leave_distance={self.stage_distances[2]:.2f}m.')
 
     def reset(self):
         self.stop()
@@ -536,65 +571,44 @@ class VirtualTrackingSim(Node):
             self.run_start = None
             self.run_end = None
 
-    def _on_goal_response(self, future):
-        handle = future.result()
+    def _on_status(self, msg: String):
+        try:
+            status = json.loads(msg.data)
+        except ValueError:
+            self.get_logger().warn(f'Invalid status JSON: {msg.data!r}')
+            return
+        state = status.get('state')
         with self.lock:
-            if not handle.accepted:
-                self.phase = 'REJECTED'
-                self.result_message = 'Goal rejected.'
-                self.finished.set()
+            self.status_seen = True
+            phase = self.phase
+            # sent_cmd_id 0: the cmd service has not answered yet (status cmd_id 0 is the boot value)
+            if (phase not in ('STARTING', 'RUNNING', 'LEAVING') or not self.sent_cmd_id
+                    or status.get('cmd_id') != self.sent_cmd_id):
                 return
-            self.goal_handle = handle
-            if self.phase == 'STARTING':
-                self.phase = 'RUNNING'
-        handle.get_result_async().add_done_callback(self._on_result)
-
-    def _on_feedback(self, feedback_msg):
-        fb = feedback_msg.feedback
-        # undock reports y / yaw as *_shift (monitor only); same CSV columns
-        if isinstance(fb, UndockWheelchair.Feedback):
-            y, yaw = fb.y_shift, fb.yaw_shift
-        else:
-            y, yaw = fb.y_error, fb.yaw_error
-        values = [fb.x_error, y, yaw, fb.seq, fb.stage, fb.last_frame_age]
-        with self.lock:
-            if self.phase in ACTIVE_PHASES:
-                self.run.feedback.append((time.monotonic() - self.run_start, *values))
-
-    @staticmethod
-    def _status_phase(status) -> str:
-        return {
-            GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED',
-            GoalStatus.STATUS_ABORTED: 'ABORTED',
-            GoalStatus.STATUS_CANCELED: 'CANCELED',
-        }.get(status, f'STATUS_{status}')
-
-    def _end_run(self, phase: str, message: str, expected_phase: str):
-        """Final result of a run: save it and release headless mode."""
-        with self.lock:
-            if self.phase != expected_phase:
-                return  # reset while running
-            self.phase = phase
-            self.result_message = message
-            self.run_end = time.monotonic()
-            self.goal_handle = None
-        self._save_run(phase)
-        self.finished.set()
-
-    def _on_result(self, future):
-        response = future.result()
-        phase = self._status_phase(response.status)
-        self.get_logger().info(f'dock_wheelchair finished: {phase} error_code={response.result.error_code} '
-                               f'- {response.result.message}')
-        if phase != 'SUCCEEDED':
-            self._end_run(phase, response.result.message, 'RUNNING')
+            if state != 'IDLE':
+                if phase == 'STARTING':
+                    self.phase = 'RUNNING'
+                values = [status.get(k) for k in ('x_error', 'y_error', 'yaw_error')]
+                age = status.get('last_frame_age')
+                self.run.feedback.append((time.monotonic() - self.run_start,
+                                          *[math.nan if v is None else v for v in values],
+                                          status['cmd_id'], STATE_NUMBERS.get(state, -1),
+                                          math.nan if age is None else age))
+                return
+        # IDLE with our cmd_id: the cmd has ended
+        code = int(status.get('error_code', -1))
+        message = status.get('error_msg') or 'OK'
+        result = {0: 'SUCCEEDED', 5: 'CANCELED'}.get(code, 'ABORTED')
+        name = 'detach' if phase == 'LEAVING' else 'attach'
+        self.get_logger().info(f'{name} cmd_id={self.sent_cmd_id} finished: {result} error_code={code} - {message}')
+        if phase == 'LEAVING' or result != 'SUCCEEDED':
+            self._end_run(result, message, phase)
             return
         with self.lock:
-            if self.phase != 'RUNNING':
+            if self.phase != phase:
                 return  # reset while running
             self.phase = 'ALIGNED'
-            self.result_message = response.result.message
-            self.goal_handle = None
+            self.result_message = message
         # apriltag_control is back in IDLE with AMCL closed, lidar safety disabled
         amcl_on, lidar_safety_disabled = self.fake_g7.state()
         held = (f"aligned: amcl={'on' if amcl_on else 'off'} "
@@ -606,22 +620,30 @@ class VirtualTrackingSim(Node):
         if self.headless:
             self.leave()
 
-    def _on_leave_goal_response(self, future):
-        handle = future.result()
-        if not handle.accepted:
-            self.get_logger().error('undock_wheelchair goal rejected.')
-            self._end_run('REJECTED', 'undock_wheelchair goal rejected.', 'LEAVING')
-            return
+    def _check_rejected(self):
+        """A cmd service call without a response in time (apriltag_control not running)."""
         with self.lock:
-            self.goal_handle = handle
-        handle.get_result_async().add_done_callback(self._on_leave_result)
+            phase = self.phase
+            rejected = (phase in ('STARTING', 'LEAVING') and self.cmd_pending
+                        and time.monotonic() - self.sent_time > self.cmd_reject_timeout)
+            if rejected:
+                self.cmd_pending = False
+        if rejected:
+            cmd = 'attach' if phase == 'STARTING' else 'detach'
+            message = f'no response from /wheelchair/{cmd} after {self.cmd_reject_timeout:.1f}s (rejected).'
+            self.get_logger().error(message)
+            self._end_run('REJECTED', message, phase)
 
-    def _on_leave_result(self, future):
-        response = future.result()
-        phase = self._status_phase(response.status)
-        self.get_logger().info(f'undock_wheelchair finished: {phase} error_code={response.result.error_code} '
-                               f'- {response.result.message}')
-        self._end_run(phase, response.result.message, 'LEAVING')
+    def _end_run(self, phase: str, message: str, expected_phase: str):
+        """Final result of a run: save it and release headless mode."""
+        with self.lock:
+            if self.phase != expected_phase:
+                return  # reset while running
+            self.phase = phase
+            self.result_message = message
+            self.run_end = time.monotonic()
+        self._save_run(phase)
+        self.finished.set()
 
     # ---- logging ----------------------------------------------------------
 
@@ -644,7 +666,7 @@ class VirtualTrackingSim(Node):
             writer.writerows(run.samples)
         with open(base + '_feedback.csv', 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['t', 'x_err', 'y_err', 'yaw_err', 'seq', 'stage', 'last_frame_age'])
+            writer.writerow(['t', 'x_err', 'y_err', 'yaw_err', 'cmd_id', 'state', 'last_frame_age'])
             writer.writerows(run.feedback)
         with open(base + '_cmd_raw.csv', 'w', newline='') as f:
             writer = csv.writer(f)
@@ -658,9 +680,9 @@ class VirtualTrackingSim(Node):
             summary += (f' | final GT err x={final[4]:+.4f} y={final[5]:+.4f} yaw={final[6]:+.4f}'
                         f' | max |cmd| vx={max_cmd[0]:.3f} vy={max_cmd[1]:.3f} wz={max_cmd[2]:.3f}')
         self.get_logger().info(summary)
-        # every goal end must leave AMCL on and lidar safety enabled
+        # every cmd end must leave AMCL on and lidar safety enabled
         amcl_on, lidar_safety_disabled = self.fake_g7.state()
-        restore = (f"after goal: amcl={'on' if amcl_on else 'off'} "
+        restore = (f"after cmd: amcl={'on' if amcl_on else 'off'} "
                    f"lidar_safety={'disabled' if lidar_safety_disabled else 'enabled'}")
         if amcl_on and not lidar_safety_disabled:
             self.get_logger().info(f'{restore} (restored)')
@@ -947,7 +969,7 @@ class Dashboard:
         err_values = err_values[np.isfinite(err_values)]
         lim = max(0.1, float(np.max(np.abs(err_values))) * 1.1) if err_values.size else 0.2
         draw_plot(
-            img, ERR_RECT, 'Pose error   line = ground truth,  o = controller (action feedback)', t_max, (-lim, lim),
+            img, ERR_RECT, 'Pose error   line = ground truth,  o = controller (status)', t_max, (-lim, lim),
             lines=[(t, samples[:, 4], C_X), (t, samples[:, 5], C_Y), (t, samples[:, 6], C_YAW)],
             dots=[(feedback[:, 0], feedback[:, 1], C_X), (feedback[:, 0], feedback[:, 2], C_Y),
                   (feedback[:, 0], feedback[:, 3], C_YAW)],
@@ -1086,7 +1108,7 @@ def main(args=None):
     dashboard = Dashboard(sim)
     try:
         if sim.headless:
-            # run one goal (auto_start) and save the dashboard PNG at the end
+            # run one attach + detach (auto_start) and save the dashboard PNG at the end
             while rclpy.ok() and not sim.finished.wait(timeout=0.2):
                 pass
             path = sim.take_png_request()

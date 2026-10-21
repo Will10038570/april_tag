@@ -1,4 +1,4 @@
-"""Print what apriltag_detection publishes under /up (at most 5 Hz).
+"""Print what apriltag_detection publishes under /wheelchair (at most 5 Hz).
 
 topic:=tag_tracing (default) prints the tracked tag (TagTracing),
 topic:=apriltag_poses every detected tag (TagPoseArray).
@@ -18,7 +18,7 @@ def generate_launch_description():
         package='apriltag',
         executable='detection_viewer',
         name='detection_viewer',
-        namespace='up',
+        namespace='wheelchair',
         output='screen',
         parameters=[{'topic': LaunchConfiguration('topic')}],
     )

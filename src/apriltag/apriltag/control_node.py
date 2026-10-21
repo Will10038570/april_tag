@@ -7,16 +7,15 @@ from typing import Optional, Tuple
 
 import numpy as np
 import rclpy
-from apriltag_interfaces.action import DockWheelchair, UndockWheelchair
 from apriltag_interfaces.msg import TagTracing
 from geometry_msgs.msg import Twist
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32, String
 from std_srvs.srv import Empty, Trigger
 
 from apriltag.control import LQRTracker, TrajectoryPlanner
@@ -27,12 +26,14 @@ from apriltag.domain.math_utils import (
     tag_size_for,
 )
 from apriltag.ros.ros_io import publish_twist
-from apriltag.runtime.action_flow import (
-    DOCK,
-    UNDOCK,
+from apriltag.runtime.cmd_flow import (
+    ATTACH,
+    CANCEL,
+    DETACH,
     Codes,
-    feedback_stage,
     final_outcome,
+    reply_json,
+    status_json,
     tag_id_filter,
     validate_goal,
 )
@@ -42,15 +43,13 @@ from apriltag.runtime.target_flow import ANY_TAG_ID, tag_matches
 from apriltag.runtime.yaw_probe import YawProbe, YawProbeConfig
 from apriltag.yaw_estimator import YawEstimator, YawEstimatorConfig
 
-# high-rate messages (cmd_vel, action feedback) are logged at most once per this period
+# high-rate messages (cmd_vel, status) are logged at most once per this period
 LOG_THROTTLE_SEC = 1.0
-# action feedback (heartbeat) and timeout check period (s)
-FEEDBACK_PERIOD = 0.1
-ACTION_TYPES = {DOCK: DockWheelchair, UNDOCK: UndockWheelchair}
-ACTION_NAMES = {DOCK: 'dock_wheelchair', UNDOCK: 'undock_wheelchair'}
-# feedback / result field names for y and yaw: undock has no y / yaw target, so
-# it reports them as *_shift (monitor only, never affects the result)
-Y_YAW_FIELDS = {DOCK: ('y_error', 'yaw_error'), UNDOCK: ('y_shift', 'yaw_shift')}
+# /wheelchair/status (heartbeat) and timeout check period (s), 5 Hz
+STATUS_PERIOD = 0.2
+# transient_local: a restarted subscriber gets the current status at once
+STATUS_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                        durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
 
 class TrackingState(Enum):
@@ -58,7 +57,7 @@ class TrackingState(Enum):
     STAGE1 = 'STAGE1'    # enable lidar safety, close AMCL; track stage1_distance on /cmd_vel
     STAGE2 = 'STAGE2'    # disable lidar safety; track stage2_distance on /pre_cmd_vel
     LEAVING = 'LEAVING'  # disable lidar safety, close AMCL; back straight to the
-                         # goal's distance_m; restore AMCL / lidar safety
+                         # leave_distance; restore AMCL / lidar safety
 
 
 class Step(Enum):
@@ -77,12 +76,14 @@ ALLOWED_TRANSITIONS = {
 }
 # states with a running goal; velocity is published only in their RUNNING step
 ACTIVE_STATES = frozenset({S.STAGE1, S.STAGE2, S.LEAVING})
-# action -> states in which its goal is accepted; a running goal is stopped
-# with an action cancel
+# cmd -> states in which it is accepted; a running cmd is stopped with the
+# cancel service
 GOAL_RULES = {
-    DOCK: frozenset({S.IDLE}),
-    UNDOCK: frozenset({S.IDLE}),
+    ATTACH: frozenset({S.IDLE}),
+    DETACH: frozenset({S.IDLE}),
 }
+# body_status_topic value on entering a state; STAGE2 publishes nothing
+BODY_STATUS = {S.IDLE: 0, S.STAGE1: 1, S.LEAVING: 2}
 
 
 def is_transition_allowed(src: TrackingState, dst: TrackingState) -> bool:
@@ -126,36 +127,44 @@ class AprilTagControlNode(Node):
 
     The procedure is a state machine (TrackingState):
 
-        IDLE -> STAGE1 -> STAGE2 -> IDLE        (dock_wheelchair)
-        IDLE -> LEAVING -> IDLE                 (undock_wheelchair)
+        IDLE -> STAGE1 -> STAGE2 -> IDLE        (attach cmd)
+        IDLE -> LEAVING -> IDLE                 (detach cmd)
 
     Each non-IDLE state runs the steps PREPARING -> RUNNING -> ENDING (Step)
-    and switches the external state it needs itself. A dock_wheelchair goal
+    and switches the external state it needs itself. An attach cmd
     enters STAGE1: it enables lidar safety and closes AMCL, then tracks the
-    goal's tag from /tag_tracing with TrajectoryPlanner + LQR on
+    tracked tag from tag_tracing with TrajectoryPlanner + LQR on
     /cmd_vel. When Stage 1 converges the robot stops and STAGE2
     disables the PLC lidar safety field, then continues on /pre_cmd_vel (G7+
     precision mode, the motors wait until the steering is within 5 deg). When
     Stage 2 is aligned the robot stops and the node returns to IDLE with AMCL
-    closed and lidar safety disabled; the goal then succeeds. An
-    undock_wheelchair goal (also accepted without a previous alignment)
+    closed and lidar safety disabled; the cmd then succeeds. A detach cmd
+    (also accepted without a previous alignment)
     enters LEAVING: it disables lidar safety, closes AMCL (both are usually
     already so after Stage 2), then backs straight up at max_vx on
-    /pre_cmd_vel, without the planner / LQR, until the tag is at least the
-    goal's distance_m ahead of the camera; then it stops, enables lidar safety
+    /pre_cmd_vel, without the planner / LQR, until the tag is at least
+    leave_distance ahead of the camera; then it stops, enables lidar safety
     and makes sure AMCL is open before IDLE. A failure, cancel, timeout or
     target loss in any state ends the same way as LEAVING: stop, restore AMCL
     / lidar safety, IDLE. Node shutdown restores them too. With
     manage_amcl_and_lidar_safety set to false it skips all AMCL and lidar
-    safety calls. Goals are accepted only in IDLE and stopped with an action
-    cancel; the result carries an error_code, the feedback is published at a
-    fixed 10 Hz.
+    safety calls.
+
+    Interface (std_msgs / std_srvs only, for ros1_bridge): cmds are the
+    std_srvs/Trigger services attach, detach and cancel, answered at once
+    (success = accepted, message = JSON {"cmd_id": n | null, "msg": ...}).
+    attach / detach are accepted only in IDLE and get a new cmd_id (1, 2, ...
+    since start); cancel stops whatever runs (rejected in IDLE). status (JSON, 5 Hz) carries the
+    state, the cmd_id, error_code / error_msg and debug errors; a cmd has
+    ended when the state is IDLE with its cmd_id (error_code 0: success).
+    attached is always false (the gripper is not sensed).
 
     apriltag_detection runs on its own, picks the tracked tag of each image
     (closest one of its tracking_tag_family / tracking_tag_id) and publishes
-    it on /tag_tracing (TagTracing). This node only checks it against the
-    goal's tag_family / tag_id (-1: any id): valid=false or a tag that does
-    not match counts as not seen, so it ends the goal with TAG_LOST after
+    it on tag_tracing (TagTracing). This node only checks it against its own
+    tracking_tag_family / tracking_tag_id (-1: any id; the launch file passes
+    the same values to both nodes): valid=false or a tag that does not match
+    counts as not seen, so it ends the cmd with TAG_LOST after
     lost_target_timeout.
 
     AMCL is switched through external services whose responses are checked.
@@ -173,9 +182,9 @@ class AprilTagControlNode(Node):
                                                     self.tracing_callback,
                                                     1)
 
-        # id of the tag the yaw estimator follows (None: none yet in this goal)
+        # id of the tag the yaw estimator follows (None: none yet in this cmd)
         self._target_id: Optional[str] = None
-        # (family, id) of the non-matching tag last warned about in this goal
+        # (family, id) of the non-matching tag last warned about in this cmd
         self._mismatch_warned: Optional[Tuple[str, str]] = None
         ## tag size: real black-border side (m), tag_sizes 'id:size ...' per id;
         # must match apriltag_detection. Only the S4 table conversion uses it here.
@@ -262,10 +271,10 @@ class AprilTagControlNode(Node):
         self.max_vw = 0.05
         self.max_dt = 0.2
         self.latest_plan = None
-        # whole-action timeouts (s), from goal accepted until it ends
-        self.dock_timeout = float(self.declare_parameter('dock_timeout', 60.0).value)
-        self.undock_timeout = float(self.declare_parameter('undock_timeout', 60.0).value)
-        # target not seen for this long (s) while running ends the goal (TAG_LOST)
+        # whole-cmd timeouts (s), from attach / detach accepted until it ends
+        self.dock_timeout = float(self.declare_parameter('dock_timeout', 300.0).value)
+        self.undock_timeout = float(self.declare_parameter('undock_timeout', 300.0).value)
+        # target not seen for this long (s) while running ends the cmd (TAG_LOST)
         self.lost_target_timeout = float(self.declare_parameter('lost_target_timeout', 1.0).value)
         for name in ('dock_timeout', 'undock_timeout', 'lost_target_timeout'):
             if not getattr(self, name) > 0.0:
@@ -290,16 +299,27 @@ class AprilTagControlNode(Node):
         self._tracking_result: dict = {}
         self._latest_best_target: dict = {}
         self._tracking_start_time: Optional[float] = None
-        # the running goal, set in _goal_callback under _control_lock:
-        # action (DOCK / UNDOCK), tag filter, undock distance, deadline
-        # (monotonic) and the feedback state
+        # tag the cmds track (same values as apriltag_detection's) and the
+        # leave distance (m, camera-to-tag forward distance to back up to)
+        tag_family = str(self.declare_parameter('tracking_tag_family', 'tag36h11').value).strip()
+        tag_id = int(self.declare_parameter('tracking_tag_id', 0).value)
+        leave_distance = float(self.declare_parameter('leave_distance', 1.0).value)
+        reason = validate_goal(tag_id, tag_family, leave_distance)
+        if reason is not None:
+            raise ValueError(f'Invalid tracking_tag_family / tracking_tag_id / leave_distance: {reason}')
+        self._goal_tag_family = tag_family
+        self._goal_tag_id = tag_id_filter(tag_id)
+        self._goal_leave_distance = leave_distance
+        # the running cmd, set in _cmd_callback under _control_lock: cmd
+        # (ATTACH / DETACH) and deadline (monotonic)
         self._goal_action: Optional[str] = None
-        self._goal_tag_family = ''
-        self._goal_tag_id = ANY_TAG_ID
-        self._goal_leave_distance = 0.0
         self._goal_deadline: Optional[float] = None
-        self._active_goal_handle = None
-        self._feedback_seq = 0
+        # status fields (under _control_lock): cmd_id of the current / last
+        # cmd (0: none), its error; _next_cmd_id is given to the next accepted cmd
+        self._cmd_id = 0
+        self._next_cmd_id = 1
+        self._error_code = Codes.OK
+        self._error_msg = ''
         # header.stamp (s, ROS time) of the newest frame with the tracked tag
         self._last_frame_stamp: Optional[float] = None
 
@@ -308,7 +328,7 @@ class AprilTagControlNode(Node):
         self.lost_check_timer = self.create_timer(self.lost_check_period, self._check_target_lost)
 
         # service clients get their own group so responses can be handled
-        # while the action execute thread is waiting on them
+        # while the cmd worker thread is waiting on them
         self._client_cb_group = MutuallyExclusiveCallbackGroup()
 
         ## external services (AMCL, PLC lidar safety)
@@ -338,7 +358,7 @@ class AprilTagControlNode(Node):
             Empty, self.amcl_open_service, callback_group=self._client_cb_group)
         self.lidar_safety_pub = self.create_publisher(Bool, self.lidar_safety_topic, 1)
 
-        # for feedback and logs: AMCL as reported by its provider, lidar safety
+        # for status and logs: AMCL as reported by its provider, lidar safety
         # as last published (not confirmed by the PLC)
         self._amcl_state = 'unknown'          # on / off / unknown / unmanaged
         self._lidar_safety_state = 'unknown'  # enabled / disabled / unknown / unmanaged
@@ -351,36 +371,29 @@ class AprilTagControlNode(Node):
                 'will not be checked or changed.'
             )
 
-        self._action_cb_group = ReentrantCallbackGroup()
-        self.dock_action_server = ActionServer(
-            self,
-            DockWheelchair,
-            ACTION_NAMES[DOCK],
-            execute_callback=self._execute_dock,
-            goal_callback=lambda goal: self._goal_callback(DOCK, goal),
-            cancel_callback=self._cancel_callback,
-            callback_group=self._action_cb_group,
-        )
-        self.undock_action_server = ActionServer(
-            self,
-            UndockWheelchair,
-            ACTION_NAMES[UNDOCK],
-            execute_callback=self._execute_undock,
-            goal_callback=lambda goal: self._goal_callback(UNDOCK, goal),
-            cancel_callback=self._cancel_callback,
-            callback_group=self._action_cb_group,
-        )
-        # feedback heartbeat and timeout check; own group, so it also runs
-        # while the execute thread waits on a service
-        self._feedback_timer = self.create_timer(
-            FEEDBACK_PERIOD, self._feedback_tick, callback_group=MutuallyExclusiveCallbackGroup())
+        ## wheelchair interface (std_msgs only, for ros1_bridge)
+        self.attach_srv = self.create_service(Trigger, 'attach', lambda _, res: self._goal_service(ATTACH, res))
+        self.detach_srv = self.create_service(Trigger, 'detach', lambda _, res: self._goal_service(DETACH, res))
+        self.cancel_srv = self.create_service(Trigger, 'cancel', self._cancel_service)
+        self.status_pub = self.create_publisher(String, 'status', STATUS_QOS)
+        self.attached_pub = self.create_publisher(Bool, 'attached', STATUS_QOS)
+        # G7+ UI: 1 attaching, 2 leaving, 0 back to IDLE; published on state change only
+        self.body_status_pub = self.create_publisher(
+            Int32, self.declare_parameter('body_status_topic', '/g7_body/simple_ui/body_status').value,
+            STATUS_QOS)
+        # status heartbeat and timeout check; own group, so it also runs
+        # while the cmd worker thread waits on a service
+        self._status_timer = self.create_timer(
+            STATUS_PERIOD, self._status_tick, callback_group=MutuallyExclusiveCallbackGroup())
         self.get_logger().info(
             self._stage() + f'dock_timeout={self.dock_timeout:.1f}s undock_timeout={self.undock_timeout:.1f}s '
-            f'lost_target_timeout={self.lost_target_timeout:.2f}s'
+            f'lost_target_timeout={self.lost_target_timeout:.2f}s tracking {self._goal_tag_family} id '
+            + ('any' if self._goal_tag_id == ANY_TAG_ID else self._goal_tag_id)
+            + f' leave_distance={self._goal_leave_distance:.2f}m'
         )
         self.get_logger().info(
-            self._stage() + f'State {self._state.value}. Send the {ACTION_NAMES[DOCK]} or '
-            f'{ACTION_NAMES[UNDOCK]} action to start.'
+            self._stage() + f'State {self._state.value}. Call {self.attach_srv.srv_name} or '
+            f'{self.detach_srv.srv_name} to start.'
         )
 
     # ---- state machine ----------------------------------------------------------
@@ -402,6 +415,8 @@ class AprilTagControlNode(Node):
                 self._stage() + f'[state] invalid transition {old.value} -> {new.value} ({reason}), ignored.')
             return False
         self._state = new
+        if new in BODY_STATUS:
+            self.body_status_pub.publish(Int32(data=BODY_STATUS[new]))
         self._step = None if new is S.IDLE else step
         if new is S.IDLE:
             self._idle.set()
@@ -449,7 +464,7 @@ class AprilTagControlNode(Node):
         """Move the running procedure to its ENDING step, stop and record its result.
 
         Used for Stage 2 aligned, leave reached, target lost, cancel, timeout,
-        service failure and shutdown; the goal's execute thread then cleans
+        service failure and shutdown; the cmd's worker thread then cleans
         up. The errors at this moment are kept as the result's final errors.
         Returns False if the state is not in only_in or already ending.
         """
@@ -506,7 +521,7 @@ class AprilTagControlNode(Node):
             self.trajectory_planner.reset()
             self.lqr_tracker.reset()
 
-    # ---- service calls (action execute thread / shutdown only) --------------
+    # ---- service calls (cmd worker thread / shutdown only) ------------------
 
     def _call_service(self, client, request, timeout: float, what: str):
         """Call a service and wait for the response; return it, or None on failure."""
@@ -593,117 +608,97 @@ class AprilTagControlNode(Node):
         self._publish_stop_command()
         return self._restore_external_state()
 
-    def _end_goal(self, restore: bool) -> bool:
-        """ENDING step of the goal's state: clean up, then IDLE; return False if anything failed.
+    def _end_goal(self, restore: bool, outcome: str, error_code: int,
+                  message: str) -> Tuple[str, int, str]:
+        """ENDING step of the cmd's state: clean up, then IDLE with the status error.
 
         restore=False (Stage 2 aligned) only stops, so AMCL stays closed and
-        lidar safety disabled.
+        lidar safety disabled. Returns the final (outcome, error_code, message).
         """
         if restore:
             ok = self._end_tracking()
         else:
             self._publish_stop_command()
             ok = True
+        if not ok:
+            message += ' Restore failed, see apriltag_control log.'
+        outcome, error_code = final_outcome(outcome, error_code, ok)
         with self._control_lock:
             self._reset_control_locked(self.stage1_distance)
+            self._goal_deadline = None
+            # written together with IDLE, so IDLE + cmd_id never shows a stale error_code
+            self._error_code = int(error_code)
+            self._error_msg = '' if outcome == 'succeed' else message
             self._transition_locked(S.IDLE, None, 'cleanup done' if ok else 'cleanup done, with failures')
-        return ok
+        return outcome, error_code, message
 
     def _goal_end_timeout(self) -> float:
-        # a goal may still be preparing (AMCL check/close/check) and then ends
+        # a cmd may still be preparing (AMCL check/close/check) and then ends
         # (AMCL check/open/check); each call waits for the service and then
         # for the response
         return 2.0 * 6 * self.external_service_timeout
 
-    # ---- action servers ---------------------------------------------------------
+    # ---- wheelchair cmd / status ---------------------------------------------
 
-    def _goal_callback(self, action: str, goal_request):
-        tag_id = int(goal_request.tag_id)
-        tag_family = str(goal_request.tag_family).strip()
-        distance_m = float(goal_request.distance_m) if action == UNDOCK else None
-        received = f'tag_id={tag_id} tag_family={tag_family!r}' + (
-            f' distance_m={distance_m:.3f}' if distance_m is not None else '')
-        name = ACTION_NAMES[action]
-        self.get_logger().info(self._stage() + f'[action] {name} goal received: {received}')
-        reason = validate_goal(tag_id, tag_family, distance_m)
-        if reason is not None:
-            self.get_logger().warn(self._stage() + f'[action] {name} goal rejected: {reason}')
-            return GoalResponse.REJECT
+    def _goal_service(self, cmd: str, response: Trigger.Response) -> Trigger.Response:
+        accepted, cmd_id, msg = self._start_cmd(cmd)
+        response.success, response.message = accepted, reply_json(cmd_id, msg)
+        return response
+
+    def _cancel_service(self, _request, response: Trigger.Response) -> Trigger.Response:
+        """Stop the running cmd; accepted whenever the state is not IDLE."""
+        with self._control_lock:
+            running_id = self._cmd_id if self._state in ACTIVE_STATES else None
+        if running_id is None:
+            self.get_logger().warn(self._stage() + '[cmd] cancel rejected: nothing running')
+            response.success, response.message = False, reply_json(None, 'nothing running')
+            return response
+        self.get_logger().info(self._stage() + f'[cmd] cancel cmd_id={running_id} accepted')
+        # False: already ending (e.g. just aligned), so the result may not be ACTION_CANCELED
+        ended = self._request_end(False, f'Cancelled cmd_id={running_id}.', Codes.ACTION_CANCELED, canceled=True)
+        response.success = True
+        response.message = reply_json(
+            running_id, 'cancel requested' if ended else 'already ending, result unchanged')
+        return response
+
+    def _start_cmd(self, cmd: str) -> Tuple[bool, Optional[int], str]:
+        """Accept attach / detach in IDLE and run it on a worker thread.
+
+        Returns (accepted, its new cmd_id or None, reason).
+        """
         with self._control_lock:
             state = self._state
-            # decided under the lock, so of two goals only one leaves IDLE
-            if not is_goal_accepted(action, state):
-                self.get_logger().warn(
-                    self._stage() + f'[action] {name} goal rejected: state={state.value} '
-                    f'(only accepted in {", ".join(sorted(s.value for s in GOAL_RULES[action]))})')
-                return GoalResponse.REJECT
-            # a new goal selects its target from scratch
-            self._goal_action = action
-            self._goal_tag_family = tag_family
-            self._goal_tag_id = tag_id_filter(tag_id)
-            if distance_m is not None:
-                self._goal_leave_distance = distance_m
-            timeout = self.dock_timeout if action == DOCK else self.undock_timeout
+            # decided under the lock, so of two cmds only one leaves IDLE
+            if not is_goal_accepted(cmd, state):
+                reason = (f'rejected: state={state.value} '
+                          f'(only accepted in {", ".join(sorted(s.value for s in GOAL_RULES[cmd]))})')
+                self.get_logger().warn(self._stage() + f'[cmd] {cmd} {reason}, status unchanged')
+                return False, None, reason
+            cmd_id = self._next_cmd_id
+            self._next_cmd_id += 1
+            self._goal_action = cmd
+            timeout = self.dock_timeout if cmd == ATTACH else self.undock_timeout
             self._goal_deadline = time.monotonic() + timeout
-            self._feedback_seq = 0
+            self._cmd_id = cmd_id
+            self._error_code, self._error_msg = Codes.OK, ''
             self._last_frame_stamp = None
             self._target_id = None
             self._mismatch_warned = None
             self._tracking_done.clear()
             self._tracking_result = {}
             self._tracking_start_time = time.monotonic()
-            if action == DOCK:
-                self._transition_locked(S.STAGE1, Step.PREPARING, f'{name} goal accepted')
+            if cmd == ATTACH:
+                self._transition_locked(S.STAGE1, Step.PREPARING, f'attach cmd_id={cmd_id} accepted')
             else:
                 self._transition_locked(
                     S.LEAVING, Step.PREPARING,
-                    f'{name} goal accepted, back to {self._goal_leave_distance:.2f}m')
-        self.get_logger().info(
-            self._stage() + f'[action] {name} goal accepted, tracking {tag_family} id '
-            + ('any' if self._goal_tag_id == ANY_TAG_ID else self._goal_tag_id)
-            + f', timeout {timeout:.1f}s')
-        return GoalResponse.ACCEPT
-
-    def _cancel_callback(self, goal_handle):
-        _ = goal_handle
-        self.get_logger().info(self._stage() + '[action] cancel requested')
-        return CancelResponse.ACCEPT
-
-    def _finish_goal_handle(self, goal_handle, action: str, outcome: str, error_code: int,
-                            message: str, final: dict):
-        result = ACTION_TYPES[action].Result()
-        result.success = outcome == 'succeed'
-        result.error_code = int(error_code)
-        result.message = message
-        y_field, yaw_field = Y_YAW_FIELDS[action]
-        final_y = float(final.get('y_error', math.nan))
-        final_yaw = float(final.get('yaw_error', math.nan))
-        result.final_x_error = float(final.get('x_error', math.nan))
-        setattr(result, 'final_' + y_field, final_y)
-        setattr(result, 'final_' + yaw_field, final_yaw)
-        # no feedback after the result
-        with self._control_lock:
-            self._active_goal_handle = None
-            self._goal_deadline = None
-        if outcome == 'succeed':
-            goal_handle.succeed()
-        elif outcome == 'canceled':
-            goal_handle.canceled()
-        else:
-            goal_handle.abort()
-        status = {'succeed': 'SUCCEEDED', 'canceled': 'CANCELED'}.get(outcome, 'ABORTED')
-        text = (f'[action] {ACTION_NAMES[action]} result: {status} success={result.success} '
-                f'error_code={result.error_code} message={result.message!r} '
-                f'final=({result.final_x_error:+.3f}, {final_y:+.3f}, {final_yaw:+.3f})')
-        # rclpy rejects one call site logging at different severities
-        if result.success:
-            self.get_logger().info(self._stage() + text)
-        else:
-            self.get_logger().warn(self._stage() + text)
-        return result
+                    f'detach cmd_id={cmd_id} accepted, back to {self._goal_leave_distance:.2f}m')
+        self.get_logger().info(self._stage() + f'[cmd] {cmd} cmd_id={cmd_id} accepted, timeout {timeout:.1f}s')
+        threading.Thread(target=self._run_goal, args=(cmd, cmd_id), daemon=True).start()
+        return True, cmd_id, f'{cmd} accepted'
 
     def _goal_outcome(self):
-        """(outcome, error_code, message, final errors) of the ended goal."""
+        """(outcome, error_code, message, final errors) of the ended cmd."""
         with self._control_lock:
             res = self._tracking_result.copy()
         if res.get('canceled', False):
@@ -712,44 +707,36 @@ class AprilTagControlNode(Node):
             outcome = 'succeed' if res.get('success', False) else 'abort'
         return outcome, res.get('error_code', Codes.OTHER), res.get('message', ''), res.get('final', {})
 
-    def _run_goal(self, goal_handle, action: str, prepare, cancel_message: str, ended_message: str,
-                  restore_on_success: bool):
-        """Run one goal: prepare, track, then clean up to IDLE; return its result."""
-        with self._control_lock:
-            self._active_goal_handle = goal_handle
+    def _run_goal(self, cmd: str, cmd_id: int) -> None:
+        """Worker thread of one cmd: prepare, track, then clean up to IDLE."""
+        if cmd == ATTACH:
+            prepare, ended_message, restore_on_success = self._prepare_stage1, 'Attach ended unexpectedly.', False
+        else:
+            prepare, ended_message, restore_on_success = self._prepare_leaving, 'Detach ended unexpectedly.', True
         try:
-            if prepare(goal_handle):
-                self._wait_motion_done(goal_handle, cancel_message)
+            if prepare():
+                self._wait_motion_done()
         finally:
             # no-op if already ending; covers an exception above
             self._request_end(False, ended_message, Codes.OTHER)
             outcome, error_code, message, final = self._goal_outcome()
             restore = restore_on_success or outcome != 'succeed'
-            restore_ok = self._end_goal(restore=restore)
-            if not restore_ok:
-                message += ' Restore failed, see apriltag_control log.'
-            outcome, error_code = final_outcome(outcome, error_code, restore_ok)
-        # the result goes out in IDLE, so the next goal can be sent right away
-        return self._finish_goal_handle(goal_handle, action, outcome, error_code, message, final)
+            outcome, error_code, message = self._end_goal(restore, outcome, error_code, message)
+        status = {'succeed': 'SUCCEEDED', 'canceled': 'CANCELED'}.get(outcome, 'ABORTED')
+        text = (f'[cmd] {cmd} cmd_id={cmd_id} result: {status} error_code={error_code} '
+                f'message={message!r} final=({final.get("x_error", math.nan):+.3f}, '
+                f'{final.get("y_error", math.nan):+.3f}, {final.get("yaw_error", math.nan):+.3f})')
+        # rclpy rejects one call site logging at different severities
+        if outcome == 'succeed':
+            self.get_logger().info(self._stage() + text)
+        else:
+            self.get_logger().warn(self._stage() + text)
 
-    def _execute_dock(self, goal_handle):
-        return self._run_goal(goal_handle, DOCK, self._prepare_stage1,
-                              'Dock cancelled.', 'Dock ended unexpectedly.',
-                              restore_on_success=False)
-
-    def _execute_undock(self, goal_handle):
-        return self._run_goal(goal_handle, UNDOCK, self._prepare_leaving,
-                              'Undock cancelled.', 'Undock ended unexpectedly.',
-                              restore_on_success=True)
-
-    def _stop_requested(self, goal_handle, cancel_message: str) -> bool:
-        """True if the goal was cancelled (ended here) or already ended (stop / shutdown)."""
-        if goal_handle.is_cancel_requested:
-            self._request_end(False, cancel_message, Codes.ACTION_CANCELED, canceled=True)
-            return True
+    def _stop_requested(self) -> bool:
+        """True if the running cmd already ended (cancel / timeout / shutdown)."""
         return self._tracking_done.is_set()
 
-    def _prepare_stage1(self, goal_handle) -> bool:
+    def _prepare_stage1(self) -> bool:
         """STAGE1 PREPARING: enable lidar safety, close AMCL; False if ended."""
         if self.manage_amcl_and_lidar_safety:
             # Stage 1 always runs with lidar safety on, also right after a Stage 2
@@ -757,7 +744,7 @@ class AprilTagControlNode(Node):
             if not self._set_amcl_enabled(False):
                 self._request_end(False, 'Failed to close AMCL.', Codes.AMCL_SERVICE_FAIL)
                 return False
-        if self._stop_requested(goal_handle, 'Dock cancelled.'):
+        if self._stop_requested():
             return False
         with self._control_lock:
             if not (self._state is S.STAGE1 and self._step is Step.PREPARING):
@@ -784,7 +771,7 @@ class AprilTagControlNode(Node):
                 'lidar safety disabled' if self.manage_amcl_and_lidar_safety else 'lidar safety unmanaged')
         self.get_logger().info(self._stage() + f'Advancing to Stage 2 ({self.stage2_distance:.2f}m).')
 
-    def _prepare_leaving(self, goal_handle) -> bool:
+    def _prepare_leaving(self) -> bool:
         """LEAVING PREPARING: disable lidar safety, close AMCL; False if ended."""
         if self.manage_amcl_and_lidar_safety:
             # leaving starts next to the station, also without a previous
@@ -793,7 +780,7 @@ class AprilTagControlNode(Node):
             if not self._set_amcl_enabled(False):
                 self._request_end(False, 'Failed to close AMCL.', Codes.AMCL_SERVICE_FAIL)
                 return False
-        if self._stop_requested(goal_handle, 'Undock cancelled.'):
+        if self._stop_requested():
             return False
         with self._control_lock:
             if not (self._state is S.LEAVING and self._step is Step.PREPARING):
@@ -807,64 +794,44 @@ class AprilTagControlNode(Node):
             self._stage() + f'Leaving started: backing up to {self._goal_leave_distance:.2f}m.')
         return True
 
-    def _wait_motion_done(self, goal_handle, cancel_message: str) -> None:
+    def _wait_motion_done(self) -> None:
         """Wait until the running tracking / leaving has a result (ENDING).
 
-        Feedback and the timeout are handled by _feedback_tick.
+        Cancel and the timeout end it through _request_end.
         """
         while not self._tracking_done.wait(timeout=0.1):
-            if goal_handle.is_cancel_requested:
-                self._request_end(False, cancel_message, Codes.ACTION_CANCELED, canceled=True)
-                break  # if it ended meanwhile, that result is reported
-
             with self._control_lock:
                 stage2_preparing = self._state is S.STAGE2 and self._step is Step.PREPARING
             if stage2_preparing:
                 self._prepare_stage2()
 
-    def _feedback_tick(self) -> None:
-        """10 Hz: end the running goal on timeout, publish its feedback (heartbeat)."""
+    def _status_tick(self) -> None:
+        """5 Hz: end the running cmd on timeout, publish status and attached (heartbeat)."""
         with self._control_lock:
             action = self._goal_action
-            handle = self._active_goal_handle
             deadline = self._goal_deadline
             state, step = self._state, self._step
             timed_out = (deadline is not None and state in ACTIVE_STATES and step is not Step.ENDING
                          and time.monotonic() >= deadline)
         if timed_out:
-            timeout = self.dock_timeout if action == DOCK else self.undock_timeout
-            self._request_end(False, f'{"Dock" if action == DOCK else "Undock"} timed out after '
+            timeout = self.dock_timeout if action == ATTACH else self.undock_timeout
+            self._request_end(False, f'{"Attach" if action == ATTACH else "Detach"} timed out after '
                               f'{timeout:.1f}s.', Codes.TIMEOUT)
-        if handle is None:
-            return
 
-        feedback = ACTION_TYPES[action].Feedback()
         now = self.get_clock().now()
-        feedback.stamp = now.to_msg()
         t = self._latest_best_target
-        feedback.x_error = float(t.get('x_error', math.nan))
-        y_field, yaw_field = Y_YAW_FIELDS[action]
-        fb_y = float(t.get('y_error', math.nan))
-        fb_yaw = float(t.get('yaw_error', math.nan))
-        setattr(feedback, y_field, fb_y)
-        setattr(feedback, yaw_field, fb_yaw)
         with self._control_lock:
-            # the result may have gone out meanwhile: no feedback after it
-            if self._active_goal_handle is not handle:
-                return
-            feedback.stage = feedback_stage(action, self._state.value,
-                                            self._step.value if self._step else None)
-            feedback.seq = self._feedback_seq
             stamp = self._last_frame_stamp
-            feedback.last_frame_age = (now.nanoseconds * 1e-9 - stamp) if stamp is not None else math.nan
-            handle.publish_feedback(feedback)
-            self._feedback_seq += 1
-        self.get_logger().info(
-            self._stage() + f'[action] feedback: seq={feedback.seq} stage={feedback.stage} '
-            f'x_err={feedback.x_error:.3f} {y_field}={fb_y:.3f} {yaw_field}={fb_yaw:.3f} '
-            f'last_frame_age={feedback.last_frame_age:.3f} '
-            f'amcl={self._amcl_state} lidar_safety={self._lidar_safety_state}',
-            throttle_duration_sec=LOG_THROTTLE_SEC)
+            active = self._state in ACTIVE_STATES
+            text = status_json(
+                self._state.value, self._cmd_id, self._error_code, self._error_msg, time.time(),
+                t.get('x_error', math.nan), t.get('y_error', math.nan), t.get('yaw_error', math.nan),
+                (now.nanoseconds * 1e-9 - stamp) if stamp is not None else math.nan)
+            self.status_pub.publish(String(data=text))
+        self.attached_pub.publish(Bool(data=False))
+        if active:
+            self.get_logger().info(
+                self._stage() + f'[status] {text} amcl={self._amcl_state} lidar_safety={self._lidar_safety_state}')
 
     def shutdown(self) -> None:
         """End a running procedure and restore external state before the node is destroyed."""
@@ -888,7 +855,7 @@ class AprilTagControlNode(Node):
             and abs(float(target.get('yaw_error', 0.0))) <= self.stop_yaw_error_tolerance
         )
 
-    # watchdog: tracing_callback ignores frames without the goal's tag (and
+    # watchdog: tracing_callback ignores frames without the tracked tag (and
     # detection may stop publishing), so target loss is checked on a timer
     def _check_target_lost(self):
         with self._control_lock:
@@ -908,7 +875,7 @@ class AprilTagControlNode(Node):
                 False, f'AprilTag lost for {self.lost_target_timeout:.2f}s. Tracking stopped.',
                 Codes.TAG_LOST)
 
-    # callback to check the tracked tag against the goal, convert its pose
+    # callback to check the tracked tag against the tracking parameters, convert its pose
     # into control errors and publish cmd_vel
     def tracing_callback(self, msg: TagTracing):
         with self._control_lock:
@@ -916,8 +883,8 @@ class AprilTagControlNode(Node):
                 return
             tracking_state = self._state
 
-        # no tag, or not the goal's tag: not seen (the lost-target timer
-        # ends the goal after lost_target_timeout)
+        # no tag, or not the tracking parameters' tag: not seen (the lost-target timer
+        # ends the cmd after lost_target_timeout)
         if not msg.valid:
             return
         with self._control_lock:
@@ -927,7 +894,7 @@ class AprilTagControlNode(Node):
             if (tag.family, tag.id) != self._mismatch_warned:
                 self._mismatch_warned = (tag.family, tag.id)
                 self.get_logger().warn(
-                    self._stage() + f'[target] tag_tracing has {tag.family} id {tag.id}, goal wants '
+                    self._stage() + f'[target] tag_tracing has {tag.family} id {tag.id}, tracking '
                     f'{family} id {"any" if tag_id == ANY_TAG_ID else tag_id}; treated as not seen')
             return
         if tag.id != self._target_id:
@@ -1058,12 +1025,12 @@ class AprilTagControlNode(Node):
             # back to IDLE without restoring: AMCL stays closed, lidar safety disabled
             self._request_end(
                 True, f'Stage 2 aligned at {self.stage2_distance:.2f}m. {converged} '
-                + (f'AMCL off, lidar safety disabled; send {ACTION_NAMES[UNDOCK]} to restore.'
+                + ('AMCL off, lidar safety disabled; send detach to restore.'
                    if self.manage_amcl_and_lidar_safety else 'AMCL / lidar safety unmanaged.'),
                 Codes.OK, only_in=frozenset({S.STAGE2}))
 
     def _leave_step(self, x_error: float) -> None:
-        """LEAVING: back straight at max_vx until the tag is the goal's distance_m away."""
+        """LEAVING: back straight at max_vx until the tag is leave_distance away."""
         try:
             reached, vx, vy, vw = leave_step(x_error, self.max_vx)
         except ValueError as exc:

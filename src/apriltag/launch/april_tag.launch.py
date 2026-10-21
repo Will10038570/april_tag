@@ -11,7 +11,7 @@ from launch_ros.substitutions import FindPackageShare
 LOG_FORMAT = '[{severity}] [{name}]: {message}'
 OUTPUT_FORMAT = '{line}'
 # apriltag_control prefixes every message with '[stage <STATE>] : ', giving
-# '[INFO] [up.apriltag_control][stage LEAVING] : ...'
+# '[INFO] [wheelchair.apriltag_control][stage LEAVING] : ...'
 CONTROL_LOG_ENV = {'RCUTILS_CONSOLE_OUTPUT_FORMAT': '[{severity}] [{name}]{message}'}
 
 
@@ -25,20 +25,23 @@ def generate_launch_description():
                     '(pupil_apriltags names, e.g. "tag36h11 tag25h9"); each adds CPU load')
     tracking_tag_family_arg = DeclareLaunchArgument(
         'tracking_tag_family', default_value='tag36h11',
-        description='family of the tag apriltag_detection publishes on tag_tracing; '
-                    'must be one of detect_tag_families')
+        description='family of the tag apriltag_detection publishes on tag_tracing and '
+                    'apriltag_control tracks; must be one of detect_tag_families')
     tracking_tag_id_arg = DeclareLaunchArgument(
         'tracking_tag_id', default_value='0',
-        description='id of the tag published on tag_tracing (closest one), -1 = any id')
+        description='id of the tag published on tag_tracing (closest one) and tracked, -1 = any id')
+    leave_distance_arg = DeclareLaunchArgument(
+        'leave_distance', default_value='1.0',
+        description='detach backs up until the tag is this far ahead of the camera (m), > 0')
     dock_timeout_arg = DeclareLaunchArgument(
-        'dock_timeout', default_value='60.0',
-        description='dock_wheelchair timeout (s), from goal accepted until it ends')
+        'dock_timeout', default_value='300.0',
+        description='attach timeout (s), from cmd accepted until it ends')
     undock_timeout_arg = DeclareLaunchArgument(
-        'undock_timeout', default_value='60.0',
-        description='undock_wheelchair timeout (s), from goal accepted until it ends')
+        'undock_timeout', default_value='300.0',
+        description='detach timeout (s), from cmd accepted until it ends')
     lost_target_timeout_arg = DeclareLaunchArgument(
         'lost_target_timeout', default_value='1.0',
-        description='tracked tag not seen for this long (s) while running ends the goal (TAG_LOST)')
+        description='tracked tag not seen for this long (s) while running ends the cmd (TAG_LOST)')
     tag_size_arg = DeclareLaunchArgument(
         'tag_size', default_value='0.0635',
         description='real black-border side of the tags (m)')
@@ -58,7 +61,7 @@ def generate_launch_description():
         package='apriltag',
         executable='apriltag_detection',
         name='apriltag_detection',
-        namespace='up',
+        namespace='wheelchair',
         output='screen',
         output_format=OUTPUT_FORMAT,
         parameters=[{
@@ -74,13 +77,16 @@ def generate_launch_description():
         package='apriltag',
         executable='apriltag_control',
         name='apriltag_control',
-        namespace='up',
+        namespace='wheelchair',
         output='screen',
         output_format=OUTPUT_FORMAT,
         additional_env=CONTROL_LOG_ENV,
         parameters=[{
             'manage_amcl_and_lidar_safety': ParameterValue(
                 LaunchConfiguration('manage_amcl_and_lidar_safety'), value_type=bool),
+            'tracking_tag_family': ParameterValue(LaunchConfiguration('tracking_tag_family'), value_type=str),
+            'tracking_tag_id': ParameterValue(LaunchConfiguration('tracking_tag_id'), value_type=int),
+            'leave_distance': ParameterValue(LaunchConfiguration('leave_distance'), value_type=float),
             'dock_timeout': ParameterValue(LaunchConfiguration('dock_timeout'), value_type=float),
             'undock_timeout': ParameterValue(LaunchConfiguration('undock_timeout'), value_type=float),
             'lost_target_timeout': ParameterValue(LaunchConfiguration('lost_target_timeout'), value_type=float),
@@ -89,7 +95,7 @@ def generate_launch_description():
             # two-stage target distances from camera to tag (m)
             'stage1_distance': 0.50,
             'stage2_distance': 0.28,
-            # G7+ AMCL services (absolute names, not affected by namespace 'up')
+            # G7+ AMCL services (absolute names, not affected by namespace 'wheelchair')
             'amcl_check_service': '/check_mcl_if_trigger',
             'amcl_close_service': '/close_amcl',
             'amcl_open_service': '/open_amcl',
@@ -107,12 +113,13 @@ def generate_launch_description():
         detect_tag_families_arg,
         tracking_tag_family_arg,
         tracking_tag_id_arg,
+        leave_distance_arg,
         dock_timeout_arg,
         undock_timeout_arg,
         lost_target_timeout_arg,
         tag_size_arg,
         tag_sizes_arg,
-        # '[INFO] [up.apriltag_detection]: ...' (apriltag_control: see CONTROL_LOG_ENV)
+        # '[INFO] [wheelchair.apriltag_detection]: ...' (apriltag_control: see CONTROL_LOG_ENV)
         SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT', LOG_FORMAT),
         camera,
         apriltag_detection,

@@ -32,8 +32,6 @@ setup(
             'apriltag_control = apriltag.control_node:main',
             'detection_viewer = tools.detection_viewer:main',
             'virtual_tracking_sim = tools.virtual_tracking_sim:main',
-            'wheelchair_docking = tools.WheelChairDocking:main',
-            'wheelchair_undocking = tools.WheelChairUndocking:main',
         ],
     },
 )

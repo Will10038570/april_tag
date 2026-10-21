@@ -13,7 +13,6 @@
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
-  <depend>action_msgs</depend>
   <depend>rcl_interfaces</depend>
   <depend>apriltag_interfaces</depend>
 

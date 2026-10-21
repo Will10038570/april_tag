@@ -18,6 +18,8 @@ def generate_launch_description():
         DeclareLaunchArgument('rgb_profile', default_value='1280,720,30'),
         # cv2.imshow viewer; needs an X display, so off by default (headless)
         DeclareLaunchArgument('enable_viewer', default_value='false'),
+        # case-insensitive regex search on the device name: 'd435' matches D435 / D435i / D435if / D435f; other models are never opened.
+        DeclareLaunchArgument('device_type', default_value='d435'),
     ]
 
     enable_rgb = LaunchConfiguration('enable_rgb')
@@ -39,6 +41,7 @@ def generate_launch_description():
             'enable_infra1': enable_ir1,
             'enable_infra2': enable_ir2,
             'rgb_camera.color_profile': rgb_profile,
+            'device_type': LaunchConfiguration('device_type'),
         }.items(),
     )
 
@@ -56,10 +59,10 @@ def generate_launch_description():
         }],
     )
 
-    up_group = GroupAction([
-        PushRosNamespace('up'),
+    wheelchair_group = GroupAction([
+        PushRosNamespace('wheelchair'),
         realsense_driver,
         viewer_node,
     ])
 
-    return LaunchDescription([*stream_args, up_group])
+    return LaunchDescription([*stream_args, wheelchair_group])

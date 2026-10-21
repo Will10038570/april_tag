@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Debug tool: print what apriltag_detection publishes.
 
-Parameter `topic` picks the topic (relative, /up/... with namespace up):
+Parameter `topic` picks the topic (relative, /wheelchair/... with namespace wheelchair):
 - `tag_tracing` (default): the TagTracing with the tracked tag; the header,
   valid, image size, then the tag if valid.
 - `apriltag_poses`: the TagPoseArray with every detected tag; the header,
@@ -11,8 +11,8 @@ A tag is printed as family, id, position in m and orientation quaternion
 printed (the others are skipped).
 
 Usage (inside the container, after sourcing the workspace):
-    ros2 run apriltag detection_viewer --ros-args -r __ns:=/up
-    ros2 run apriltag detection_viewer --ros-args -r __ns:=/up -p topic:=apriltag_poses
+    ros2 run apriltag detection_viewer --ros-args -r __ns:=/wheelchair
+    ros2 run apriltag detection_viewer --ros-args -r __ns:=/wheelchair -p topic:=apriltag_poses
 """
 
 import time

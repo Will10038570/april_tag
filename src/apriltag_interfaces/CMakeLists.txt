@@ -8,8 +8,6 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "action/DockWheelchair.action"
-  "action/UndockWheelchair.action"
   "msg/TagPose.msg"
   "msg/TagPoseArray.msg"
   "msg/TagTracing.msg"

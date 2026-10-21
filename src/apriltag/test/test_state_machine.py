@@ -5,6 +5,7 @@ import pytest
 from apriltag.control_node import (
     ACTIVE_STATES,
     ALLOWED_TRANSITIONS,
+    BODY_STATUS,
     GOAL_RULES,
     Step,
     TrackingState as S,
@@ -19,10 +20,10 @@ EXPECTED = {
     S.LEAVING: {S.IDLE},
 }
 
-# action -> states in which its goal is accepted (stopping is an action cancel)
+# cmd -> states in which it is accepted (stopping is the cancel service)
 EXPECTED_GOALS = {
-    'dock': {S.IDLE},
-    'undock': {S.IDLE},
+    'attach': {S.IDLE},
+    'detach': {S.IDLE},
 }
 
 
@@ -43,7 +44,7 @@ def test_is_transition_allowed(src, dst):
 @pytest.mark.parametrize('src, dst', [
     (S.IDLE, S.STAGE2),       # Stage 2 only follows Stage 1
     (S.IDLE, S.IDLE),
-    (S.STAGE1, S.LEAVING),    # undock only starts from IDLE
+    (S.STAGE1, S.LEAVING),    # detach only starts from IDLE
     (S.STAGE2, S.STAGE1),
     (S.STAGE2, S.LEAVING),    # Stage 2 aligned goes back to IDLE first
     (S.LEAVING, S.STAGE1),
@@ -67,5 +68,9 @@ def test_is_goal_accepted(action, state):
     assert is_goal_accepted(action, state) == (state in EXPECTED_GOALS[action])
 
 
-def test_unknown_action_is_rejected():
+def test_unknown_cmd_is_rejected():
     assert not is_goal_accepted('start_tracking', S.IDLE)
+
+
+def test_body_status_values():
+    assert BODY_STATUS == {S.IDLE: 0, S.STAGE1: 1, S.LEAVING: 2}

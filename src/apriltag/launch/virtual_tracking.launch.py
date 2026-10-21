@@ -1,10 +1,9 @@
 """End-to-end virtual test: real apriltag_detection + apriltag_control, with the
 camera, the AMR and the G7+ AMCL services / lidar safety topic replaced by
-tools/virtual_tracking_sim. A run is dock_wheelchair (Stage 1 + 2, back to IDLE
-with AMCL closed and lidar safety disabled) followed by undock_wheelchair;
-headless + auto_start runs both and checks AMCL / lidar safety after the dock
-(held) and at the end (restored). tag_family / tag_id / distance_m only go
-into the sim's goals.
+tools/virtual_tracking_sim. A run is an attach cmd (Stage 1 + 2, back to IDLE
+with AMCL closed and lidar safety disabled) followed by a detach cmd, both
+called by the sim on the /wheelchair/attach / detach services; headless + auto_start runs both and checks AMCL
+/ lidar safety after the attach (held) and at the end (restored).
 
 Runs in ROS domain 65, the same as the robot: apriltag_control publishes the
 absolute /cmd_vel, /pre_cmd_vel and /g7_plc/disable_lidar_safety and calls the AMCL
@@ -23,7 +22,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 LOG_FORMAT = '[{severity}] [{name}]: {message}'
 OUTPUT_FORMAT = '{line}'
 # apriltag_control prefixes every message with '[stage <STATE>] : ', giving
-# '[INFO] [up.apriltag_control][stage LEAVING] : ...'
+# '[INFO] [wheelchair.apriltag_control][stage LEAVING] : ...'
 CONTROL_LOG_ENV = {'RCUTILS_CONSOLE_OUTPUT_FORMAT': '[{severity}] [{name}]{message}'}
 
 
@@ -35,23 +34,20 @@ def generate_launch_description():
         DeclareLaunchArgument('init_y', default_value='0.15'),
         DeclareLaunchArgument('init_yaw_deg', default_value='10.0'),
         DeclareLaunchArgument('headless', default_value='false',
-                              description='no UI; run one goal and save CSV + PNG'),
+                              description='no UI; run one attach + detach and save CSV + PNG'),
         DeclareLaunchArgument('auto_start', default_value='false',
-                              description='send dock_wheelchair as soon as the action server is up'),
+                              description='send attach as soon as apriltag_control publishes its status'),
         DeclareLaunchArgument('log_dir', default_value='virtual_tracking_logs'),
         DeclareLaunchArgument('manage_amcl_and_lidar_safety', default_value='true',
                               description='false: apriltag_control skips AMCL / lidar safety'),
         # detection families; the sim draws tag36h11 id 0
         DeclareLaunchArgument('detect_tag_families', default_value='tag36h11'),
-        # tag apriltag_detection publishes on tag_tracing (tracking_tag_id:=5: the
-        # drawn id 0 is never tracked, tag_tracing is always valid=false)
+        # tag apriltag_detection publishes on tag_tracing and apriltag_control
+        # tracks (tracking_tag_id:=5: the drawn id 0 is never tracked,
+        # tag_tracing is always valid=false, the cmd ends with TAG_LOST)
         DeclareLaunchArgument('tracking_tag_family', default_value='tag36h11'),
         DeclareLaunchArgument('tracking_tag_id', default_value='0', description='-1 = any id'),
-        # goals the sim sends (tag_id:=5 tests the tag filter: apriltag_control
-        # does not match the tracked id 0 and ends with TAG_LOST)
-        DeclareLaunchArgument('tag_family', default_value='tag36h11', description='goal tag_family'),
-        DeclareLaunchArgument('tag_id', default_value='0', description='goal tag_id, -1 = any id'),
-        DeclareLaunchArgument('distance_m', default_value='1.0', description='undock goal distance_m'),
+        DeclareLaunchArgument('leave_distance', default_value='1.0', description='detach back-up distance (m)'),
         # the sim draws its tag with the same size
         DeclareLaunchArgument('tag_size', default_value='0.0635'),
         DeclareLaunchArgument('tag_sizes', default_value=''),
@@ -59,8 +55,8 @@ def generate_launch_description():
         # the sim reads them back from apriltag_control
         DeclareLaunchArgument('stage1_distance', default_value='0.50'),
         DeclareLaunchArgument('stage2_distance', default_value='0.28'),
-        DeclareLaunchArgument('dock_timeout', default_value='60.0'),
-        DeclareLaunchArgument('undock_timeout', default_value='60.0'),
+        DeclareLaunchArgument('dock_timeout', default_value='300.0'),
+        DeclareLaunchArgument('undock_timeout', default_value='300.0'),
         DeclareLaunchArgument('lost_target_timeout', default_value='1.0'),
     ]
 
@@ -68,7 +64,7 @@ def generate_launch_description():
         package='apriltag',
         executable='apriltag_detection',
         name='apriltag_detection',
-        namespace='up',
+        namespace='wheelchair',
         output='screen',
         output_format=OUTPUT_FORMAT,
         parameters=[{
@@ -84,13 +80,16 @@ def generate_launch_description():
         package='apriltag',
         executable='apriltag_control',
         name='apriltag_control',
-        namespace='up',
+        namespace='wheelchair',
         output='screen',
         output_format=OUTPUT_FORMAT,
         additional_env=CONTROL_LOG_ENV,
         parameters=[{
             'manage_amcl_and_lidar_safety': ParameterValue(
                 LaunchConfiguration('manage_amcl_and_lidar_safety'), value_type=bool),
+            'tracking_tag_family': ParameterValue(LaunchConfiguration('tracking_tag_family'), value_type=str),
+            'tracking_tag_id': ParameterValue(LaunchConfiguration('tracking_tag_id'), value_type=int),
+            'leave_distance': ParameterValue(LaunchConfiguration('leave_distance'), value_type=float),
             'stage1_distance': ParameterValue(LaunchConfiguration('stage1_distance'), value_type=float),
             'stage2_distance': ParameterValue(LaunchConfiguration('stage2_distance'), value_type=float),
             'dock_timeout': ParameterValue(LaunchConfiguration('dock_timeout'), value_type=float),
@@ -105,7 +104,7 @@ def generate_launch_description():
         package='apriltag',
         executable='virtual_tracking_sim',
         name='virtual_tracking_sim',
-        namespace='up',
+        namespace='wheelchair',
         output='screen',
         output_format=OUTPUT_FORMAT,
         parameters=[{
@@ -116,9 +115,6 @@ def generate_launch_description():
             'auto_start': LaunchConfiguration('auto_start'),
             'log_dir': LaunchConfiguration('log_dir'),
             'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
-            'goal_tag_family': ParameterValue(LaunchConfiguration('tag_family'), value_type=str),
-            'goal_tag_id': ParameterValue(LaunchConfiguration('tag_id'), value_type=int),
-            'goal_distance_m': ParameterValue(LaunchConfiguration('distance_m'), value_type=float),
         }],
         # quitting the dashboard ends the whole test, so no detection/control
         # is left running
@@ -128,7 +124,7 @@ def generate_launch_description():
     return LaunchDescription([
         *args,
         SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id')),
-        # '[INFO] [up.apriltag_detection]: ...' (apriltag_control: see CONTROL_LOG_ENV)
+        # '[INFO] [wheelchair.apriltag_detection]: ...' (apriltag_control: see CONTROL_LOG_ENV)
         SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT', LOG_FORMAT),
         apriltag_detection,
         apriltag_control,
