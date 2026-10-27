@@ -9,9 +9,10 @@ apriltag_detection and apriltag_control nodes run unmodified:
   /cmd_vel (Stage 1) and /pre_cmd_vel (Stage 2 and leaving);
 - a synthetic camera image of the tag is rendered from the AMR/tag relative
   pose and published with camera_info, so apriltag_detection really detects it;
-- Start calls the /wheelchair/attach service (std_srvs/Trigger), whose response
+- Start calls the /wheelchair/attach service (std_srvs/SetBool, data=true), whose response
   gives the cmd_id (or rejects it: the run ends as REJECTED). When /wheelchair/status shows
-  IDLE with its cmd_id and error_code 0, apriltag_control is back in IDLE with
+  IDLE with its cmd_id, error_code 0 and error_msg 'Attach succeeded' (a cancel is
+  also error_code 0, with error_msg 'Cancelled ...'), apriltag_control is back in IDLE with
   AMCL closed and lidar safety disabled (checked here as "held"); the sim waits
   in ALIGNED. Leave then calls /wheelchair/detach (headless: automatically) and
   the run ends with its status, where AMCL and lidar safety must be restored.
@@ -31,7 +32,7 @@ Controls:
     top view   drag AMR body = move, drag the round handle in front = rotate,
                mouse wheel or a / d = rotate 2 deg (only while not running)
     keys       s = start, l = leave (in ALIGNED, or a leave-only run when idle),
-               x = stop (call /wheelchair/cancel), r = reset to initial pose,
+               x = stop (data=false on the running cmd's service), r = reset to initial pose,
                + / - = zoom top view, q or Esc = quit
 """
 
@@ -58,7 +59,7 @@ from rclpy.qos import DurabilityPolicy, QoSHistoryPolicy, QoSProfile, Reliabilit
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool, String
-from std_srvs.srv import Empty, Trigger
+from std_srvs.srv import Empty, SetBool, Trigger
 
 from apriltag.domain.math_utils import optical_to_control_error
 
@@ -69,7 +70,7 @@ STAGE_PREFIX_RE = re.compile(r'^\[stage [A-Z_0-9 ]+\] : ')
 # LEAVING: detach cmd
 ACTIVE_PHASES = ('STARTING', 'RUNNING', 'ALIGNED', 'LEAVING')
 # status state as a number, so the feedback rows stay numeric
-STATE_NUMBERS = {'IDLE': 0, 'STAGE1': 1, 'STAGE2': 2, 'LEAVING': 3}
+STATE_NUMBERS = {'IDLE': 0, 'Attaching(STAGE1)': 1, 'Attaching(STAGE2)': 2, 'Detaching': 3}
 # same QoS as apriltag_control (PDF interface: status transient_local)
 STATUS_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -297,8 +298,11 @@ class VirtualTrackingSim(Node):
         self.run_end: Optional[float] = None
         self.result_message = ''
         self.control_log: List[str] = []
-        # cmd_id from the last accepted cmd service response (0: none yet)
+        # cmd_id of the running cmd, taken from the status after its call was accepted (0: none yet)
         self.sent_cmd_id = 0
+        # newest status cmd_id, and the one seen before the last cmd call
+        self.status_cmd_id = 0
+        self.base_cmd_id = 0
         self.sent_time = 0.0
         # a cmd service call waits for its response
         self.cmd_pending = False
@@ -318,7 +322,7 @@ class VirtualTrackingSim(Node):
         self.create_subscription(Twist, '/pre_cmd_vel', self._on_cmd_vel, 10)
         self.create_subscription(Image, 'apriltag/marked_image', self._on_marked_image, image_qos)
         self.create_subscription(Log, '/rosout', self._on_rosout, 100)
-        self.cmd_clients = {c: self.create_client(Trigger, c) for c in ('attach', 'detach', 'cancel')}
+        self.cmd_clients = {c: self.create_client(SetBool, c) for c in ('attach', 'detach')}
         self.create_subscription(String, 'status', self._on_status, STATUS_QOS)
         self.create_timer(0.2, self._check_rejected)
         self.control_param_client = self.create_client(GetParameters, 'apriltag_control/get_parameters')
@@ -465,33 +469,28 @@ class VirtualTrackingSim(Node):
             self.start()
 
     def _prepare_cmd_locked(self):
-        """Forget the last cmd_id before a new cmd call; the caller must hold self.lock."""
+        """Forget the last cmd_id and note the status cmd_id before a new cmd call; the caller must hold self.lock."""
         self.sent_cmd_id = 0
+        self.base_cmd_id = self.status_cmd_id
         self.sent_time = time.monotonic()
         self.cmd_pending = True
 
     def _call_cmd(self, cmd: str, phase: str):
         """Call the attach / detach service; called without self.lock (the done callback takes it)."""
-        future = self.cmd_clients[cmd].call_async(Trigger.Request())
+        future = self.cmd_clients[cmd].call_async(SetBool.Request(data=True))
         future.add_done_callback(lambda f: self._on_cmd_response(cmd, phase, f))
         self.get_logger().info(f'{cmd} service called.')
 
     def _on_cmd_response(self, cmd: str, phase: str, future):
         response = future.result()
-        try:
-            reply = json.loads(response.message)
-        except ValueError:
-            reply = {'cmd_id': None, 'msg': response.message}
         with self.lock:
             if self.phase != phase or not self.cmd_pending:
                 return  # reset (or timed out) meanwhile
             self.cmd_pending = False
-            if response.success:
-                self.sent_cmd_id = int(reply['cmd_id'])
         if response.success:
-            self.get_logger().info(f'{cmd} accepted: cmd_id={reply["cmd_id"]}.')
+            self.get_logger().info(f'{cmd} accepted.')
             return
-        message = f'{cmd} rejected: {reply.get("msg")}'
+        message = f'{cmd} rejected: {response.message}'
         self.get_logger().error(message)
         self._end_run('REJECTED', message, phase)
 
@@ -527,13 +526,14 @@ class VirtualTrackingSim(Node):
         with self.lock:
             aligned = self.phase == 'ALIGNED'
             active = self.phase in ACTIVE_PHASES
+            cmd = 'detach' if self.phase == 'LEAVING' else 'attach'
         if aligned:
             # apriltag_control is in IDLE: no cmd to cancel
             self.get_logger().info('ALIGNED: nothing to stop; press l to leave (restores AMCL / lidar safety).')
         elif active:
-            future = self.cmd_clients['cancel'].call_async(Trigger.Request())
+            future = self.cmd_clients[cmd].call_async(SetBool.Request(data=False))
             future.add_done_callback(lambda f: self.get_logger().info(
-                f'cancel: success={f.result().success} message={f.result().message}'))
+                f'{cmd} false: success={f.result().success} message={f.result().message}'))
 
     def leave(self):
         """Send detach: continues the run in ALIGNED, else starts a leave-only run."""
@@ -581,7 +581,12 @@ class VirtualTrackingSim(Node):
         with self.lock:
             self.status_seen = True
             phase = self.phase
-            # sent_cmd_id 0: the cmd service has not answered yet (status cmd_id 0 is the boot value)
+            self.status_cmd_id = int(status.get('cmd_id', 0))
+            # the service reply has no cmd_id: ours is the first status cmd_id above the one seen before the call
+            if (phase in ('STARTING', 'RUNNING', 'LEAVING') and not self.cmd_pending
+                    and not self.sent_cmd_id and self.status_cmd_id > self.base_cmd_id):
+                self.sent_cmd_id = self.status_cmd_id
+            # sent_cmd_id 0: not accepted yet, or no status with our cmd_id yet
             if (phase not in ('STARTING', 'RUNNING', 'LEAVING') or not self.sent_cmd_id
                     or status.get('cmd_id') != self.sent_cmd_id):
                 return
@@ -598,7 +603,8 @@ class VirtualTrackingSim(Node):
         # IDLE with our cmd_id: the cmd has ended
         code = int(status.get('error_code', -1))
         message = status.get('error_msg') or 'OK'
-        result = {0: 'SUCCEEDED', 5: 'CANCELED'}.get(code, 'ABORTED')
+        # a cancel also ends with error_code 0
+        result = 'ABORTED' if code != 0 else 'CANCELED' if message.startswith('Cancelled') else 'SUCCEEDED'
         name = 'detach' if phase == 'LEAVING' else 'attach'
         self.get_logger().info(f'{name} cmd_id={self.sent_cmd_id} finished: {result} error_code={code} - {message}')
         if phase == 'LEAVING' or result != 'SUCCEEDED':

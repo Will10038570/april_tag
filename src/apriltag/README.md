@@ -7,7 +7,7 @@ A ROS 2 Python package that detects [AprilTag](https://april.eecs.umich.edu/soft
 The package runs as two nodes under the `wheelchair` namespace (the RealSense camera too):
 
 - **`apriltag_detection`** — runs continuously from startup: every camera image gives one `TagPoseArray` on `/wheelchair/apriltag_poses` with every detected tag (family, id, pose) of the families in `tag_families`, empty when none is visible, plus a TF per tag, and one `TagTracing` on `/wheelchair/tag_tracing` with the tracked tag: the closest one (smallest positive forward z) of `tracking_tag_family` / `tracking_tag_id` (`-1`: any id), `valid=false` when there is none. It is not controlled by `apriltag_control`.
-- **`apriltag_control`** — orchestrator, run as a state machine, driven by the `std_srvs/Trigger` services `/wheelchair/attach` / `detach` / `cancel` and reporting on `/wheelchair/status` (std_msgs / std_srvs only, so ros1_bridge can carry them; see [Wheelchair Interface](#wheelchair-interface)). `attach` enables lidar safety, closes AMCL (Stage 1), runs the planner + LQR on `/cmd_vel`, then disables the PLC lidar safety field (Stage 2) and continues on `/pre_cmd_vel` (G7+ precision mode). When Stage 2 is aligned the node returns to `IDLE` with AMCL closed and lidar safety disabled; then the cmd succeeds. `detach` (accepted in `IDLE`, with or without a previous alignment) disables lidar safety and closes AMCL, then backs straight up at `max_vx` on `/pre_cmd_vel` (no planner / LQR) until the tag is `leave_distance` ahead of the camera; when it ends, or whenever a stage fails, times out or is cancelled, the node enables lidar safety and makes sure AMCL is open before `IDLE`. It subscribes only to `/wheelchair/tag_tracing` and checks the tag there against its own `tracking_tag_family` / `tracking_tag_id` (the launch files pass detection's values; `-1`: any id); `valid=false` or a tag that does not match counts as not seen (TAG_LOST after `lost_target_timeout`).
+- **`apriltag_control`** — orchestrator, run as a state machine, driven by the `std_srvs/SetBool` services `/wheelchair/attach` / `detach` (`data: true` starts, `false` cancels) and reporting on `/wheelchair/status` (std_msgs / std_srvs only, so ros1_bridge can carry them; see [Wheelchair Interface](#wheelchair-interface)). `attach` enables lidar safety, closes AMCL (Stage 1), runs the planner + LQR on `/cmd_vel`, then disables the PLC lidar safety field (Stage 2) and continues on `/pre_cmd_vel` (G7+ precision mode). When Stage 2 is aligned the node returns to `IDLE` with AMCL closed and lidar safety disabled; then the cmd succeeds. `detach` (accepted in `IDLE`, with or without a previous alignment) disables lidar safety and closes AMCL, then backs straight up at `max_vx` on `/pre_cmd_vel` (no planner / LQR) until the tag is `leave_distance` ahead of the camera; when it ends, or whenever a stage fails, times out or is cancelled, the node enables lidar safety and makes sure AMCL is open before `IDLE`. It subscribes only to `/wheelchair/tag_tracing` and checks the tag there against its own `tracking_tag_family` / `tracking_tag_id` (the launch files pass detection's values; `-1`: any id); `valid=false` or a tag that does not match counts as not seen (TAG_LOST after `lost_target_timeout`).
 
 ```
  camera/camera/color/image_raw ──► apriltag_detection ──► TF <family>_<id>, apriltag/marked_image
@@ -17,7 +17,7 @@ The package runs as two nodes under the `wheelchair` namespace (the RealSense ca
                                           ▼
                    /wheelchair/tag_tracing (apriltag_interfaces/TagTracing, every image)
                                           │
- /wheelchair/attach | detach | cancel (Trigger) ──► apriltag_control ──► /wheelchair/status (5 Hz), /wheelchair/attached
+ /wheelchair/attach | detach (SetBool)     ──► apriltag_control ──► /wheelchair/status (5 Hz), /wheelchair/attached
                                           │ valid and matches tracking_tag_family / tracking_tag_id? else not seen
    quaternion → R → control error → TrajectoryPlanner → LQR → clamp
                                   │
@@ -97,7 +97,7 @@ Each non-`IDLE` state runs three steps, logged as `[step] STATE OLD -> NEW (reas
 | `IDLE` | accept → `STAGE1` | accept → `LEAVING` |
 | `STAGE1` / `STAGE2` / `LEAVING` | reject | reject |
 
-A rejected cmd gets `success=false` with the reason and is logged (`[cmd] <cmd> rejected: …, status unchanged`); the status keeps showing the running cmd. A running cmd is stopped with `cancel`; see [Wheelchair Interface](#wheelchair-interface).
+A rejected cmd gets `success=false` with the reason and is logged (`[cmd] <cmd> rejected: …, status unchanged`); the status keeps showing the running cmd. A running cmd is stopped with `data: false` on its own service; see [Wheelchair Interface](#wheelchair-interface).
 
 Every cmd also has a whole-cmd timeout (`dock_timeout` for attach / `undock_timeout` for detach, launch arguments, default 300 s), counted from cmd accepted until the procedure ends (the cleanup is not counted). A service call already in progress is not interrupted, so the cmd may end up to ~10 s later.
 
@@ -191,23 +191,22 @@ Without a namespace, the relative names lose the `/wheelchair` prefix (e.g. `/at
 Call the cmd services from another terminal (the response's `message` carries the new `cmd_id`) and watch the status:
 
 ```bash
-ros2 service call /wheelchair/attach std_srvs/srv/Trigger    # success=True, message='{"cmd_id": 1, "msg": "attach accepted"}'
+ros2 service call /wheelchair/attach std_srvs/srv/SetBool "{data: true}"    # success=True, message='{"cmd_id": 1, "msg": "attach accepted"}'
 ros2 topic echo /wheelchair/status
-# after a successful attach (IDLE, cmd_id 1, error_code 0): back up and restore AMCL / lidar safety
-ros2 service call /wheelchair/detach std_srvs/srv/Trigger
-# stop the running cmd
-ros2 service call /wheelchair/cancel std_srvs/srv/Trigger
+# stop the running attach (a running detach: /wheelchair/detach with data: false)
+ros2 service call /wheelchair/attach std_srvs/srv/SetBool "{data: false}"
+# in IDLE (e.g. after a successful attach: cmd_id 1, error_code 0): back up and restore AMCL / lidar safety
+ros2 service call /wheelchair/detach std_srvs/srv/SetBool "{data: true}"
 ```
 
-Or use the test tools, one per service without arguments (`tools/attach.py`, `tools/detach.py`, `tools/cancel.py`, shared code in `tools/wheelchair_cmd.py`; run them with `python3`, they have no entry point):
+Or use the test tools, one per service with a required `true` / `false` argument (`tools/attach.py`, `tools/detach.py`, shared code in `tools/wheelchair_cmd.py`; run them with `python3`, they have no entry point):
 
 ```bash
-python3 src/apriltag/tools/attach.py
-python3 src/apriltag/tools/detach.py
-python3 src/apriltag/tools/cancel.py
+python3 src/apriltag/tools/attach.py true    # false: cancel the running attach
+python3 src/apriltag/tools/detach.py true    # false: cancel the running detach
 ```
 
-Like `ros2 service call`, each prints the response (`<cmd>: success=… message=…`) and returns at once; follow the cmd on `/wheelchair/status`. Exit code: 0 accepted, 1 rejected or no response within 2 s, 2 service not found within 5 s (check `ROS_DOMAIN_ID` / `CYCLONEDDS_URI`) or an argparse error.
+Like `ros2 service call`, each prints the response (`<cmd> <data>: success=… message=…`) and returns at once; follow the cmd on `/wheelchair/status`. Exit code: 0 accepted, 1 rejected or no response within 2 s, 2 service not found within 5 s (check `ROS_DOMAIN_ID` / `CYCLONEDDS_URI`) or an argparse error.
 
 Run the controller demo module without ROS:
 
@@ -227,7 +226,7 @@ ros2 launch apriltag virtual_tracking.launch.py
 
 The stage / leave distances are not set on the sim: it reads `stage1_distance` / `stage2_distance` / `leave_distance` from `apriltag_control` at startup (`apriltag_control/get_parameters`) and sends no cmd before that. Set them with `stage1_distance:=… stage2_distance:=… leave_distance:=…` on the test launch.
 
-A run is an `attach` call followed by a `detach` call; the `cmd_id` comes from the service response. A cmd has ended when `/wheelchair/status` shows `IDLE` with its `cmd_id` (`error_code` 0 SUCCEEDED, 5 CANCELED, else ABORTED); a rejected call, or one without a response after `cmd_reject_timeout` (sim parameter, 2.0 s), ends the run as REJECTED. When the attach succeeds the sim logs `aligned: amcl=off lidar_safety=disabled (held)` (or an error if they were restored too early) and waits in its `ALIGNED` phase (`apriltag_control` is in `IDLE`); Leave (`l`) sends `detach` (headless: sent automatically). The run ends with the detach. Leave without a previous Start runs a leave-only run.
+A run is an `attach` call followed by a `detach` call; the reply has no `cmd_id`, so the sim takes it from the status: the first `cmd_id` above the one seen before the call, once the call is accepted. A cmd has ended when `/wheelchair/status` shows `IDLE` with its `cmd_id` (`error_code` 0 with `error_msg` starting with `Cancelled` CANCELED, other 0 SUCCEEDED, else ABORTED); a rejected call, or one without a response after `cmd_reject_timeout` (sim parameter, 2.0 s), ends the run as REJECTED. When the attach succeeds the sim logs `aligned: amcl=off lidar_safety=disabled (held)` (or an error if they were restored too early) and waits in its `ALIGNED` phase (`apriltag_control` is in `IDLE`); Leave (`l`) sends `detach` (headless: sent automatically). The run ends with the detach. Leave without a previous Start runs a leave-only run.
 
 A fake node `fake_g7_services` stands in for AMCL and the PLC lidar safety. It serves the same three AMCL services and subscribes to the lidar safety topic, but only keeps two bool flags (AMCL on/off, lidar safety enabled/disabled), shown in the dashboard. At the end of every run the sim logs `after cmd: amcl=… lidar_safety=… (restored)`, or an error if `apriltag_control` did not restore them.
 
@@ -242,9 +241,9 @@ Dashboard:
 | Pose error | Ground-truth error (lines) vs. the controller's error from the status `x_error` / `y_error` / `yaw_error` (circles), ±0.05 tolerance band, Stage 2 and leave start times |
 | cmd_vel | Thick dark line: the cmd the sim actually applies to the AMR (sampled at 50 Hz, zero after 0.5 s without a message). Thin line + dots: every raw `/cmd_vel` / `/pre_cmd_vel` message from `apriltag_control`. ±0.5 limit |
 
-Keys: `s` start (calls `attach`), `l` leave (calls `detach`: in `ALIGNED`, or a leave-only run when no run is active), `x` stop (calls `cancel`; nothing to stop in `ALIGNED`), `r` reset to the initial pose, `+` / `-` zoom, `q` quit.
+Keys: `s` start (calls `attach`), `l` leave (calls `detach`: in `ALIGNED`, or a leave-only run when no run is active), `x` stop (`data: false` on the running cmd's service; nothing to stop in `ALIGNED`), `r` reset to the initial pose, `+` / `-` zoom, `q` quit.
 
-Every finished run is saved to `virtual_tracking_logs/` (relative to the working directory): `<time>_<result>_sim.csv` (50 Hz pose, ground-truth error, cmd), `<time>_<result>_feedback.csv` (status while the cmd runs: `t, x_err, y_err, yaw_err, cmd_id, state, last_frame_age`; state 1 STAGE1, 2 STAGE2, 3 LEAVING; NaN for `null`), `<time>_<result>_cmd_raw.csv` (every raw `/cmd_vel` / `/pre_cmd_vel` message) and a PNG of the dashboard.
+Every finished run is saved to `virtual_tracking_logs/` (relative to the working directory): `<time>_<result>_sim.csv` (50 Hz pose, ground-truth error, cmd), `<time>_<result>_feedback.csv` (status while the cmd runs: `t, x_err, y_err, yaw_err, cmd_id, state, last_frame_age`; state 1 `Attaching(STAGE1)`, 2 `Attaching(STAGE2)`, 3 `Detaching`; NaN for `null`), `<time>_<result>_cmd_raw.csv` (every raw `/cmd_vel` / `/pre_cmd_vel` message) and a PNG of the dashboard.
 
 Headless (no window, `attach` then `detach`, then exit after saving):
 
@@ -277,39 +276,38 @@ The sim's camera intrinsics, camera mount offset, tag size and stage distances a
 |---|---|---|---|
 | `/check_mcl_if_trigger` | `std_srvs/Trigger` | G7+ AMCL | Called by `apriltag_control`; `success=true` means AMCL is running |
 | `/close_amcl`, `/open_amcl` | `std_srvs/Empty` | G7+ AMCL | Called by `apriltag_control` before Stage 1 and before leaving (close, only if on) and at procedure end / shutdown (open, only if off) |
-| `/wheelchair/attach`, `/wheelchair/detach`, `/wheelchair/cancel` | `std_srvs/Trigger` | control | Cmds, see [Wheelchair Interface](#wheelchair-interface) |
+| `/wheelchair/attach`, `/wheelchair/detach` | `std_srvs/SetBool` | control | Cmds, see [Wheelchair Interface](#wheelchair-interface) |
 
 ## Wheelchair Interface
 
-Follows `[service_robot] wheelchair_interface.pdf` (v0.1) with these differences: `detach` is the leaving (no gripper, `attached` is always `false`), the states are this node's `IDLE` / `STAGE1` / `STAGE2` / `LEAVING` (no `CANCELLED` / `ERROR`: a cmd that failed or was cancelled ends in `IDLE` with `error_code` ≠ 0), the error codes are the ones below (not the PDF's yet), there is no `/wheelchair/get_status` service, and the cmds are three `std_srvs/Trigger` services instead of the `/wheelchair/cmd` topic (no `reset`; `apriltag_control` gives the `cmd_id`, not the caller).
+Follows `[service_robot] wheelchair_interface.pdf` (v0.1) with these differences: `detach` is the leaving (no gripper, `attached` is always `false`), the status states are `IDLE` / `Attaching(STAGE1)` / `Attaching(STAGE2)` / `Detaching` (this node's `TrackingState` `IDLE` / `STAGE1` / `STAGE2` / `LEAVING`; no `CANCELLED` / `ERROR`: a cmd that failed ends in `IDLE` with `error_code` ≠ 0, a cancelled one with `error_code` 0 and `error_msg` `Cancelled …`), the error codes are the ones below (not the PDF's yet), there is no `/wheelchair/get_status` service, and the cmds are two `std_srvs/SetBool` services instead of the `/wheelchair/cmd` topic (`data: false` = cancel, no `reset`; `apriltag_control` gives the `cmd_id`, not the caller).
 
-`/wheelchair/attach`, `/wheelchair/detach`, `/wheelchair/cancel` (`std_srvs/Trigger`, empty request) answer at once whether the cmd is taken; the result is in the status. `success` = accepted, `message` = JSON `{"cmd_id": n | null, "msg": "<reason>"}`. Only one cmd runs at a time.
+`/wheelchair/attach`, `/wheelchair/detach` (`std_srvs/SetBool`; `data: true` starts the cmd, `data: false` cancels it) answer at once whether the cmd is taken; the result is in the status. `success` = accepted, `message` = the reason as plain text (no JSON, no `cmd_id`): `attach accepted` / `detach accepted`, `cancel requested`, `already ending, result unchanged`, `nothing running` or `rejected: state=… (only accepted in …)`. The `cmd_id` of a cmd is only in the status. Only one cmd runs at a time.
 
 | Service | Effect |
 |---|---|
-| `attach` | Only in `IDLE`: Stage 1 + 2 (dock). Gets a new `cmd_id` n (1, 2, … since the node started; status `cmd_id` = n), error cleared. Succeeds in `IDLE` with AMCL closed, lidar safety disabled. Else `success=false`, `cmd_id` null |
-| `detach` | Only in `IDLE`, with or without a previous attach (new `cmd_id` like attach): back straight up until the tag is `leave_distance` ahead, then restore AMCL / lidar safety |
-| `cancel` | Not in `IDLE`: `success=true` with the running `cmd_id`; stop at once, restore, `IDLE` with `error_code` 5. If the cmd is already ending (e.g. just aligned) `msg` is `already ending, result unchanged` and the status keeps its own result, so always check the status `error_code`. In `IDLE`: `success=false` (`nothing running`) |
+| `attach` `true` | Only in `IDLE`: Stage 1 + 2 (dock). Gets a new `cmd_id` n (1, 2, … since the node started; status `cmd_id` = n), error cleared. Succeeds in `IDLE` with AMCL closed, lidar safety disabled. Else `success=false` |
+| `detach` `true` | Only in `IDLE`, with or without a previous attach (new `cmd_id` like attach): back straight up until the tag is `leave_distance` ahead, then restore AMCL / lidar safety |
+| `attach` / `detach` `false` | Only the running cmd of the same service (`attach`: `STAGE1` / `STAGE2`, `detach`: `LEAVING`): `success=true` (`cancel requested`); stop at once, restore, `IDLE` with `error_code` 0 and `error_msg` `Cancelled cmd_id=n. elapsed=…s` (`error_code` 2 if the restore failed). If the cmd is already ending (e.g. just aligned) `msg` is `already ending, result unchanged` and the status keeps its own result, so always check the status `error_code` / `error_msg`. In `IDLE`: `success=false` (`nothing running`); the other cmd running: `success=false`, e.g. `rejected: state=LEAVING (only accepted in STAGE1, STAGE2)`, status unchanged |
 
 `/wheelchair/status` (`std_msgs/String`, reliable, transient_local, depth 1, 5 Hz):
 
 ```json
-{"state": "STAGE1", "cmd_id": 17, "attached": false, "error_code": 0, "error_msg": "", "stamp": 1792389633.11,
+{"state": "Attaching(STAGE1)", "cmd_id": 17, "attached": false, "error_code": 0, "error_msg": "", "stamp": 1792389633.11,
  "x_error": 0.12, "y_error": -0.02, "yaw_error": 0.01, "last_frame_age": 0.03}
 ```
 
-`state` is the `TrackingState`; `cmd_id` the current / last cmd (0 after startup); `stamp` the publish time (epoch s); `x_error` / `y_error` (m), `yaw_error` (rad) and `last_frame_age` (s, node clock − `header.stamp` of the newest frame with the tracked tag) are debug fields, `null` when unknown. A cmd has ended when the state is `IDLE` with its `cmd_id`; `error_code` 0 means it succeeded. `error_code` / `error_msg` are written together with the change to `IDLE`.
+`state` is the `TrackingState` as a status string (`STATUS_STATE` in `control_node.py`: `IDLE`, `Attaching(STAGE1)`, `Attaching(STAGE2)`, `Detaching`; logs and service replies keep the enum value, e.g. `STAGE1`); `cmd_id` the current / last cmd (0 after startup); `stamp` the publish time (epoch s); `x_error` / `y_error` (m), `yaw_error` (rad) and `last_frame_age` (s, node clock − `header.stamp` of the newest frame with the tracked tag) are debug fields, `null` when unknown. A cmd has ended when the state is `IDLE` with its `cmd_id`; `error_code` 0 means it succeeded (`error_msg` `Attach succeeded` / `Detach succeeded`) or was cancelled (`error_msg` starts with `Cancelled`); while running `error_msg` is `""`, after a failure it is the reason. `error_code` / `error_msg` are written together with the change to `IDLE`.
 
 | `error_code` | Meaning |
 |---|---|
-| `OK` 0 | attach aligned / detach reached |
+| `OK` 0 | attach aligned / detach reached, or cancelled with `data: false` (see `error_msg`) |
 | `TAG_LOST` 1 | tracked tag not seen for `lost_target_timeout` while running |
 | `AMCL_SERVICE_FAIL` 2 | AMCL service missing / no response / wrong state, or the restore failed (whatever ended the cmd) |
 | `LIDAR_SERVICE_FAIL` 3 | reserved, not reported yet (lidar safety is fire-and-forget) |
 | `TIMEOUT` 4 | `dock_timeout` / `undock_timeout` |
-| `ACTION_CANCELED` 5 | `cancel` |
-| `OTHER` 6 | anything else (e.g. an exception) |
-| `NODE_SHUTDOWN` 7 | `apriltag_control` shut down |
+| `OTHER` 5 | anything else (e.g. an exception) |
+| `NODE_SHUTDOWN` 6 | `apriltag_control` shut down |
 
 ### TF Transforms
 
@@ -418,8 +416,8 @@ apriltag_ws/
 │       │   ├── april_tag.launch.py                # camera + detection + control (real robot)
 │       │   └── virtual_tracking.launch.py         # virtual end-to-end test
 │       ├── tools/
-│       │   ├── attach.py / detach.py / cancel.py  # test tools: call one service each, print the response
-│       │   ├── wheelchair_cmd.py        # shared code of attach.py / detach.py / cancel.py
+│       │   ├── attach.py / detach.py    # test tools: call one service each (true / false), print the response
+│       │   ├── wheelchair_cmd.py        # shared code of attach.py / detach.py
 │       │   ├── detection_viewer.py      # prints /wheelchair/tag_tracing (default) or /wheelchair/apriltag_poses
 │       │   └── virtual_tracking_sim.py  # virtual camera / AMR / fake G7+ AMCL + lidar safety + dashboard
 │       └── test/

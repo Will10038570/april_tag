@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Call /wheelchair/attach and print its response (see wheelchair_cmd.py).
+"""Call /wheelchair/attach (SetBool: true = start, false = cancel) and print its response (see wheelchair_cmd.py).
 
 Inside the container, with ROS + the workspace sourced and the same ROS_DOMAIN_ID /
 CYCLONEDDS_URI as apriltag_control:
-    python3 /mnt/work_space/src/apriltag/tools/attach.py
+    python3 /mnt/work_space/src/apriltag/tools/attach.py true|false
 """
 
 from wheelchair_cmd import main

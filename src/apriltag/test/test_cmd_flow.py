@@ -1,4 +1,4 @@
-"""Service reply JSON, status JSON, parameter checks and outcome of the wheelchair interface."""
+"""Status JSON, parameter checks and outcome of the wheelchair interface."""
 
 import json
 import math
@@ -6,28 +6,18 @@ import math
 import pytest
 
 from apriltag.runtime.cmd_flow import (
+    SUCCESS_MSG,
     Codes as D,
     final_outcome,
-    reply_json,
     status_json,
     tag_id_filter,
     validate_goal,
 )
 
 CODE_NAMES = ['OK', 'TAG_LOST', 'AMCL_SERVICE_FAIL', 'LIDAR_SERVICE_FAIL', 'TIMEOUT',
-              'ACTION_CANCELED', 'OTHER', 'NODE_SHUTDOWN']
+              'OTHER', 'NODE_SHUTDOWN']
 STATUS_KEYS = ['state', 'cmd_id', 'attached', 'error_code', 'error_msg', 'stamp',
                'x_error', 'y_error', 'yaw_error', 'last_frame_age']
-
-
-# ---- service reply JSON ------------------------------------------------------------
-
-def test_reply_json_accepted():
-    assert json.loads(reply_json(7, 'attach accepted')) == {'cmd_id': 7, 'msg': 'attach accepted'}
-
-
-def test_reply_json_rejected():
-    assert json.loads(reply_json(None, 'rejected')) == {'cmd_id': None, 'msg': 'rejected'}
 
 
 # ---- status JSON ------------------------------------------------------------------
@@ -89,7 +79,7 @@ def test_tag_id_filter():
 # ---- outcome ----------------------------------------------------------------------
 
 @pytest.mark.parametrize('outcome, code', [
-    ('succeed', D.OK), ('abort', D.TAG_LOST), ('canceled', D.ACTION_CANCELED)])
+    ('succeed', D.OK), ('abort', D.TAG_LOST), ('canceled', D.OK)])
 def test_restore_ok_keeps_outcome(outcome, code):
     assert final_outcome(outcome, code, True) == (outcome, code)
 
@@ -97,10 +87,14 @@ def test_restore_ok_keeps_outcome(outcome, code):
 @pytest.mark.parametrize('outcome, code, expected', [
     ('succeed', D.OK, ('abort', D.AMCL_SERVICE_FAIL)),
     ('abort', D.TAG_LOST, ('abort', D.AMCL_SERVICE_FAIL)),
-    ('canceled', D.ACTION_CANCELED, ('canceled', D.AMCL_SERVICE_FAIL)),
+    ('canceled', D.OK, ('canceled', D.AMCL_SERVICE_FAIL)),
 ])
 def test_restore_failed_reports_amcl(outcome, code, expected):
     assert final_outcome(outcome, code, False) == expected
+
+
+def test_success_msg_values():
+    assert SUCCESS_MSG == {'attach': 'Attach succeeded', 'detach': 'Detach succeeded'}
 
 
 def test_error_code_values():

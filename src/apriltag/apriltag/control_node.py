@@ -16,7 +16,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
 from std_msgs.msg import Bool, Int32, String
-from std_srvs.srv import Empty, Trigger
+from std_srvs.srv import Empty, SetBool, Trigger
 
 from apriltag.control import LQRTracker, TrajectoryPlanner
 from apriltag.domain.math_utils import (
@@ -28,11 +28,10 @@ from apriltag.domain.math_utils import (
 from apriltag.ros.ros_io import publish_twist
 from apriltag.runtime.cmd_flow import (
     ATTACH,
-    CANCEL,
     DETACH,
+    SUCCESS_MSG,
     Codes,
     final_outcome,
-    reply_json,
     status_json,
     tag_id_filter,
     validate_goal,
@@ -76,14 +75,22 @@ ALLOWED_TRANSITIONS = {
 }
 # states with a running goal; velocity is published only in their RUNNING step
 ACTIVE_STATES = frozenset({S.STAGE1, S.STAGE2, S.LEAVING})
-# cmd -> states in which it is accepted; a running cmd is stopped with the
-# cancel service
+# cmd -> states in which it is accepted; a running cmd is stopped by its own
+# service with data=false
 GOAL_RULES = {
     ATTACH: frozenset({S.IDLE}),
     DETACH: frozenset({S.IDLE}),
 }
+# cmd -> states in which data=false cancels it (only its own running cmd)
+CANCEL_RULES = {
+    ATTACH: frozenset({S.STAGE1, S.STAGE2}),
+    DETACH: frozenset({S.LEAVING}),
+}
 # body_status_topic value on entering a state; STAGE2 publishes nothing
 BODY_STATUS = {S.IDLE: 0, S.STAGE1: 1, S.LEAVING: 2}
+# /wheelchair/status state string (logs and replies keep the enum value)
+STATUS_STATE = {S.IDLE: 'IDLE', S.STAGE1: 'Attaching(STAGE1)', S.STAGE2: 'Attaching(STAGE2)',
+                S.LEAVING: 'Detaching'}
 
 
 def is_transition_allowed(src: TrackingState, dst: TrackingState) -> bool:
@@ -151,10 +158,11 @@ class AprilTagControlNode(Node):
     safety calls.
 
     Interface (std_msgs / std_srvs only, for ros1_bridge): cmds are the
-    std_srvs/Trigger services attach, detach and cancel, answered at once
+    std_srvs/SetBool services attach and detach, answered at once
     (success = accepted, message = JSON {"cmd_id": n | null, "msg": ...}).
-    attach / detach are accepted only in IDLE and get a new cmd_id (1, 2, ...
-    since start); cancel stops whatever runs (rejected in IDLE). status (JSON, 5 Hz) carries the
+    data=true is accepted only in IDLE and gets a new cmd_id (1, 2, ...
+    since start); data=false cancels the running cmd of the same service
+    (attach: STAGE1 / STAGE2, detach: LEAVING). status (JSON, 5 Hz) carries the
     state, the cmd_id, error_code / error_msg and debug errors; a cmd has
     ended when the state is IDLE with its cmd_id (error_code 0: success).
     attached is always false (the gripper is not sensed).
@@ -372,9 +380,8 @@ class AprilTagControlNode(Node):
             )
 
         ## wheelchair interface (std_msgs only, for ros1_bridge)
-        self.attach_srv = self.create_service(Trigger, 'attach', lambda _, res: self._goal_service(ATTACH, res))
-        self.detach_srv = self.create_service(Trigger, 'detach', lambda _, res: self._goal_service(DETACH, res))
-        self.cancel_srv = self.create_service(Trigger, 'cancel', self._cancel_service)
+        self.attach_srv = self.create_service(SetBool, 'attach', lambda req, res: self._cmd_service(ATTACH, req, res))
+        self.detach_srv = self.create_service(SetBool, 'detach', lambda req, res: self._cmd_service(DETACH, req, res))
         self.status_pub = self.create_publisher(String, 'status', STATUS_QOS)
         self.attached_pub = self.create_publisher(Bool, 'attached', STATUS_QOS)
         # G7+ UI: 1 attaching, 2 leaving, 0 back to IDLE; published on state change only
@@ -608,7 +615,7 @@ class AprilTagControlNode(Node):
         self._publish_stop_command()
         return self._restore_external_state()
 
-    def _end_goal(self, restore: bool, outcome: str, error_code: int,
+    def _end_goal(self, cmd: str, restore: bool, outcome: str, error_code: int,
                   message: str) -> Tuple[str, int, str]:
         """ENDING step of the cmd's state: clean up, then IDLE with the status error.
 
@@ -628,7 +635,7 @@ class AprilTagControlNode(Node):
             self._goal_deadline = None
             # written together with IDLE, so IDLE + cmd_id never shows a stale error_code
             self._error_code = int(error_code)
-            self._error_msg = '' if outcome == 'succeed' else message
+            self._error_msg = SUCCESS_MSG[cmd] if outcome == 'succeed' else message
             self._transition_locked(S.IDLE, None, 'cleanup done' if ok else 'cleanup done, with failures')
         return outcome, error_code, message
 
@@ -640,26 +647,35 @@ class AprilTagControlNode(Node):
 
     # ---- wheelchair cmd / status ---------------------------------------------
 
-    def _goal_service(self, cmd: str, response: Trigger.Response) -> Trigger.Response:
-        accepted, cmd_id, msg = self._start_cmd(cmd)
-        response.success, response.message = accepted, reply_json(cmd_id, msg)
+    def _cmd_service(self, cmd: str, request: SetBool.Request,
+                     response: SetBool.Response) -> SetBool.Response:
+        """data=true starts cmd, data=false cancels it."""
+        accepted, _, msg = self._start_cmd(cmd) if request.data else self._cancel_cmd(cmd)
+        response.success, response.message = accepted, msg
         return response
 
-    def _cancel_service(self, _request, response: Trigger.Response) -> Trigger.Response:
-        """Stop the running cmd; accepted whenever the state is not IDLE."""
+    def _cancel_cmd(self, cmd: str) -> Tuple[bool, Optional[int], str]:
+        """Stop the running cmd if it is cmd (state in CANCEL_RULES[cmd]).
+
+        Returns (accepted, the running cmd_id or None, reason).
+        """
+        allowed = CANCEL_RULES[cmd]
         with self._control_lock:
-            running_id = self._cmd_id if self._state in ACTIVE_STATES else None
-        if running_id is None:
-            self.get_logger().warn(self._stage() + '[cmd] cancel rejected: nothing running')
-            response.success, response.message = False, reply_json(None, 'nothing running')
-            return response
-        self.get_logger().info(self._stage() + f'[cmd] cancel cmd_id={running_id} accepted')
-        # False: already ending (e.g. just aligned), so the result may not be ACTION_CANCELED
-        ended = self._request_end(False, f'Cancelled cmd_id={running_id}.', Codes.ACTION_CANCELED, canceled=True)
-        response.success = True
-        response.message = reply_json(
-            running_id, 'cancel requested' if ended else 'already ending, result unchanged')
-        return response
+            state = self._state
+            running_id = self._cmd_id
+        if state not in ACTIVE_STATES:
+            self.get_logger().warn(self._stage() + f'[cmd] {cmd} false rejected: nothing running')
+            return False, None, 'nothing running'
+        if state not in allowed:
+            reason = (f'rejected: state={state.value} '
+                      f'(only accepted in {", ".join(sorted(s.value for s in allowed))})')
+            self.get_logger().warn(self._stage() + f'[cmd] {cmd} false {reason}, status unchanged')
+            return False, None, reason
+        self.get_logger().info(self._stage() + f'[cmd] {cmd} false cmd_id={running_id} accepted')
+        # False: already ending (e.g. just aligned) or the state changed meanwhile; only_in rechecks under the lock
+        ended = self._request_end(False, f'Cancelled cmd_id={running_id}.', Codes.OK,
+                                  canceled=True, only_in=allowed)
+        return True, running_id, 'cancel requested' if ended else 'already ending, result unchanged'
 
     def _start_cmd(self, cmd: str) -> Tuple[bool, Optional[int], str]:
         """Accept attach / detach in IDLE and run it on a worker thread.
@@ -721,7 +737,7 @@ class AprilTagControlNode(Node):
             self._request_end(False, ended_message, Codes.OTHER)
             outcome, error_code, message, final = self._goal_outcome()
             restore = restore_on_success or outcome != 'succeed'
-            outcome, error_code, message = self._end_goal(restore, outcome, error_code, message)
+            outcome, error_code, message = self._end_goal(cmd, restore, outcome, error_code, message)
         status = {'succeed': 'SUCCEEDED', 'canceled': 'CANCELED'}.get(outcome, 'ABORTED')
         text = (f'[cmd] {cmd} cmd_id={cmd_id} result: {status} error_code={error_code} '
                 f'message={message!r} final=({final.get("x_error", math.nan):+.3f}, '
@@ -824,7 +840,7 @@ class AprilTagControlNode(Node):
             stamp = self._last_frame_stamp
             active = self._state in ACTIVE_STATES
             text = status_json(
-                self._state.value, self._cmd_id, self._error_code, self._error_msg, time.time(),
+                STATUS_STATE[self._state], self._cmd_id, self._error_code, self._error_msg, time.time(),
                 t.get('x_error', math.nan), t.get('y_error', math.nan), t.get('yaw_error', math.nan),
                 (now.nanoseconds * 1e-9 - stamp) if stamp is not None else math.nan)
             self.status_pub.publish(String(data=text))

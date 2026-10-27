@@ -84,7 +84,7 @@ docker exec april_tag_serive bash -ic '
 
 ### 3.2 虛擬端到端測試(建議每次改 code 後必跑)
 
-`virtual_tracking.launch.py` 會啟動真正的 `apriltag_detection`、`apriltag_control`,以及取代相機 / AMR / G7+ AMCL 與 lidar safety 的 `virtual_tracking_sim`(全部在 `wheelchair` namespace)。一次 run = sim 呼叫 `/wheelchair/attach` service(`std_srvs/Trigger`,response 帶 `cmd_id`)(Stage 1 → Stage 2 → 回 `IDLE`,AMCL 關、lidar safety disabled)接著呼叫 `/wheelchair/detach`(退到 `leave_distance` 後還原 AMCL / lidar safety);sim 看 `/wheelchair/status` 出現 `IDLE` + 自己的 `cmd_id` 判斷結束。
+`virtual_tracking.launch.py` 會啟動真正的 `apriltag_detection`、`apriltag_control`,以及取代相機 / AMR / G7+ AMCL 與 lidar safety 的 `virtual_tracking_sim`(全部在 `wheelchair` namespace)。一次 run = sim 呼叫 `/wheelchair/attach` service(`std_srvs/SetBool` `data:true`;response 不帶 `cmd_id`,sim 在被接受後取 status 中第一個大於呼叫前的 `cmd_id`)(Stage 1 → Stage 2 → 回 `IDLE`,AMCL 關、lidar safety disabled)接著呼叫 `/wheelchair/detach`(退到 `leave_distance` 後還原 AMCL / lidar safety);sim 看 `/wheelchair/status` 出現 `IDLE` + 自己的 `cmd_id` 判斷結束。
 
 **安全注意:** `virtual_tracking.launch.py` 的 `domain_id` 預設是 65(機器人在 63,但仍請勿依賴這點),而 `apriltag_control` 會發 `/cmd_vel`、`/pre_cmd_vel`、`/g7_plc/disable_lidar_safety` 並呼叫 AMCL service。跑虛擬測試時:
 
@@ -108,10 +108,11 @@ docker exec april_tag_serive bash -ic '
 [state] STAGE1 -> STAGE2 (Stage 1 aligned)
 [state] STAGE2 -> IDLE (cleanup done)
 [cmd] attach cmd_id=1 result: SUCCEEDED error_code=0 message='Stage 2 aligned at 0.28m. ... AMCL off, lidar safety disabled; send detach to restore. ...' final=(...)
-attach cmd_id=1 finished: SUCCEEDED error_code=0 - OK
+attach cmd_id=1 finished: SUCCEEDED error_code=0 - Attach succeeded
 aligned: amcl=off lidar_safety=disabled (held)
 [state] IDLE -> LEAVING (detach cmd_id=2 accepted, back to 1.00m)
 [cmd] detach cmd_id=2 result: SUCCEEDED error_code=0 message='Leave reached 1.00m (forward=1.0xxm). ...' final=(...)
+detach cmd_id=2 finished: SUCCEEDED error_code=0 - Detach succeeded
 after cmd: amcl=on lidar_safety=enabled (restored)
 Run saved to .../virtual_tracking_logs/<time>_succeeded_*.csv
 ```
@@ -131,7 +132,7 @@ docker exec -it april_tag_serive bash -ic '
   ros2 launch apriltag virtual_tracking.launch.py'
 ```
 
-按鍵:`s` 開始(呼叫 `attach`)、`l` 離開(呼叫 `detach`;sim 在 `ALIGNED` 時接續同一個 run,沒有 run 時為只有 leave 的 run)、`x` 呼叫 `cancel`(`ALIGNED` 時沒有東西可停)、`r` 重置、`a`/`d` 旋轉初始 yaw(±2°,僅未執行時)、`+`(或 `=`)/`-` 縮放、`q` 或 `Esc` 離開(會連同整個 launch 一起結束)。未執行時,上半部畫面可用滑鼠拖曳車體移動、拖曳把手或滾輪旋轉,也可點畫面上的按鈕。
+按鍵:`s` 開始(呼叫 `attach`)、`l` 離開(呼叫 `detach`;sim 在 `ALIGNED` 時接續同一個 run,沒有 run 時為只有 leave 的 run)、`x` 對執行中 cmd 的 service 送 `data:false`(`ALIGNED` 時沒有東西可停)、`r` 重置、`a`/`d` 旋轉初始 yaw(±2°,僅未執行時)、`+`(或 `=`)/`-` 縮放、`q` 或 `Esc` 離開(會連同整個 launch 一起結束)。未執行時,上半部畫面可用滑鼠拖曳車體移動、拖曳把手或滾輪旋轉,也可點畫面上的按鈕。
 
 | Launch 參數 | 預設 |
 |---|---|
@@ -145,7 +146,7 @@ docker exec -it april_tag_serive bash -ic '
 | `tracking_tag_family` / `tracking_tag_id` | `tag36h11` / `0`(**同時傳給 detection 與 control**:發到 `/wheelchair/tag_tracing` 的 tag,`-1` = 任何 id;family 不在 `detect_tag_families` 時 detection 啟動即 `ValueError` 結束。sim 畫的是 tag36h11 id 0;`tracking_tag_id:=5` → `tag_tracing` 一直 `valid=false`,status `IDLE` `error_code=1`) |
 | `dock_timeout` / `undock_timeout` / `lost_target_timeout` | `300.0` / `300.0` / `1.0` s(例:`dock_timeout:=3.0` 測 TIMEOUT,`error_code=4`) |
 
-手動送 cmd 測試(另開終端,同樣設 `ROS_DOMAIN_ID=99` 與 `lo` 的 `CYCLONEDDS_URI`):用 `headless:=true auto_start:=false` 啟動,sim 的物理與相機照常運作,但不會自己送 cmd。指令見第 4 節(`tools/attach.py` / `detach.py` / `cancel.py`,或 `ros2 service call /wheelchair/attach std_srvs/srv/Trigger`、`ros2 topic echo /wheelchair/status`)。工具呼叫完 service 就結束(不會卡住終端),結果看 status。
+手動送 cmd 測試(另開終端,同樣設 `ROS_DOMAIN_ID=99` 與 `lo` 的 `CYCLONEDDS_URI`):用 `headless:=true auto_start:=false` 啟動,sim 的物理與相機照常運作,但不會自己送 cmd。指令見第 4 節(`tools/attach.py` / `detach.py` `true|false`,或 `ros2 service call /wheelchair/attach std_srvs/srv/SetBool "{data: true}"`、`ros2 topic echo /wheelchair/status`)。工具呼叫完 service 就結束(不會卡住終端),結果看 status。
 
 **背景 process 注意:** `docker exec` 被中斷(或 Claude Code 的指令被拒絕)時,container 內已啟動的 process **不會**停止;非互動 bash 的背景 job 也會忽略 SIGINT。測完務必確認並清掉殘留(`[a]` 寫法避免 `pkill` 比對到自己)。**先看 `ps` 有沒有實機 launch 的 node**(不是 domain 99 的測試):下面的 `pkill` 會連它們一起停掉(2026-10-19 發生過),有的話改用 `kill -INT <pid>` 只停測試的 PID:
 
@@ -162,7 +163,7 @@ docker exec april_tag_serive bash -ic '
   colcon test --packages-select apriltag && colcon test-result --all'
 ```
 
-`src/apriltag/test/` 內有 `test_state_machine.py`(轉移表與 cmd 接受表)、`test_cmd_flow.py`(service response JSON、status JSON、參數檢查、outcome / error_code)、`test_leave_step.py`、`test_target_flow.py`(`choose_best_target`、`tag_matches`)、`test_yaw_*.py`、`test_tag_size.py`,2026-10-21 共 110 tests。新增的 pytest 請放在 `src/apriltag/test/`,同樣用上面的指令在 container 內執行。
+`src/apriltag/test/` 內有 `test_state_machine.py`(轉移表、cmd 接受表與取消表)、`test_cmd_flow.py`(status JSON、參數檢查、outcome / error_code)、`test_leave_step.py`、`test_target_flow.py`(`choose_best_target`、`tag_matches`)、`test_yaw_*.py`、`test_tag_size.py`,2026-10-27 共 112 tests。新增的 pytest 請放在 `src/apriltag/test/`,同樣用上面的指令在 container 內執行。
 
 ---
 
@@ -179,23 +180,22 @@ docker exec -it april_tag_serive bash -ic '
 # 終端 2:看狀態
 docker exec -it april_tag_serive bash -ic 'ros2 topic echo /wheelchair/status'
 
-# 終端 3:測試工具,每個 service 一支、不需參數;像 ros2 service call 一樣印出 response 後立即結束,結果看終端 2 的 status(exit code:0 被接受、1 被拒 / 無回應、2 找不到 service 或參數錯誤)
-docker exec -it april_tag_serive bash -ic 'python3 /mnt/work_space/src/apriltag/tools/attach.py'
-docker exec -it april_tag_serive bash -ic 'python3 /mnt/work_space/src/apriltag/tools/detach.py'
-docker exec -it april_tag_serive bash -ic 'python3 /mnt/work_space/src/apriltag/tools/cancel.py'
+# 終端 3:測試工具,每個 service 一支、必填 true(開始)/ false(取消);像 ros2 service call 一樣印出 response 後立即結束,結果看終端 2 的 status(exit code:0 被接受、1 被拒 / 無回應、2 找不到 service 或參數錯誤)
+docker exec -it april_tag_serive bash -ic 'python3 /mnt/work_space/src/apriltag/tools/attach.py true'    # false:取消執行中的 attach
+docker exec -it april_tag_serive bash -ic 'python3 /mnt/work_space/src/apriltag/tools/detach.py true'    # false:取消執行中的 detach
 
-# 或直接呼叫 service(std_srvs/Trigger,request 為空;response 立即回 success=接受與否、message={"cmd_id": n|null, "msg": ...})
+# 或直接呼叫 service(std_srvs/SetBool;response 立即回 success=接受與否、message=純文字原因,不帶 cmd_id;cmd_id 看 status)
 # 對位(成功後 status 為 IDLE + 該 cmd_id + error_code 0,AMCL 關、lidar safety disabled)
-docker exec -it april_tag_serive bash -ic 'ros2 service call /wheelchair/attach std_srvs/srv/Trigger'
-# 離開:/wheelchair/detach(IDLE 時接受,不需先對位;退到 leave_distance,完成後開 AMCL、enable lidar safety)
-# 停止:/wheelchair/cancel(非 IDLE 時一律 success=true → IDLE、error_code=5,停止並還原;已在 ending 時 msg 為 already ending,結果以 status 為準;IDLE 時 success=false)
+docker exec -it april_tag_serive bash -ic 'ros2 service call /wheelchair/attach std_srvs/srv/SetBool "{data: true}"'
+# 離開:/wheelchair/detach data:true(IDLE 時接受,不需先對位;退到 leave_distance,完成後開 AMCL、enable lidar safety)
+# 停止:同一個 service 送 data:false(attach 停 STAGE1 / STAGE2、detach 停 LEAVING;success=true → IDLE、error_code=0、error_msg 為 `Cancelled cmd_id=n. …`,停止並還原;已在 ending 時 msg 為 already ending,結果以 status 為準;IDLE 或另一種 cmd 在跑時 success=false)
 ```
 
-介面依 `[service_robot] wheelchair_interface.pdf`(v0.1),差異:`detach` = leaving(不管夾爪,`/wheelchair/attached` 固定發 `false`)、state 只有 `IDLE` / `STAGE1` / `STAGE2` / `LEAVING`(沒有 `CANCELLED` / `ERROR`,結束一律回 `IDLE`,看 `error_code`)、錯誤碼沿用下列舊編號(之後再改成 PDF 的)、沒有 `/wheelchair/get_status`、cmd 改成三個 `std_srvs/Trigger` service(取代 `/wheelchair/cmd` topic,沒有 `reset`,`cmd_id` 由 `apriltag_control` 給)。
+介面依 `[service_robot] wheelchair_interface.pdf`(v0.1),差異:`detach` = leaving(不管夾爪,`/wheelchair/attached` 固定發 `false`)、status 的 state 字串為 `IDLE` / `Attaching(STAGE1)` / `Attaching(STAGE2)` / `Detaching`(`control_node.py` 的 `STATUS_STATE`,對應 enum `IDLE` / `STAGE1` / `STAGE2` / `LEAVING`;log 與 service response 仍用 enum 名稱;沒有 `CANCELLED` / `ERROR`,結束一律回 `IDLE`,看 `error_code` / `error_msg`)、錯誤碼沿用下列舊編號(之後再改成 PDF 的)、沒有 `/wheelchair/get_status`、cmd 改成兩個 `std_srvs/SetBool` service(取代 `/wheelchair/cmd` topic,`data:false` = cancel,沒有 `reset`,`cmd_id` 由 `apriltag_control` 給)。
 
-- `/wheelchair/attach`、`/wheelchair/detach`、`/wheelchair/cancel`(`std_srvs/Trigger`):立即回 `success`(接受與否)與 `message` JSON `{"cmd_id": n|null, "msg": "..."}`。attach / detach 只在 `IDLE` 接受,每次接受 `cmd_id` +1(開機後從 1 起算,重啟重算);非 `IDLE` → `success=false`、`[cmd] … rejected …, status unchanged`。cancel 回執行中的 `cmd_id`,`IDLE` 時 `success=false`(`nothing running`)。
-- `/wheelchair/status`(`std_msgs/String` JSON,reliable、transient_local、depth 1,5 Hz):`state`、`cmd_id`(開機後 0)、`attached`(false)、`error_code`、`error_msg`、`stamp`(epoch s),以及除錯欄位 `x_error` / `y_error` / `yaw_error` / `last_frame_age`(未知時 `null`)。cmd 結束 = `IDLE` + 該 `cmd_id`;`error_code` / `error_msg` 與轉到 `IDLE` 在同一個 lock 內寫入。
-- `error_code`:0 OK、1 TAG_LOST、2 AMCL_SERVICE_FAIL(restore 失敗也是)、3 LIDAR_SERVICE_FAIL(保留未用)、4 TIMEOUT、5 ACTION_CANCELED(cancel)、6 OTHER、7 NODE_SHUTDOWN。
+- `/wheelchair/attach`、`/wheelchair/detach`(`std_srvs/SetBool`):立即回 `success`(接受與否)與純文字 `message`(`attach accepted` / `detach accepted`、`cancel requested`、`already ending, result unchanged`、`nothing running`、`rejected: state=… (only accepted in …)`;2026-10-27 起不是 JSON、不帶 `cmd_id`)。`data:true` 只在 `IDLE` 接受,每次接受 `cmd_id` +1(開機後從 1 起算,重啟重算;只出現在 status);非 `IDLE` → `success=false`、`[cmd] … rejected …, status unchanged`。`data:false` 只取消同一個 service 的執行中 cmd(`CANCEL_RULES`:attach → `STAGE1` / `STAGE2`、detach → `LEAVING`),回 `cancel requested`;`IDLE` 時 `success=false`(`nothing running`);另一種 cmd 在跑時 `success=false`、`rejected: state=LEAVING (only accepted in STAGE1, STAGE2)`。
+- `/wheelchair/status`(`std_msgs/String` JSON,reliable、transient_local、depth 1,5 Hz):`state`、`cmd_id`(開機後 0)、`attached`(false)、`error_code`、`error_msg`、`stamp`(epoch s),以及除錯欄位 `x_error` / `y_error` / `yaw_error` / `last_frame_age`(未知時 `null`)。cmd 結束 = `IDLE` + 該 `cmd_id`;`error_code` / `error_msg` 與轉到 `IDLE` 在同一個 lock 內寫入。`error_msg`:執行中 `""`、成功 `Attach succeeded` / `Detach succeeded`(`cmd_flow.py` 的 `SUCCESS_MSG`)、取消 `Cancelled cmd_id=n. elapsed=…s`、失敗為原因。
+- `error_code`:0 OK(成功或 `data:false` 取消,以 `error_msg` 是否以 `Cancelled` 開頭區分)、1 TAG_LOST、2 AMCL_SERVICE_FAIL(restore 失敗也是,取消後 restore 失敗亦同)、3 LIDAR_SERVICE_FAIL(保留未用)、4 TIMEOUT、5 OTHER、6 NODE_SHUTDOWN(2026-10-27 起;之前 5 是 ACTION_CANCELED、6 OTHER、7 NODE_SHUTDOWN)。
 - `/wheelchair/attached`(`std_msgs/Bool`,transient_local,5 Hz):固定 `false`。
 - `/g7_body/simple_ui/body_status`(`std_msgs/Int32`,reliable、transient_local、depth 1,參數 `body_status_topic`;絕對路徑,不在 `wheelchair` namespace):只在 state 改變時發一次,進 `STAGE1` → `1`、進 `LEAVING` → `2`、回 `IDLE` → `0`(成功或失敗都一樣);進 `STAGE2` 與開機時不發。
 
@@ -336,6 +336,27 @@ ros2 run rqt_image_view rqt_image_view /wheelchair/apriltag/marked_image
 - CLI(`auto_start:=false`):`ros2 topic list` 無 `/wheelchair/cmd`、三個 service 存在;`IDLE` cancel → `success=False` `nothing running`;attach → `{"cmd_id": 1}`、status `STAGE1 cmd_id 1`;執行中 attach / detach → `success=False` `rejected: state=STAGE1`;cancel → `success=True` `{"cmd_id": 1, "msg": "cancel requested"}`、status `IDLE error_code 5`;之後 cmd_id 依序 2、3、4
 - 工具(改為每個 service 一支、無參數、只印 response 立即結束:`attach.py` / `detach.py` / `cancel.py`):`IDLE` 時 `cancel.py` exit 1;`attach.py` exit 0、status `STAGE1 cmd_id 1`;執行中 `detach.py` exit 1;`cancel.py` exit 0、status `IDLE error_code 5`;`detach.py` exit 0、status `LEAVING cmd_id 2`;多給參數 exit 2;沒有 launch exit 2
 - 未測:cancel 回 `already ending`(時間點難卡);互動版 `x` 鍵(無 `DISPLAY`);實機尚未測(Shane 端 `bridge.yaml` 改 service 橋接)
+
+2026-10-22 `/wheelchair/attach` / `detach` 改為 `std_srvs/SetBool`(`data:true` 開始、`data:false` 只取消同一個 service 的執行中 cmd;刪除 `/wheelchair/cancel` 與 `tools/cancel.py`;工具改為必填 `true|false`)後,在同一 container 內實測(domain 99、`lo`):
+
+- `colcon test --packages-select apriltag`:112 tests,0 failures
+- 虛擬測試 headless:`attach accepted: cmd_id=1`、attach `SUCCEEDED`(Stage 2 elapsed 12.8 s)、`(held)`、detach `Leave reached 1.00m (forward=1.001m)` `SUCCEEDED`、`(restored)`
+- CLI(`auto_start:=false`):`ros2 service list` 只有 `/wheelchair/attach`、`/wheelchair/detach`,type `std_srvs/srv/SetBool`;`IDLE` 時 `attach false` → log `attach false rejected: nothing running`;`attach.py true` exit 0、`STAGE1 cmd_id 1`;`detach.py false` exit 1 `rejected: state=STAGE1 (only accepted in LEAVING)`、status 不變;`attach.py true` exit 1 `(only accepted in IDLE)`;`attach.py false` exit 0 `cancel requested`、`IDLE error_code 5`;`detach.py true` exit 0 `LEAVING cmd_id 2`;`attach.py false` exit 1 `(only accepted in STAGE1, STAGE2)`;`detach.py false` exit 0、`IDLE error_code 5`;沒給參數 / `yes` → exit 2;沒有 launch → exit 2
+- 未測:`data:false` 回 `already ending`;互動版 `x` 鍵(無 `DISPLAY`);實機尚未測(Shane 端 `bridge.yaml` 需改 SetBool、移除 cancel)
+
+2026-10-27 刪除 `error_code` 5 `ACTION_CANCELED`(取消改回 0,`OTHER` 5、`NODE_SHUTDOWN` 6)、status `state` 改發 `Attaching(STAGE1)` / `Attaching(STAGE2)` / `Detaching`(enum 不變)、成功時 `error_msg` 為 `Attach succeeded` / `Detach succeeded` 後,在同一個 container 內實測(domain 99、`lo`):
+
+- `colcon test --packages-select apriltag`:114 tests,0 failures
+- 虛擬測試 headless:status `Attaching(STAGE1)` → `Attaching(STAGE2)` → `Detaching`;`attach cmd_id=1 finished: SUCCEEDED error_code=0 - Attach succeeded`、`(held)`、`detach cmd_id=2 finished: SUCCEEDED error_code=0 - Detach succeeded`、`(restored)`;`*_feedback.csv` state 只有 1/2/3;log 仍為 `[state] STAGE1 -> STAGE2`
+- CLI(`auto_start:=false`):`attach.py true` → `Attaching(STAGE1)`;`attach.py false` → `IDLE` `error_code 0` `error_msg "Cancelled cmd_id=1. elapsed=5.55s"`;`detach.py true` → `Detaching`,完成後 `error_msg "Detach succeeded"`
+- 未測:`detach false` 取消(leave 在送出前已完成)、取消後 restore 失敗回 2 的實際流程(只有 `final_outcome` 單元測試);實機尚未測(Shane 端需改 state 字串、碼值與取消判斷)
+
+2026-10-27 service response `message` 改為純文字(刪除 `reply_json`,不帶 `cmd_id`;sim 改從 status 取 `cmd_id`)後,在同一 container 內實測(domain 99、`lo`):
+
+- `colcon test --packages-select apriltag`:112 tests,0 failures
+- 虛擬測試 headless:`attach accepted.`、`attach cmd_id=1 finished: SUCCEEDED … Attach succeeded`、`(held)`、`detach accepted.`、`detach cmd_id=2 finished: SUCCEEDED … Detach succeeded`、`(restored)`
+- CLI:`attach false`(IDLE)→ `success=False message=nothing running`;`attach true` → `success=True message=attach accepted`;執行中 `detach true` → `rejected: state=STAGE1 (only accepted in IDLE)`、`detach false` → `rejected: state=STAGE1 (only accepted in LEAVING)`;status `Attaching(STAGE1)` `cmd_id 1`;`attach false` → `cancel requested`、status `IDLE` `error_code 0` `Cancelled cmd_id=1. …`
+- 實機尚未測(Shane 端不可再 `json.loads` response)
 
 ## 7. `src/apriltag/README.md` 與實際不一致之處
 

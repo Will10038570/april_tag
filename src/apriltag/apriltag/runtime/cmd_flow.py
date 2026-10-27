@@ -1,4 +1,4 @@
-"""Service reply JSON, status JSON, parameter checks and outcome of the wheelchair interface.
+"""Status JSON, parameter checks and outcome of the wheelchair interface.
 
 Pure helpers (no rclpy), shared by apriltag_control and the tests.
 """
@@ -9,27 +9,23 @@ from typing import Optional, Tuple
 
 from apriltag.runtime.target_flow import ANY_TAG_ID
 
-# /wheelchair/<cmd> std_srvs/Trigger services: attach = dock (Stage 1 + 2), detach = leaving
+# /wheelchair/<cmd> std_srvs/SetBool services (data true = start, false = cancel):
+# attach = dock (Stage 1 + 2), detach = leaving
 ATTACH = 'attach'
 DETACH = 'detach'
-CANCEL = 'cancel'
+# /wheelchair/status error_msg of a succeeded cmd (a cancel also ends with error_code 0, its error_msg starts with 'Cancelled')
+SUCCESS_MSG = {ATTACH: 'Attach succeeded', DETACH: 'Detach succeeded'}
 
 
 class Codes:
     """error_code reported in /wheelchair/status."""
-    OK = 0
+    OK = 0                  # succeeded, or cancelled by attach / detach data=false (see error_msg)
     TAG_LOST = 1            # tag not seen for lost_target_timeout while running
     AMCL_SERVICE_FAIL = 2   # AMCL service missing / no response / wrong state; also when the restore fails
     LIDAR_SERVICE_FAIL = 3  # reserved, not reported yet (lidar safety is fire-and-forget)
     TIMEOUT = 4             # dock_timeout / undock_timeout from cmd accepted until ending
-    ACTION_CANCELED = 5     # cancel service
-    OTHER = 6               # any other failure
-    NODE_SHUTDOWN = 7       # apriltag_control shut down
-
-
-def reply_json(cmd_id: Optional[int], msg: str) -> str:
-    """Trigger response message: the accepted / cancelled cmd_id (None if rejected) and the reason."""
-    return json.dumps({'cmd_id': cmd_id, 'msg': msg})
+    OTHER = 5               # any other failure
+    NODE_SHUTDOWN = 6       # apriltag_control shut down
 
 
 def status_json(state: str, cmd_id: int, error_code: int, error_msg: str, stamp: float,

@@ -6,7 +6,9 @@ from apriltag.control_node import (
     ACTIVE_STATES,
     ALLOWED_TRANSITIONS,
     BODY_STATUS,
+    CANCEL_RULES,
     GOAL_RULES,
+    STATUS_STATE,
     Step,
     TrackingState as S,
     is_goal_accepted,
@@ -20,10 +22,15 @@ EXPECTED = {
     S.LEAVING: {S.IDLE},
 }
 
-# cmd -> states in which it is accepted (stopping is the cancel service)
+# cmd -> states in which it is accepted (stopping is data=false on the same service)
 EXPECTED_GOALS = {
     'attach': {S.IDLE},
     'detach': {S.IDLE},
+}
+# cmd -> states in which data=false cancels it
+EXPECTED_CANCELS = {
+    'attach': {S.STAGE1, S.STAGE2},
+    'detach': {S.LEAVING},
 }
 
 
@@ -68,9 +75,23 @@ def test_is_goal_accepted(action, state):
     assert is_goal_accepted(action, state) == (state in EXPECTED_GOALS[action])
 
 
+def test_cancel_rules_match_design():
+    assert CANCEL_RULES == EXPECTED_CANCELS
+
+
+def test_each_active_state_cancelled_by_one_service():
+    assert not CANCEL_RULES['attach'] & CANCEL_RULES['detach']
+    assert CANCEL_RULES['attach'] | CANCEL_RULES['detach'] == ACTIVE_STATES
+
+
 def test_unknown_cmd_is_rejected():
     assert not is_goal_accepted('start_tracking', S.IDLE)
 
 
 def test_body_status_values():
     assert BODY_STATUS == {S.IDLE: 0, S.STAGE1: 1, S.LEAVING: 2}
+
+
+def test_status_state_values():
+    assert STATUS_STATE == {S.IDLE: 'IDLE', S.STAGE1: 'Attaching(STAGE1)',
+                            S.STAGE2: 'Attaching(STAGE2)', S.LEAVING: 'Detaching'}
