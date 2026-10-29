@@ -16,7 +16,7 @@ services:
     # `docker compose -f docker_compose_UI_off.yml up -d --force-recreate`
     # replaces the GUI container (and vice versa).
     environment:
-      - ROS_DOMAIN_ID=63
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
       - ROS_LOCALHOST_ONLY=0
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - TZ=Asia/Taipei   # local time for logs (tzdata is in the image)
@@ -25,7 +25,7 @@ services:
       # presence_required="false": if enP8p1s0 is down/unplugged, skip it and
       # fall back to loopback instead of failing to create the domain.
       # The interface is chosen once at node startup; re-launch after plugging in.
-      - CYCLONEDDS_URI=<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="enP8p1s0"/></Interfaces></General><Discovery><Peers><Peer address="192.168.6.10"/></Peers><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>50</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>
+      - CYCLONEDDS_URI=<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="${ROS_NETWORK_INTERFACE}"/></Interfaces></General><Discovery><Peers><Peer address="${ROS_PEER_IP}"/></Peers><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>50</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>
     volumes:
       - ..:/mnt/work_space
       - /dev:/dev

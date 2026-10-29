@@ -20,7 +20,7 @@ services:
     environment:
       - DISPLAY=${DISPLAY}
       - XAUTHORITY=/tmp/.docker.xauth
-      - ROS_DOMAIN_ID=63
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
       - ROS_LOCALHOST_ONLY=0
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - TZ=Asia/Taipei   # local time for logs (tzdata is in the image)
