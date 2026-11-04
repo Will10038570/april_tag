@@ -13,6 +13,7 @@
 |---|---|
 | Image | `ros2_april_tag:v1`(base `ros:humble-ros-base`) |
 | Container | `april_tag_serive`(拼字照 compose 設定,不是 service) |
+| Compose 設定檔 | `docker/.ros2_setup`(ROS 參數)。compose 指令一律在 `docker/` 目錄執行並加 `--env-file .ros2_setup`,否則報 `required variable … is missing a value` |
 | Workspace 掛載 | host `Will/work_space` → container `/mnt/work_space` |
 | 網路 | `network_mode: host`、`ipc: host`、`privileged: true`(RealSense 走 `/dev`) |
 | `ROS_DOMAIN_ID` | `63`(與機器人相同) |
@@ -31,8 +32,8 @@ Container 的 entrypoint 與 `.bashrc` 會自動 source `/opt/ros/humble/setup.b
 ```bash
 # 第一次建立(或 Dockerfile 有改)
 cd /home/cobo/Desktop/Will/work_space/docker
-docker compose build
-docker compose up -d
+docker compose --env-file .ros2_setup build
+docker compose --env-file .ros2_setup up -d
 
 # 已建立過,只是停掉了
 docker start april_tag_serive
@@ -42,16 +43,16 @@ docker exec -it april_tag_serive bash
 ```
 
 GUI(dashboard、`rqt_image_view`)需要在 host 的圖形桌面 session 裡啟動 container,`$DISPLAY` / `$XAUTHORITY` 才會帶進去;必要時先在 host 執行 `xhost +local:docker`。
-若 container 不是在桌面 session 建立的(container 內 `echo $DISPLAY` 為空,`/tmp/.docker.xauth` 變成空目錄),不重建的做法:host 執行 `xhost +local:docker`,再 `docker exec -it -e DISPLAY=:1 april_tag_serive bash`,container 內 `unset XAUTHORITY` 後啟動 GUI;永久修正則在桌面 session 執行 `docker compose up -d --force-recreate`。
+若 container 不是在桌面 session 建立的(container 內 `echo $DISPLAY` 為空,`/tmp/.docker.xauth` 變成空目錄),不重建的做法:host 執行 `xhost +local:docker`,再 `docker exec -it -e DISPLAY=:1 april_tag_serive bash`,container 內 `unset XAUTHORITY` 後啟動 GUI;永久修正則在桌面 session 執行 `docker compose --env-file .ros2_setup up -d --force-recreate`。
 
 **透過 SSH(無圖形桌面)** 時改用無 GUI 版 `docker/docker_compose_UI_off.yml`(移除 `DISPLAY`/`XAUTHORITY` 與 X11 mount,其餘設定相同)。它與 `docker-compose.yml` 同 project / service / container 名稱,所以會直接取代現有 container:
 
 ```bash
 cd /home/cobo/Desktop/Will/work_space/docker
-docker compose -f docker_compose_UI_off.yml up -d --force-recreate   # Dockerfile 有改時加 --build
+docker compose --env-file .ros2_setup -f docker_compose_UI_off.yml up -d --force-recreate   # Dockerfile 有改時加 --build
 ```
 
-這個 container 內 dashboard / `rqt_image_view` 無法使用,虛擬測試請用 `headless:=true`;之後要切回 GUI 版,在桌面 session 執行 `docker compose up -d --force-recreate`。
+這個 container 內 dashboard / `rqt_image_view` 無法使用,虛擬測試請用 `headless:=true`;之後要切回 GUI 版,在桌面 session 執行 `docker compose --env-file .ros2_setup up -d --force-recreate`。
 
 搬到別台機器的方式見 `Will/docker_copy_guide.txt`(Jetson 是 ARM,`docker save` 的 image 不能用在 x86)。
 
@@ -242,7 +243,7 @@ ros2 run rqt_image_view rqt_image_view /wheelchair/apriltag/marked_image
 | 現象 | 原因 / 處理 |
 |---|---|
 | `rmw_create_node: failed to create domain` / `rcl node's rmw handle is invalid` | `CYCLONEDDS_URI` 綁的 `enP8p1s0` 是 DOWN 或不存在(網路線沒插)。接上網路線,或照 3.2 把 `CYCLONEDDS_URI` 改成 `lo` |
-| `ddsi_udp_conn_write to udp/192.168.6.10:… failed with retcode -3`,且 `ros2 node list` 看不到機器人(ping 卻通) | `CYCLONEDDS_URI` 同時有 `enP8p1s0` 與 `lo`(或 peer 有 `127.0.0.1`),從 `lo` socket 送往外部位址被 kernel 拒絕。只留 `enP8p1s0`(見第 1 節),改 compose 後 `docker compose up -d --force-recreate` |
+| `ddsi_udp_conn_write to udp/192.168.6.10:… failed with retcode -3`,且 `ros2 node list` 看不到機器人(ping 卻通) | `CYCLONEDDS_URI` 同時有 `enP8p1s0` 與 `lo`(或 peer 有 `127.0.0.1`),從 `lo` socket 送往外部位址被 kernel 拒絕。只留 `enP8p1s0`(見第 1 節),改 compose 後 `docker compose --env-file .ros2_setup up -d --force-recreate` |
 | `selected interface "lo" is not multicast-capable` | 用 `lo` 時的正常警告,可忽略 |
 | headless 測試結束時 `virtual_tracking_sim` `exit code -11` | 已知:存完 CSV / PNG 後 process 結束時 segfault,不影響測試結果 |
 | `ros2: command not found` | `bash -lc` 不會 source ROS;改用 `bash -ic '…'`、`docker exec -it … bash`,或手動 source |

@@ -16,7 +16,7 @@ services:
     # `docker compose -f docker_compose_UI_off.yml up -d --force-recreate`
     # replaces the GUI container (and vice versa).
     environment:
-      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:?set in .ros2_setup}
       - ROS_LOCALHOST_ONLY=0
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - TZ=Asia/Taipei   # local time for logs (tzdata is in the image)
@@ -25,7 +25,7 @@ services:
       # presence_required="false": if enP8p1s0 is down/unplugged, skip it and
       # fall back to loopback instead of failing to create the domain.
       # The interface is chosen once at node startup; re-launch after plugging in.
-      - CYCLONEDDS_URI=<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="${ROS_NETWORK_INTERFACE}"/></Interfaces></General><Discovery><Peers><Peer address="${ROS_PEER_IP}"/></Peers><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>50</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>
+      - CYCLONEDDS_URI=<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="${ROS_NETWORK_INTERFACE:?set in .ros2_setup}"/></Interfaces></General><Discovery><Peers><Peer address="${ROS_PEER_IP:?set in .ros2_setup}"/></Peers><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>50</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>
     volumes:
       - ..:/mnt/work_space
       - /dev:/dev
@@ -33,15 +33,3 @@ services:
     tty: true
     # PID 1: ros_entrypoint.sh sources ROS + workspace, then exec replaces it with the launch
     command: ros2 launch apriltag april_tag.launch.py
-
-  alloy:
-    image: grafana/alloy:v1.20.1
-    container_name: alloy_container
-    env_file: .env   # Grafana Cloud Loki URL / user / token
-    environment:
-      - TZ=Asia/Taipei
-    volumes:
-      - ./config.alloy:/etc/alloy/config.alloy:ro
-      # root in this container == root on the host daemon; keep it on trusted machines only
-      - /var/run/docker.sock:/var/run/docker.sock
-    restart: unless-stopped

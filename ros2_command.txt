@@ -42,7 +42,9 @@ ros2 action send_goal /up/leave_cs apriltag_interfaces/action/StartTracking "{st
 
 
 #docker
-docker compose -f docker-compose.yml up  -d --force-recreate
+cd /home/cobo/Desktop/Will/work_space/docker
+docker compose --env-file .ros2_setup -f docker-compose.yml build
+docker compose --env-file .ros2_setup -f docker-compose.yml up -d --force-recreate
 
 
 
