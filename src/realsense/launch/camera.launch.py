@@ -59,10 +59,18 @@ def generate_launch_description():
         }],
     )
 
+    static_tf_node = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='realsense_base_link_tf',
+        arguments=['0', '0.274', '0.306', '0', '0', '0', 'base_link', 'camera_link'],
+        output='screen',
+    )
+
     wheelchair_group = GroupAction([
         PushRosNamespace('wheelchair'),
         realsense_driver,
         viewer_node,
     ])
 
-    return LaunchDescription([*stream_args, wheelchair_group])
+    return LaunchDescription([*stream_args, static_tf_node, wheelchair_group])
