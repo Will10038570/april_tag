@@ -1,7 +1,7 @@
 
 #start tracking 
-ros2 action send_goal /up/start_tracking apriltag_interfaces/action/StartTracking "{start: true}"
-ros2 action send_goal /up/leave_cs apriltag_interfaces/action/StartTracking "{start: true}"
+ros2 service call /wheelchair/attach std_srvs/srv/SetBool "{data: true}"
+ros2 service call /wheelchair/detach std_srvs/srv/SetBool "{data: true}"
 #-------------------------------------------------------
  source /mnt/work_space/install/setup.bash
 
@@ -58,8 +58,9 @@ docker compose --env-file .ros2_setup -f docker-compose.yml up -d --force-recrea
 
 source /opt/ros/humble/setup.bash
 cd /mnt/work_space
-colcon build --packages-select apriltag
+colcon build --symlink-install --packages-select apriltag
 
+colcon build --symlink-install
 
 #network setting 
 sudo ip addr flush dev enp3s0

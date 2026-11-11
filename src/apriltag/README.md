@@ -214,6 +214,54 @@ Run the controller demo module without ROS:
 python -m apriltag.control
 ```
 
+## Calibration
+
+`apriltag_control` can target an exact tag pose recorded from the real camera at the desired docking / leaving position, instead of the fixed default distances. This corrects for camera mounting offsets (lateral and yaw) and makes docking more repeatable across robot restarts.
+
+### Saving Reference Points
+
+Place the robot at the desired position with the tag visible, then run `calibrate.py` for that stage. Only `apriltag_detection` (and the camera) need to be running; `apriltag_control` does not.
+
+```bash
+# Stage 1 (approach) — robot at ~50 cm from the tag, laterally centred
+docker exec -it april_tag_serive bash -ic '
+  python3 /mnt/work_space/src/apriltag/tools/calibrate.py --stage1'
+
+# Stage 2 (final dock) — robot at ~28 cm
+docker exec -it april_tag_serive bash -ic '
+  python3 /mnt/work_space/src/apriltag/tools/calibrate.py --stage2'
+
+# Detach (leave end position) — robot backed up to ~1 m
+docker exec -it april_tag_serive bash -ic '
+  python3 /mnt/work_space/src/apriltag/tools/calibrate.py --detach'
+```
+
+Each command saves the tracked tag's `z_ref` (forward distance, m), `x_ref` (optical lateral, m) and `yaw_ref` (rad) to `/mnt/work_space/calibration.json` (default; override with `--file PATH`) and writes an annotated PNG (`calibration_stage1.png` / `calibration_stage2.png` / `calibration_detach.png`) in the same directory, overwriting any previous one.
+
+Stages can be calibrated independently. A stage absent from the JSON falls back to the default distance (`stage1_distance`, `stage2_distance`, or `leave_distance`) with zero lateral / yaw offset.
+
+### Enabling Calibration
+
+The default `april_tag.launch.py` defaults to `use_calibration:=true` and `calibration_file:=/mnt/work_space/calibration.json`. Calibration is active automatically once the JSON exists:
+
+```bash
+ros2 launch apriltag april_tag.launch.py manage_amcl_and_lidar_safety:=true
+```
+
+To temporarily disable calibration without editing the launch file:
+
+```bash
+ros2 launch apriltag april_tag.launch.py manage_amcl_and_lidar_safety:=true use_calibration:=false
+```
+
+The startup log shows what was loaded and what each stage uses:
+
+```
+[calibration] loaded from '.../calibration.json': ['stage1', 'stage2', 'detach']
+# at each stage start:
+[calibration] STAGE1: z_ref=0.5020m x_ref=0.0140m yaw_ref=0.0030rad
+```
+
 ## Virtual End-to-End Test
 
 `tools/virtual_tracking_sim.py` replaces the RealSense camera and the AMR with a simulation, so the real `apriltag_detection` and `apriltag_control` run unmodified: a virtual tag36h11 tag stands at the world origin, a virtual holonomic AMR integrates `/cmd_vel` and `/pre_cmd_vel`, and a synthetic camera image of the tag is rendered from their relative pose and published on `wheelchair/camera/camera/color/image_raw` + `camera_info`.
@@ -378,6 +426,8 @@ ROS parameters of `apriltag_control`:
 | `stage1_cmd_vel_topic` | `/cmd_vel` (Stage 1 velocity commands) |
 | `stage2_cmd_vel_topic` | `/pre_cmd_vel` (Stage 2 and leaving velocity commands, G7+ precision mode) |
 | `external_service_timeout` | `5.0` s (wait for service + wait for response, each) |
+| `use_calibration` | `false` (launch default `true`; `false`: ignore `calibration_file`, behaviour unchanged) |
+| `calibration_file` | `''` (launch default `/mnt/work_space/calibration.json`; path to calibration JSON; only read when `use_calibration=true`) |
 
 ## Project Structure
 

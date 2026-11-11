@@ -48,6 +48,14 @@ def generate_launch_description():
     tag_sizes_arg = DeclareLaunchArgument(
         'tag_sizes', default_value='',
         description="per-id tag sizes 'id:size ...' (m), e.g. '3:0.095'; other ids use tag_size")
+    use_calibration_arg = DeclareLaunchArgument(
+        'use_calibration', default_value='true',
+        description='true: load calibration_file and use recorded poses as control reference; '
+                    'false: ignore calibration file, identical to pre-calibration behaviour')
+    calibration_file_arg = DeclareLaunchArgument(
+        'calibration_file', default_value='/mnt/work_space/calibration.json',
+        description='path to calibration JSON (stage1 / stage2 / detach reference poses); '
+                    'only read when use_calibration=true')
 
     camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -109,6 +117,9 @@ def generate_launch_description():
             # velocity topics: Stage 1 normal, Stage 2 and leaving G7+ precision mode
             'stage1_cmd_vel_topic': '/cmd_vel',
             'stage2_cmd_vel_topic': '/pre_cmd_vel',
+            # calibration: recorded tag poses as control reference per stage
+            'use_calibration': ParameterValue(LaunchConfiguration('use_calibration'), value_type=bool),
+            'calibration_file': ParameterValue(LaunchConfiguration('calibration_file'), value_type=str),
         }],
     )
 
@@ -123,6 +134,8 @@ def generate_launch_description():
         lost_target_timeout_arg,
         tag_size_arg,
         tag_sizes_arg,
+        use_calibration_arg,
+        calibration_file_arg,
         # '[INFO] [wheelchair.apriltag_detection]: ...' (apriltag_control: see CONTROL_LOG_ENV)
         SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT', LOG_FORMAT),
         camera,

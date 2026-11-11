@@ -41,6 +41,7 @@ from apriltag.runtime.safety_guard import handle_target_lost
 from apriltag.runtime.target_flow import ANY_TAG_ID, tag_matches
 from apriltag.runtime.yaw_probe import YawProbe, YawProbeConfig
 from apriltag.yaw_estimator import YawEstimator, YawEstimatorConfig
+from apriltag.domain.calibration import CalibrationPoint, load_calibration
 
 # high-rate messages (cmd_vel, status) are logged at most once per this period
 LOG_THROTTLE_SEC = 1.0
@@ -318,6 +319,23 @@ class AprilTagControlNode(Node):
         self._goal_tag_family = tag_family
         self._goal_tag_id = tag_id_filter(tag_id)
         self._goal_leave_distance = leave_distance
+        # calibration reference points (loaded at startup if use_calibration=true)
+        self.use_calibration = bool(self.declare_parameter('use_calibration', False).value)
+        _calibration_file = str(self.declare_parameter('calibration_file', '').value)
+        self._cal_stage1: Optional[CalibrationPoint] = None
+        self._cal_stage2: Optional[CalibrationPoint] = None
+        self._cal_detach: Optional[CalibrationPoint] = None
+        self._active_x_ref: float = self.camera_y_offset   # replaced per-stage at RUNNING start
+        self._active_yaw_ref: float = 0.0
+        if self.use_calibration:
+            if _calibration_file:
+                self._load_calibration_file(_calibration_file)
+            else:
+                self.get_logger().warn(
+                    self._stage() + '[calibration] use_calibration=true but calibration_file is empty; using defaults.')
+        elif _calibration_file:
+            self.get_logger().info(
+                self._stage() + f'[calibration] use_calibration=false; {_calibration_file!r} ignored.')
         # the running cmd, set in _cmd_callback under _control_lock: cmd
         # (ATTACH / DETACH) and deadline (monotonic)
         self._goal_action: Optional[str] = None
@@ -414,6 +432,27 @@ class AprilTagControlNode(Node):
         """
         return f'[stage {self._state.value}] : '
 
+    def _load_calibration_file(self, path: str) -> None:
+        """Load calibration JSON and populate per-stage CalibrationPoints."""
+        try:
+            data = load_calibration(path)
+        except Exception as exc:
+            self.get_logger().error(
+                self._stage() + f'[calibration] Failed to load {path!r}: {exc}. Using defaults.')
+            return
+        self._cal_stage1 = data.get('stage1')
+        self._cal_stage2 = data.get('stage2')
+        self._cal_detach = data.get('detach')
+        loaded = [k for k, v in data.items() if v is not None]
+        missing = [k for k, v in data.items() if v is None]
+        if loaded:
+            self.get_logger().info(
+                self._stage() + f'[calibration] loaded from {path!r}: {loaded}'
+                + (f'; no calibration for: {missing}' if missing else ''))
+        else:
+            self.get_logger().warn(
+                self._stage() + f'[calibration] {path!r} exists but no valid stages found. Using defaults.')
+
     def _transition_locked(self, new: TrackingState, step: Optional[Step], reason: str) -> bool:
         """Change state (and its step) if allowed; the caller must hold _control_lock."""
         old = self._state
@@ -442,6 +481,8 @@ class AprilTagControlNode(Node):
     def _reset_control_locked(self, desired_distance: float) -> None:
         """Reset the controller for a new tracking phase; the caller must hold _control_lock."""
         self.desired_distance = desired_distance
+        self._active_x_ref = self.camera_y_offset   # restored to default; overridden below if calibrated
+        self._active_yaw_ref = 0.0
         self._error_zero_since = None
         self._last_stamp = None
         self._last_target_time = None
@@ -453,6 +494,21 @@ class AprilTagControlNode(Node):
         """PREPARING -> RUNNING with a fresh controller; the caller must hold _control_lock."""
         # _last_target_time is reset too, so the watchdog starts counting now
         self._reset_control_locked(desired_distance)
+        if self.use_calibration:
+            _CAL = {S.STAGE1: self._cal_stage1, S.STAGE2: self._cal_stage2,
+                    S.LEAVING: self._cal_detach}
+            _cal = _CAL.get(self._state)
+            if _cal is not None:
+                self.desired_distance = _cal.z_ref
+                self._active_x_ref = _cal.x_ref
+                self._active_yaw_ref = _cal.yaw_ref
+                self.get_logger().info(
+                    self._stage() + f'[calibration] {self._state.value}: '
+                    f'z_ref={_cal.z_ref:.4f}m x_ref={_cal.x_ref:.4f}m yaw_ref={_cal.yaw_ref:.4f}rad')
+            else:
+                self.get_logger().info(
+                    self._stage() + f'[calibration] {self._state.value}: no calibration, '
+                    f'using defaults (desired_distance={self.desired_distance:.4f}m)')
         self._set_step_locked(Step.RUNNING, reason)
 
     def _is_running_locked(self) -> bool:
@@ -931,7 +987,7 @@ class AprilTagControlNode(Node):
         q = tag.pose.orientation
         t_vec = np.array([p.x, p.y, p.z], dtype=float)
         r_mat = quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w)
-        state = optical_to_control_error(t_vec, self.desired_distance, r_mat, self.camera_y_offset)
+        state = optical_to_control_error(t_vec, self.desired_distance, r_mat, self._active_x_ref)
         self._last_target_time = now
 
         if tracking_state is S.LEAVING:
@@ -952,10 +1008,12 @@ class AprilTagControlNode(Node):
             tag_size=tag_size_for(tag.id, self.tag_sizes, self.tag_size),
             wz_cmd=self._last_wz_cmd, dt=dt)
         x_f = est.x_f - self.desired_distance
+        yaw_f_cal = est.yaw_f - self._active_yaw_ref
+        yaw_abs_cal = abs(est.yaw_abs_f - abs(self._active_yaw_ref))
         best_target = {
             'x_error': x_f,
             'y_error': est.y_f,
-            'yaw_error': est.yaw_f,
+            'yaw_error': yaw_f_cal,
         }
         self._latest_best_target = best_target
 
@@ -1004,7 +1062,7 @@ class AprilTagControlNode(Node):
         done_target = {
             'x_error': x_f,
             'y_error': est.y_f,
-            'yaw_error': est.yaw_abs_f,
+            'yaw_error': yaw_abs_cal,
         }
         if not self._error_is_zero(done_target):
             self._error_zero_since = None

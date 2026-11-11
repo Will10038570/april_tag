@@ -177,6 +177,11 @@ docker exec april_tag_serive bash -ic '
 docker exec -it april_tag_serive bash -ic '
   ros2 launch apriltag april_tag.launch.py manage_amcl_and_lidar_safety:=true'
 # 偵測多個 family / 改追蹤 tag / 改後退距離 / 改 timeout:detect_tag_families:="tag36h11 tag25h9" tracking_tag_family:=tag36h11 tracking_tag_id:=0 leave_distance:=1.0 dock_timeout:=300.0 undock_timeout:=300.0 lost_target_timeout:=1.0
+# 校正定點(預設 use_calibration:=true,讀 /mnt/work_space/calibration.json);關閉:use_calibration:=false;換檔:calibration_file:=/path/to/calibration.json
+
+# 校正定點存檔(擺好位置後執行,只需 detection + camera):
+# docker exec -it april_tag_serive bash -ic 'python3 /mnt/work_space/src/apriltag/tools/calibrate.py --stage1'
+# --stage1 / --stage2 / --detach;可加 --file PATH(預設 /mnt/work_space/calibration.json)
 
 # 終端 2:看狀態
 docker exec -it april_tag_serive bash -ic 'ros2 topic echo /wheelchair/status'
