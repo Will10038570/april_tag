@@ -363,6 +363,8 @@ ROS parameters of `apriltag_control`:
 |---|---|
 | `stage1_distance` | `0.50` m (Stage 1 target distance to the tag) |
 | `stage2_distance` | `0.28` m (Stage 2, final target distance to the tag) |
+| `s4_distances` | `[0.3, 0.5, 0.7]` m (yaw precision table: equivalent-distance breakpoints; beyond the last distance yaw is not used; must have the same length as `s4_sigmas_deg`) |
+| `s4_sigmas_deg` | `[1.0, 2.0, 3.0]` deg (yaw precision table: sigma at each breakpoint; same length as `s4_distances`) |
 | `tracking_tag_family` / `tracking_tag_id` | `tag36h11` / `0` (tag checked on `tag_tracing`; must match apriltag_detection's) |
 | `leave_distance` | `1.0` m (detach back-up distance; must be > 0) |
 | `dock_timeout` / `undock_timeout` | `300.0` s (attach / detach timeout; must be > 0) |

@@ -95,6 +95,10 @@ def generate_launch_description():
             # two-stage target distances from camera to tag (m)
             'stage1_distance': 0.50,
             'stage2_distance': 0.28,
+            # yaw precision table: equivalent-distance breakpoints (m) and sigma (deg);
+            # beyond the last distance the yaw measurement is not used by the estimator
+            's4_distances':  [0.3, 0.5, 0.7],
+            's4_sigmas_deg': [1.0, 2.0, 3.0],
             # G7+ AMCL services (absolute names, not affected by namespace 'wheelchair')
             'amcl_check_service': '/check_mcl_if_trigger',
             'amcl_close_service': '/close_amcl',
