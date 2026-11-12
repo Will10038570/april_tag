@@ -31,5 +31,6 @@ services:
       - /dev:/dev
     stdin_open: true
     tty: true
+    restart: unless-stopped
     # PID 1: ros_entrypoint.sh sources ROS + workspace, then exec replaces it with the launch
     command: ros2 launch apriltag april_tag.launch.py
