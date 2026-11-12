@@ -6,6 +6,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile
 from sensor_msgs.msg import CameraInfo, Image
 
+from apriltag.domain.config_loader import load_config
 from apriltag.domain.math_utils import parse_tag_sizes, tag_size_for
 from apriltag.perception.tag_perception import (
     build_detector,
@@ -36,6 +37,17 @@ class AprilTagDetectionNode(Node):
     def __init__(self):
         super().__init__('apriltag_detection')
 
+        # Config loading: if config_file is set, params are read from JSON;
+        # otherwise individual ROS params are used (backward compat for
+        # virtual_tracking.launch.py which does not pass config_file).
+        _cfg_file = str(self.declare_parameter('config_file', '').value)
+        _cfg = load_config(_cfg_file) if _cfg_file else None   # raises ValueError → node fails
+
+        def jp(section: str, key: str, ros_name: str, default):
+            if _cfg is not None:
+                return _cfg[section][key]
+            return self.declare_parameter(ros_name, default).value
+
         # Low-latency image QoS: keep last 1.
         self.image_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -44,7 +56,7 @@ class AprilTagDetectionNode(Node):
 
         # AprilTag families to detect, space separated. pupil_apriltags loads
         # only one family per Detector, so each family gets its own detector.
-        families_param = str(self.declare_parameter('tag_families', 'tag36h11').value)
+        families_param = str(jp('detection', 'detect_tag_families', 'tag_families', 'tag36h11'))
         self.tag_families = list(dict.fromkeys(families_param.split()))
         if not self.tag_families:
             raise ValueError('Parameter tag_families is empty; give at least one family, e.g. tag36h11.')
@@ -52,18 +64,18 @@ class AprilTagDetectionNode(Node):
 
         # real black-border side of the tags (m); tag_sizes 'id:size ...'
         # overrides it per id (any family), e.g. '3:0.095'
-        self.tag_size = float(self.declare_parameter('tag_size', 0.0635).value)
+        self.tag_size = float(jp('tag_size', 'tag_size', 'tag_size', 0.0635))
         if self.tag_size <= 0.0:
             raise ValueError('Parameter tag_size must be positive.')
-        self.tag_sizes = parse_tag_sizes(self.declare_parameter('tag_sizes', '').value)
+        self.tag_sizes = parse_tag_sizes(str(jp('tag_size', 'tag_sizes', 'tag_sizes', '')))
 
         # the tag published on tag_tracing: closest one of this family / id
-        self.tracking_tag_family = str(self.declare_parameter('tracking_tag_family', 'tag36h11').value).strip()
+        self.tracking_tag_family = str(jp('detection', 'tracking_tag_family', 'tracking_tag_family', 'tag36h11')).strip()
         if self.tracking_tag_family not in self.tag_families:
             raise ValueError(
                 f"Parameter tracking_tag_family '{self.tracking_tag_family}' is not in "
                 f"tag_families ({' '.join(self.tag_families)}).")
-        tracking_tag_id = int(self.declare_parameter('tracking_tag_id', 0).value)
+        tracking_tag_id = int(jp('detection', 'tracking_tag_id', 'tracking_tag_id', 0))
         if tracking_tag_id < -1:
             raise ValueError('Parameter tracking_tag_id must be >= 0, or -1 for any id.')
         self.tracking_tag_id = tag_id_filter(tracking_tag_id)

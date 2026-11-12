@@ -1,9 +1,11 @@
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -14,48 +16,16 @@ OUTPUT_FORMAT = '{line}'
 # '[INFO] [wheelchair.apriltag_control][stage LEAVING] : ...'
 CONTROL_LOG_ENV = {'RCUTILS_CONSOLE_OUTPUT_FORMAT': '[{severity}] [{name}]{message}'}
 
+# Default config path: install/apriltag/share/apriltag → ../../../../ = workspace root
+_pkg_share = get_package_share_directory('apriltag')
+_DEFAULT_CONFIG = os.path.normpath(
+    os.path.join(_pkg_share, '..', '..', '..', '..', 'april_tag_config.json'))
+
 
 def generate_launch_description():
-    manage_arg = DeclareLaunchArgument(
-        'manage_amcl_and_lidar_safety', default_value='false',
-        description='false: apriltag_control skips AMCL / lidar safety')
-    detect_tag_families_arg = DeclareLaunchArgument(
-        'detect_tag_families', default_value='tag36h11',
-        description='AprilTag families apriltag_detection detects, space separated '
-                    '(pupil_apriltags names, e.g. "tag36h11 tag25h9"); each adds CPU load')
-    tracking_tag_family_arg = DeclareLaunchArgument(
-        'tracking_tag_family', default_value='tag36h11',
-        description='family of the tag apriltag_detection publishes on tag_tracing and '
-                    'apriltag_control tracks; must be one of detect_tag_families')
-    tracking_tag_id_arg = DeclareLaunchArgument(
-        'tracking_tag_id', default_value='0',
-        description='id of the tag published on tag_tracing (closest one) and tracked, -1 = any id')
-    leave_distance_arg = DeclareLaunchArgument(
-        'leave_distance', default_value='1.0',
-        description='detach backs up until the tag is this far ahead of the camera (m), > 0')
-    dock_timeout_arg = DeclareLaunchArgument(
-        'dock_timeout', default_value='300.0',
-        description='attach timeout (s), from cmd accepted until it ends')
-    undock_timeout_arg = DeclareLaunchArgument(
-        'undock_timeout', default_value='300.0',
-        description='detach timeout (s), from cmd accepted until it ends')
-    lost_target_timeout_arg = DeclareLaunchArgument(
-        'lost_target_timeout', default_value='1.0',
-        description='tracked tag not seen for this long (s) while running ends the cmd (TAG_LOST)')
-    tag_size_arg = DeclareLaunchArgument(
-        'tag_size', default_value='0.0635',
-        description='real black-border side of the tags (m)')
-    tag_sizes_arg = DeclareLaunchArgument(
-        'tag_sizes', default_value='',
-        description="per-id tag sizes 'id:size ...' (m), e.g. '3:0.095'; other ids use tag_size")
-    use_calibration_arg = DeclareLaunchArgument(
-        'use_calibration', default_value='true',
-        description='true: load calibration_file and use recorded poses as control reference; '
-                    'false: ignore calibration file, identical to pre-calibration behaviour')
-    calibration_file_arg = DeclareLaunchArgument(
-        'calibration_file', default_value='/mnt/work_space/calibration.json',
-        description='path to calibration JSON (stage1 / stage2 / detach reference poses); '
-                    'only read when use_calibration=true')
+    config_file_arg = DeclareLaunchArgument(
+        'config_file', default_value=_DEFAULT_CONFIG,
+        description='path to april_tag_config.json')
 
     camera = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -72,13 +42,7 @@ def generate_launch_description():
         namespace='wheelchair',
         output='screen',
         output_format=OUTPUT_FORMAT,
-        parameters=[{
-            'tag_families': ParameterValue(LaunchConfiguration('detect_tag_families'), value_type=str),
-            'tracking_tag_family': ParameterValue(LaunchConfiguration('tracking_tag_family'), value_type=str),
-            'tracking_tag_id': ParameterValue(LaunchConfiguration('tracking_tag_id'), value_type=int),
-            'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
-            'tag_sizes': ParameterValue(LaunchConfiguration('tag_sizes'), value_type=str),
-        }],
+        parameters=[{'config_file': LaunchConfiguration('config_file')}],
     )
 
     apriltag_control = Node(
@@ -89,53 +53,11 @@ def generate_launch_description():
         output='screen',
         output_format=OUTPUT_FORMAT,
         additional_env=CONTROL_LOG_ENV,
-        parameters=[{
-            'manage_amcl_and_lidar_safety': ParameterValue(
-                LaunchConfiguration('manage_amcl_and_lidar_safety'), value_type=bool),
-            'tracking_tag_family': ParameterValue(LaunchConfiguration('tracking_tag_family'), value_type=str),
-            'tracking_tag_id': ParameterValue(LaunchConfiguration('tracking_tag_id'), value_type=int),
-            'leave_distance': ParameterValue(LaunchConfiguration('leave_distance'), value_type=float),
-            'dock_timeout': ParameterValue(LaunchConfiguration('dock_timeout'), value_type=float),
-            'undock_timeout': ParameterValue(LaunchConfiguration('undock_timeout'), value_type=float),
-            'lost_target_timeout': ParameterValue(LaunchConfiguration('lost_target_timeout'), value_type=float),
-            'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
-            'tag_sizes': ParameterValue(LaunchConfiguration('tag_sizes'), value_type=str),
-            # two-stage target distances from camera to tag (m)
-            'stage1_distance': 0.50,
-            'stage2_distance': 0.28,
-            # yaw precision table: equivalent-distance breakpoints (m) and sigma (deg);
-            # beyond the last distance the yaw measurement is not used by the estimator
-            's4_distances':  [0.3, 0.5, 0.7],
-            's4_sigmas_deg': [1.0, 2.0, 3.0],
-            # G7+ AMCL services (absolute names, not affected by namespace 'wheelchair')
-            'amcl_check_service': '/check_mcl_if_trigger',
-            'amcl_close_service': '/close_amcl',
-            'amcl_open_service': '/open_amcl',
-            # G7+ PLC lidar safety topic (Bool: true disables the safety field,
-            # false enables it; fire-and-forget like G7+ AutoCharging)
-            'lidar_safety_topic': '/g7_plc/disable_lidar_safety',
-            # velocity topics: Stage 1 normal, Stage 2 and leaving G7+ precision mode
-            'stage1_cmd_vel_topic': '/cmd_vel',
-            'stage2_cmd_vel_topic': '/pre_cmd_vel',
-            # calibration: recorded tag poses as control reference per stage
-            'use_calibration': ParameterValue(LaunchConfiguration('use_calibration'), value_type=bool),
-            'calibration_file': ParameterValue(LaunchConfiguration('calibration_file'), value_type=str),
-        }],
+        parameters=[{'config_file': LaunchConfiguration('config_file')}],
     )
 
     return LaunchDescription([
-        manage_arg,
-        detect_tag_families_arg,
-        tracking_tag_family_arg,
-        tracking_tag_id_arg,
-        leave_distance_arg,
-        dock_timeout_arg,
-        undock_timeout_arg,
-        lost_target_timeout_arg,
-        tag_size_arg,
-        tag_sizes_arg,
-        use_calibration_arg,
-        calibration_file_arg,
+        config_file_arg,
         # '[INFO] [wheelchair.apriltag_detection]: ...' (apriltag_control: see CONTROL_LOG_ENV)
         SetEnvironmentVariable('RCUTILS_CONSOLE_OUTPUT_FORMAT', LOG_FORMAT),
         camera,

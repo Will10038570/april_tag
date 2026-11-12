@@ -10,8 +10,8 @@ Requires apriltag_detection (and camera) to be running.
 apriltag_control does not need to be running.
 
 Saves the tracked tag's z_ref / x_ref / yaw_ref from the current pose to the
-calibration JSON (read-modify-write, only the specified stage is updated) and
-writes an annotated PNG of the detection image alongside the JSON.
+calibration section of april_tag_config.json (read-modify-write, only the
+specified stage is updated) and writes an annotated PNG alongside the JSON.
 
 Exit code: 0 success, 1 no valid tag / save failed, 2 argument error.
 """
@@ -43,8 +43,8 @@ def _parse_args():
     group.add_argument('--stage1', action='store_true', help='Save Stage 1 (approach) reference')
     group.add_argument('--stage2', action='store_true', help='Save Stage 2 (final dock) reference')
     group.add_argument('--detach', action='store_true', help='Save Detach (leave) reference')
-    p.add_argument('--file', default='/mnt/work_space/calibration.json',
-                   help='Calibration JSON file (default: /mnt/work_space/calibration.json)')
+    p.add_argument('--file', default='/mnt/work_space/april_tag_config.json',
+                   help='path to april_tag_config.json (default: /mnt/work_space/april_tag_config.json)')
     args, _ = p.parse_known_args()
     stage = 'stage1' if args.stage1 else ('stage2' if args.stage2 else 'detach')
     return stage, args.file

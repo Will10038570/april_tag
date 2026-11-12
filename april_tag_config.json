@@ -1,0 +1,38 @@
+{
+  "detection": {
+    "detect_tag_families": "tag36h11",
+    "tracking_tag_family": "tag36h11",
+    "tracking_tag_id": 0
+  },
+  "tag_size": {
+    "tag_size": 0.0635,
+    "tag_sizes": ""
+  },
+  "control": {
+    "manage_amcl_and_lidar_safety": false,
+    "stage1_distance": 0.50,
+    "stage2_distance": 0.28,
+    "leave_distance": 1.0,
+    "dock_timeout": 300.0,
+    "undock_timeout": 300.0,
+    "lost_target_timeout": 1.0
+  },
+  "calibration": {
+    "use_calibration": true,
+    "stage1": null,
+    "stage2": null,
+    "detach": null
+  },
+  "yaw_estimator": {
+    "s4_distances": [0.3, 0.5, 0.7],
+    "s4_sigmas_deg": [1.0, 2.0, 3.0]
+  },
+  "ros_interfaces": {
+    "amcl_check_service": "/check_mcl_if_trigger",
+    "amcl_close_service": "/close_amcl",
+    "amcl_open_service": "/open_amcl",
+    "lidar_safety_topic": "/g7_plc/disable_lidar_safety",
+    "stage1_cmd_vel_topic": "/cmd_vel",
+    "stage2_cmd_vel_topic": "/pre_cmd_vel"
+  }
+}

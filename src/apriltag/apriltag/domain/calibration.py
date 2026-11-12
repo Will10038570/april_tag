@@ -5,6 +5,9 @@ the tag pose at the desired docking/leaving position. When use_calibration is
 true, apriltag_control uses z_ref in place of the default stage distance and
 applies x_ref / yaw_ref offsets to the control error so the robot converges to
 the recorded pose rather than a fixed distance + zero lateral / yaw.
+
+Calibration data is stored in the 'calibration' section of april_tag_config.json
+and written there by tools/calibrate.py.
 """
 
 import json
@@ -24,27 +27,17 @@ class CalibrationPoint:
     image_path: Optional[str] = None     # saved PNG path — metadata only
 
 
-def load_calibration(path: str) -> Dict[str, Optional[CalibrationPoint]]:
-    """Load calibration points from a JSON file.
+def load_calibration_from_config(config: dict) -> Dict[str, Optional[CalibrationPoint]]:
+    """Extract calibration points from a loaded april_tag_config dict.
 
     Returns a dict keyed by stage name ('stage1', 'stage2', 'detach'), each
     value either a CalibrationPoint or None (not found / invalid).
-
-    Returns all-None silently when the file does not exist (not an error:
-    the user has not calibrated yet).
-    Raises ValueError when the file exists but cannot be parsed as JSON.
     Per-stage entries with missing / invalid fields are silently set to None.
     """
     result: Dict[str, Optional[CalibrationPoint]] = {s: None for s in _STAGES}
-    if not os.path.exists(path):
-        return result
-    with open(path, 'r') as f:
-        try:
-            data = json.load(f)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f'Cannot parse calibration file {path!r}: {exc}') from exc
+    cal = config.get('calibration', {})
     for stage in _STAGES:
-        entry = data.get(stage)
+        entry = cal.get(stage)
         if not isinstance(entry, dict):
             continue
         try:
@@ -66,9 +59,11 @@ def load_calibration(path: str) -> Dict[str, Optional[CalibrationPoint]]:
 
 
 def save_calibration_point(path: str, stage: str, point: CalibrationPoint) -> None:
-    """Update one stage in a calibration JSON file (read-modify-write).
+    """Update one stage in april_tag_config.json (read-modify-write).
 
-    Creates the file and its parent directories if they do not exist.
+    Reads the full config JSON, updates only config['calibration'][stage],
+    and writes the whole file back. Creates the file and its parent
+    directories if they do not exist.
     Raises ValueError for an unknown stage name.
     """
     if stage not in _STAGES:
@@ -80,7 +75,9 @@ def save_calibration_point(path: str, stage: str, point: CalibrationPoint) -> No
                 data = json.load(f)
             except json.JSONDecodeError:
                 data = {}   # corrupt file: overwrite
-    data[stage] = asdict(point)
+    if not isinstance(data.get('calibration'), dict):
+        data['calibration'] = {'use_calibration': True}
+    data['calibration'][stage] = asdict(point)
     dirpath = os.path.dirname(path)
     if dirpath:
         os.makedirs(dirpath, exist_ok=True)

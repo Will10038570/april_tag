@@ -175,13 +175,15 @@ docker exec april_tag_serive bash -ic '
 ```bash
 # 終端 1:相機 + detection + control(全部在 /wheelchair namespace)
 docker exec -it april_tag_serive bash -ic '
-  ros2 launch apriltag april_tag.launch.py manage_amcl_and_lidar_safety:=true'
-# 偵測多個 family / 改追蹤 tag / 改後退距離 / 改 timeout:detect_tag_families:="tag36h11 tag25h9" tracking_tag_family:=tag36h11 tracking_tag_id:=0 leave_distance:=1.0 dock_timeout:=300.0 undock_timeout:=300.0 lost_target_timeout:=1.0
-# 校正定點(預設 use_calibration:=true,讀 /mnt/work_space/calibration.json);關閉:use_calibration:=false;換檔:calibration_file:=/path/to/calibration.json
+  ros2 launch apriltag april_tag.launch.py'
+# 所有參數統一由 /mnt/work_space/april_tag_config.json 設定(manage_amcl_and_lidar_safety、
+# stage1/2_distance、tracking_tag_*、leave_distance、timeout、tag_size、calibration 等)
+# 若要換設定檔:config_file:=/path/to/april_tag_config.json
+# 每次送 attach / detach service 時 control node 會自動重新讀取 JSON,不需重啟即可套用變更
 
 # 校正定點存檔(擺好位置後執行,只需 detection + camera):
 # docker exec -it april_tag_serive bash -ic 'python3 /mnt/work_space/src/apriltag/tools/calibrate.py --stage1'
-# --stage1 / --stage2 / --detach;可加 --file PATH(預設 /mnt/work_space/calibration.json)
+# --stage1 / --stage2 / --detach;可加 --file PATH(預設 /mnt/work_space/april_tag_config.json)
 
 # 終端 2:看狀態
 docker exec -it april_tag_serive bash -ic 'ros2 topic echo /wheelchair/status'
@@ -209,7 +211,7 @@ docker exec -it april_tag_serive bash -ic 'ros2 service call /wheelchair/attach 
 
 `apriltag_control` 是狀態機:`IDLE → STAGE1 → STAGE2 → IDLE`(`attach`)與 `IDLE → LEAVING → IDLE`(`detach`),每個非 IDLE state 內有 `preparing → running → ending` 三個步驟(詳見 README 的 State Machine)。每個被接受的 attach / detach 在一條 worker thread 跑。AMCL / lidar safety 由各 state 自己切換:`STAGE1` 準備時 enable lidar、關 AMCL;`STAGE2` 準備時 disable lidar;Stage 2 成功只停車就回 `IDLE`(AMCL 維持關、lidar 維持 disabled);`LEAVING` 結束、任何失敗 / cancel / timeout 與 shutdown 都會 enable lidar 並確保 AMCL 打開(不記錄是誰關的)。整個 cmd 有 timeout(`dock_timeout` / `undock_timeout`,預設 300 s,從 cmd 接受算到進入 ending)。
 
-`april_tag.launch.py` 的 `manage_amcl_and_lidar_safety` 預設為 `false`(不動 AMCL / lidar safety);stage 距離寫死在 launch 裡(`stage1_distance=0.50`、`stage2_distance=0.28`),Stage 1 速度發到 `/cmd_vel`,Stage 2 與 leave 發到 `/pre_cmd_vel`(G7+ 精準模式)。leave 不用 planner / LQR:固定發 `vx=-max_vx`(-0.1 m/s)、`vy=wz=0`,直到 camera→tag 前向距離 ≥ `leave_distance` 立即停(不檢查 y / yaw、無 hold)。
+`april_tag.launch.py` 只接受 `config_file` 一個參數;`manage_amcl_and_lidar_safety`、stage 距離(`stage1_distance=0.50`、`stage2_distance=0.28`)等全部由 `april_tag_config.json` 的 `control` 區塊設定(預設 `manage_amcl_and_lidar_safety=false`),Stage 1 速度發到 `/cmd_vel`,Stage 2 與 leave 發到 `/pre_cmd_vel`(G7+ 精準模式)。leave 不用 planner / LQR:固定發 `vx=-max_vx`(-0.1 m/s)、`vy=wz=0`,直到 camera→tag 前向距離 ≥ `leave_distance` 立即停(不檢查 y / yaw、無 hold)。
 
 `apriltag_detection` 啟動後就一直偵測,不受 `apriltag_control` 控制(沒有 enable service)。debug 影像所有 tag 一律畫綠框。每張影像(收到 `camera_info` 之後)發一則 `apriltag_interfaces/msg/TagPoseArray` 到 `/wheelchair/apriltag_poses`,包含 `tag_families`(launch 參數 `detect_tag_families`,以空白分隔,預設 `tag36h11`;每個 family 一個 detector,CPU 隨數量增加)內所有偵測到的 tag(`family`、`id` 字串、`pose`),沒有 tag 時 `tags` 為空;每個 tag 廣播 TF `<camera_frame> → <family>_<id>`(如 `tag36h11_0`)。`/wheelchair/apriltag_poses` 只作參考 / 除錯,control 不訂閱。沒有 cmd 執行時 `apriltag_control` 會忽略 `tag_tracing`。RealSense 相機(`realsense/launch/camera.launch.py`)也在 `wheelchair` namespace:`/wheelchair/camera/camera/color/*`。
 
