@@ -58,28 +58,41 @@ def load_calibration_from_config(config: dict) -> Dict[str, Optional[Calibration
     return result
 
 
+def read_config_dict(path: str) -> dict:
+    """Read april_tag_config.json as a dict, without validating its sections.
+
+    Raises ValueError if the file does not exist, is not valid JSON, or its
+    top level is not a JSON object. Used by tools/calibrate.py before waiting
+    for a tag, and by save_calibration_point before writing.
+    """
+    abspath = os.path.abspath(path)
+    if not os.path.exists(path):
+        raise ValueError(f'Config file not found: {abspath!r}')
+    with open(path, 'r') as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f'Cannot parse {abspath!r}: {exc}') from exc
+    if not isinstance(data, dict):
+        raise ValueError(
+            f'{abspath!r} must contain a JSON object, got {type(data).__name__!r}')
+    return data
+
+
 def save_calibration_point(path: str, stage: str, point: CalibrationPoint) -> None:
     """Update one stage in april_tag_config.json (read-modify-write).
 
     Reads the full config JSON, updates only config['calibration'][stage],
-    and writes the whole file back. Creates the file and its parent
-    directories if they do not exist.
-    Raises ValueError for an unknown stage name.
+    and writes the whole file back.
+    Raises ValueError for an unknown stage name, or (via read_config_dict) when
+    the file does not exist, is not valid JSON or is not a JSON object; the
+    file is not written (nor created) in those cases.
     """
     if stage not in _STAGES:
         raise ValueError(f'Unknown calibration stage {stage!r}; must be one of {_STAGES}')
-    data: dict = {}
-    if os.path.exists(path):
-        with open(path, 'r') as f:
-            try:
-                data = json.load(f)
-            except json.JSONDecodeError:
-                data = {}   # corrupt file: overwrite
+    data = read_config_dict(path)
     if not isinstance(data.get('calibration'), dict):
         data['calibration'] = {'use_calibration': True}
     data['calibration'][stage] = asdict(point)
-    dirpath = os.path.dirname(path)
-    if dirpath:
-        os.makedirs(dirpath, exist_ok=True)
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)

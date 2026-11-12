@@ -1,7 +1,7 @@
 # AprilTag 開發 / 測試指南(Docker)
 
 > **規則:所有程式碼的 build、執行、測試一律在 Docker container 內進行,不要在 host 的 `/opt/ros/humble` 上跑。**
-> Docker 環境定義在 `/home/cobo/Desktop/Will/work_space/docker/`(`Dockerfile`、`docker-compose.yml`、`ros_entrypoint.sh`)。
+> Docker 環境定義在 `/home/cobo/Desktop/april_tag/docker/`(`Dockerfile`、`docker-compose.yml`、`docker_compose_UI_off.yml`、`ros_entrypoint.sh`)。
 
 套件功能、topic / service / cmd・status 介面、控制架構請看 `src/apriltag/README.md`;本文件只說明「怎麼在 Docker 裡跑起來與驗證」。
 
@@ -14,11 +14,11 @@
 | Image | `ros2_april_tag:v1`(base `ros:humble-ros-base`) |
 | Container | `april_tag_serive`(拼字照 compose 設定,不是 service) |
 | Compose 設定檔 | `docker/.ros2_setup`(ROS 參數)。compose 指令一律在 `docker/` 目錄執行並加 `--env-file .ros2_setup`,否則報 `required variable … is missing a value` |
-| Workspace 掛載 | host `Will/work_space` → container `/mnt/work_space` |
+| Workspace 掛載 | host `/home/cobo/Desktop/april_tag`(即 repo 根目錄,compose 的 `..`)→ container `/mnt/work_space` |
 | 網路 | `network_mode: host`、`ipc: host`、`privileged: true`(RealSense 走 `/dev`) |
-| `ROS_DOMAIN_ID` | `63`(與機器人相同) |
+| `ROS_DOMAIN_ID` | 由 `docker/.ros2_setup` 設定,目前 `72`(與機器人相同) |
 | `RMW_IMPLEMENTATION` | `rmw_cyclonedds_cpp` |
-| `CYCLONEDDS_URI` | `docker-compose.yml`(2026-10-07 起):只綁 `lo`,peer `127.0.0.1`(所有 node 都在本機,不再連機器人 192.168.6.10;不需網路線)。`docker_compose_UI_off.yml` 仍綁有線網卡 `enP8p1s0` + peer `192.168.6.10`、`MaxAutoParticipantIndex=50`;**該設定不要再加 `lo`**:多網卡時 Cyclone 會從 `lo` 的 socket 送 unicast 到 192.168.6.10,kernel 拒絕(`ddsi_udp_conn_write … failed with retcode -3`),網路線沒插時 node 會建不起來 |
+| `CYCLONEDDS_URI` | `docker-compose.yml`:只綁 `lo`,peer `127.0.0.1`(所有 node 都在本機,不需網路線)。`docker_compose_UI_off.yml`:綁 `.ros2_setup` 的 `ROS_NETWORK_INTERFACE` + peer `ROS_PEER_IP`(目前 `lan2` / `192.168.5.10`)、`MaxAutoParticipantIndex=50`;**該設定不要再加 `lo`**:多網卡時 Cyclone 會從 `lo` 的 socket 送 unicast 到外部 peer,kernel 拒絕(`ddsi_udp_conn_write … failed with retcode -3`);該網卡不存在 / DOWN 時 node 建不起來(compose 註解提到的 `presence_required="false"` 實際上沒有寫進 URI) |
 | 已安裝 | librealsense2、`pyrealsense2`、`realsense2_camera`、`cv_bridge`、`python3-opencv`、`rqt_image_view`、`rmw_cyclonedds_cpp`、`pupil-apriltags`、`scipy`、`numpy<2` |
 
 `numpy` 必須維持 `<2`:`cv_bridge` 是以 numpy 1.x C-API 編譯的。
@@ -29,13 +29,29 @@ Container 的 entrypoint 與 `.bashrc` 會自動 source `/opt/ros/humble/setup.b
 
 ### 啟動 container
 
+兩個 compose 檔都設定 `restart: unless-stopped` 與 `command: ros2 launch apriltag april_tag.launch.py`:**container 一啟動(含開機自動啟動)就跑實機 launch**(相機 + detection + control,PID 1),停掉 launch 就等於停掉 container。因此:
+
+- workspace 還沒 build(沒有 `install/`)時 launch 會失敗,container 不斷重啟,`docker exec` 進不去。
+- 只想 build / 測試、不想啟動實機 launch 時,用 override 把 command 換掉(2026-11-12 首次建 image 時即用此法):
+
 ```bash
-# 第一次建立(或 Dockerfile 有改)
-cd /home/cobo/Desktop/Will/work_space/docker
+# override 檔(放在 repo 外即可),內容:
+# services:
+#   ros2:
+#     restart: "no"
+#     command: sleep infinity
+docker compose --env-file .ros2_setup -f docker-compose.yml -f /path/to/compose.test.override.yml up -d --force-recreate
+```
+
+測完要回到開機自動 launch:`docker compose --env-file .ros2_setup up -d --force-recreate`(會開始驅動相機與車子)。
+
+```bash
+# 第一次建立(或 Dockerfile 有改;Jetson 上約 5 分鐘)
+cd /home/cobo/Desktop/april_tag/docker
 docker compose --env-file .ros2_setup build
 docker compose --env-file .ros2_setup up -d
 
-# 已建立過,只是停掉了
+# 已建立過,只是停掉了(或 repo 根目錄的 ./apriltag.sh up / down)
 docker start april_tag_serive
 
 # 進入 container
@@ -48,13 +64,13 @@ GUI(dashboard、`rqt_image_view`)需要在 host 的圖形桌面 session 裡啟�
 **透過 SSH(無圖形桌面)** 時改用無 GUI 版 `docker/docker_compose_UI_off.yml`(移除 `DISPLAY`/`XAUTHORITY` 與 X11 mount,其餘設定相同)。它與 `docker-compose.yml` 同 project / service / container 名稱,所以會直接取代現有 container:
 
 ```bash
-cd /home/cobo/Desktop/Will/work_space/docker
+cd /home/cobo/Desktop/april_tag/docker
 docker compose --env-file .ros2_setup -f docker_compose_UI_off.yml up -d --force-recreate   # Dockerfile 有改時加 --build
 ```
 
 這個 container 內 dashboard / `rqt_image_view` 無法使用,虛擬測試請用 `headless:=true`;之後要切回 GUI 版,在桌面 session 執行 `docker compose --env-file .ros2_setup up -d --force-recreate`。
 
-搬到別台機器的方式見 `Will/docker_copy_guide.txt`(Jetson 是 ARM,`docker save` 的 image 不能用在 x86)。
+搬到別台機器時注意 Jetson 是 ARM,`docker save` 的 image 不能用在 x86(原本的 `Will/docker_copy_guide.txt` 已不在本機)。`docker/rebuild_command` 內的路徑仍是舊的 `Will/work_space`,使用前請改成 `/home/cobo/Desktop/april_tag/docker`。
 
 ---
 
@@ -87,10 +103,12 @@ docker exec april_tag_serive bash -ic '
 
 `virtual_tracking.launch.py` 會啟動真正的 `apriltag_detection`、`apriltag_control`,以及取代相機 / AMR / G7+ AMCL 與 lidar safety 的 `virtual_tracking_sim`(全部在 `wheelchair` namespace)。一次 run = sim 呼叫 `/wheelchair/attach` service(`std_srvs/SetBool` `data:true`;response 不帶 `cmd_id`,sim 在被接受後取 status 中第一個大於呼叫前的 `cmd_id`)(Stage 1 → Stage 2 → 回 `IDLE`,AMCL 關、lidar safety disabled)接著呼叫 `/wheelchair/detach`(退到 `leave_distance` 後還原 AMCL / lidar safety);sim 看 `/wheelchair/status` 出現 `IDLE` + 自己的 `cmd_id` 判斷結束。
 
-**安全注意:** `virtual_tracking.launch.py` 的 `domain_id` 預設是 65(機器人在 63,但仍請勿依賴這點),而 `apriltag_control` 會發 `/cmd_vel`、`/pre_cmd_vel`、`/g7_plc/disable_lidar_safety` 並呼叫 AMCL service。跑虛擬測試時:
+**安全注意:** `virtual_tracking.launch.py` 的 `domain_id` 預設是 65(機器人在 `.ros2_setup` 的 `ROS_DOMAIN_ID`,目前 72,但仍請勿依賴這點),而 `apriltag_control` 會發 `/cmd_vel`、`/pre_cmd_vel`、`/g7_plc/disable_lidar_safety` 並呼叫 AMCL service。跑虛擬測試時:
 
 - 拔掉機器人網路線,**或**
 - 改用其他 domain(`domain_id:=99`)並讓 DDS 只走 loopback(見下方指令)。
+
+用 `docker-compose.yml` 建立的 container 本身就在跑實機 launch(domain 72、`lo`),與 domain 99 的測試互不干擾,但清理殘留 process 時不要誤殺它(見本節最後)。
 
 Headless(無視窗,自動依序送 `attach`、`detach`,存檔後結束):
 
@@ -164,13 +182,15 @@ docker exec april_tag_serive bash -ic '
   colcon test --packages-select apriltag && colcon test-result --all'
 ```
 
-`src/apriltag/test/` 內有 `test_state_machine.py`(轉移表、cmd 接受表與取消表)、`test_cmd_flow.py`(status JSON、參數檢查、outcome / error_code)、`test_leave_step.py`、`test_target_flow.py`(`choose_best_target`、`tag_matches`)、`test_yaw_*.py`、`test_tag_size.py`,2026-10-27 共 112 tests。新增的 pytest 請放在 `src/apriltag/test/`,同樣用上面的指令在 container 內執行。
+`src/apriltag/test/` 內有 `test_state_machine.py`(轉移表、cmd 接受表與取消表)、`test_cmd_flow.py`(status JSON、參數檢查、outcome / error_code)、`test_leave_step.py`、`test_target_flow.py`(`choose_best_target`、`tag_matches`)、`test_yaw_*.py`、`test_tag_size.py`、`test_config_loader.py`(`april_tag_config.json` 驗證、calibration 讀寫),2026-11-12 共 142 tests。新增的 pytest 請放在 `src/apriltag/test/`,同樣用上面的指令在 container 內執行。
 
 ---
 
 ## 4. 實機執行
 
-前提:有線網卡 `enP8p1s0` 已接上機器人且為 UP,RealSense 已插上。
+前提:RealSense 已插上;用 `docker-compose.yml` 時機器人端 node 須在本機(DDS 只走 `lo`),用 `docker_compose_UI_off.yml` 時 `ROS_NETWORK_INTERFACE`(目前 `lan2`)須已接上機器人且為 UP。
+
+正常情況下 container 啟動時已自動執行 `april_tag.launch.py`(見第 1 節),不需再開終端 1;下面終端 1 的指令只在 container 是以 `sleep infinity` override 建立時使用,否則會在同一 domain 跑出第二組 node。
 
 ```bash
 # 終端 1:相機 + detection + control(全部在 /wheelchair namespace)
@@ -184,6 +204,7 @@ docker exec -it april_tag_serive bash -ic '
 # 校正定點存檔(擺好位置後執行,只需 detection + camera):
 # docker exec -it april_tag_serive bash -ic 'python3 /mnt/work_space/src/apriltag/tools/calibrate.py --stage1'
 # --stage1 / --stage2 / --detach;可加 --file PATH(預設 /mnt/work_space/april_tag_config.json)
+# --file 必須是已存在且為 JSON object 的檔案,否則立刻 exit 1(不等 tag、不存 PNG、不寫檔)
 
 # 終端 2:看狀態
 docker exec -it april_tag_serive bash -ic 'ros2 topic echo /wheelchair/status'
@@ -249,12 +270,14 @@ ros2 run rqt_image_view rqt_image_view /wheelchair/apriltag/marked_image
 
 | 現象 | 原因 / 處理 |
 |---|---|
-| `rmw_create_node: failed to create domain` / `rcl node's rmw handle is invalid` | `CYCLONEDDS_URI` 綁的 `enP8p1s0` 是 DOWN 或不存在(網路線沒插)。接上網路線,或照 3.2 把 `CYCLONEDDS_URI` 改成 `lo` |
-| `ddsi_udp_conn_write to udp/192.168.6.10:… failed with retcode -3`,且 `ros2 node list` 看不到機器人(ping 卻通) | `CYCLONEDDS_URI` 同時有 `enP8p1s0` 與 `lo`(或 peer 有 `127.0.0.1`),從 `lo` socket 送往外部位址被 kernel 拒絕。只留 `enP8p1s0`(見第 1 節),改 compose 後 `docker compose --env-file .ros2_setup up -d --force-recreate` |
+| `rmw_create_node: failed to create domain` / `rcl node's rmw handle is invalid` | `CYCLONEDDS_URI` 綁的網卡(`docker_compose_UI_off.yml` 的 `ROS_NETWORK_INTERFACE`,目前 `lan2`)是 DOWN 或不存在(網路線沒插)。接上網路線,或照 3.2 把 `CYCLONEDDS_URI` 改成 `lo` |
+| `ddsi_udp_conn_write to udp/<ROS_PEER_IP>:… failed with retcode -3`,且 `ros2 node list` 看不到機器人(ping 卻通) | `CYCLONEDDS_URI` 同時有實體網卡與 `lo`(或 peer 有 `127.0.0.1`),從 `lo` socket 送往外部位址被 kernel 拒絕。只留實體網卡(見第 1 節),改 compose 後 `docker compose --env-file .ros2_setup -f docker_compose_UI_off.yml up -d --force-recreate` |
 | `selected interface "lo" is not multicast-capable` | 用 `lo` 時的正常警告,可忽略 |
 | headless 測試結束時 `virtual_tracking_sim` `exit code -11` | 已知:存完 CSV / PNG 後 process 結束時 segfault,不影響測試結果 |
 | `ros2: command not found` | `bash -lc` 不會 source ROS;改用 `bash -ic '…'`、`docker exec -it … bash`,或手動 source |
-| 改了 code 但行為沒變 | `install/` 是複製的,重新 `colcon build` |
+| 改了 code 但行為沒變 | `install/` 是複製的,重新 `colcon build`;實機 launch 是 container 的 PID 1,build 後要 `docker restart april_tag_serive` 才會載入新 code |
+| container 一直 `Restarting`,`docker exec` 失敗 | 預設 command 是實機 launch,workspace 未 build 或 launch 啟動失敗就會重啟循環;用第 1 節的 `sleep infinity` override 建立後再 build / 除錯 |
+| 寫入 `virtual_tracking_logs/`、`build/`、`install/` 時 `Permission denied`(host) | 這些目錄由 container 內 root 建立;在 container 內操作,或把暫存檔放 container 的 `/tmp` |
 | 虛擬測試結果很亂、goal 被不明 node 處理 | 之前的測試 process 沒清掉,同一 domain 有兩個 `apriltag_control`;見 3.2 的清理指令 |
 | `cv_bridge` import 錯誤 / numpy ABI 錯誤 | container 內 numpy 被升到 2.x;`pip3 install "numpy<2"` 並把修正寫回 Dockerfile |
 | GUI 開不起來(`Can't initialize GTK backend`) | container 內 `DISPLAY` 為空(不是在圖形桌面 session 中建立)或 X server 未授權;見第 1 節的 `-e DISPLAY=:1` 做法 |
@@ -365,6 +388,22 @@ ros2 run rqt_image_view rqt_image_view /wheelchair/apriltag/marked_image
 - 虛擬測試 headless:`attach accepted.`、`attach cmd_id=1 finished: SUCCEEDED … Attach succeeded`、`(held)`、`detach accepted.`、`detach cmd_id=2 finished: SUCCEEDED … Detach succeeded`、`(restored)`
 - CLI:`attach false`(IDLE)→ `success=False message=nothing running`;`attach true` → `success=True message=attach accepted`;執行中 `detach true` → `rejected: state=STAGE1 (only accepted in IDLE)`、`detach false` → `rejected: state=STAGE1 (only accepted in LEAVING)`;status `Attaching(STAGE1)` `cmd_id 1`;`attach false` → `cancel requested`、status `IDLE` `error_code 0` `Cancelled cmd_id=1. …`
 - 實機尚未測(Shane 端不可再 `json.loads` response)
+
+2026-11-12 參數統一改由 `april_tag_config.json`(`config_loader.py`,`april_tag.launch.py` 只剩 `config_file`;attach / detach 被接受時重新讀取)後,在新 build 的 `ros2_april_tag:v1` container 內實測(domain 99、`lo`;workspace 為 host `/home/cobo/Desktop/april_tag`):
+
+- 修正:原本 `_start_cmd` 在檢查 state **前** reload,執行中收到 `data:true` 也會改掉 stage 距離 / tag / `yaw_estimator` 再被拒;改為 `_read_config()`(lock 外讀檔驗證)+ `_apply_config_locked()`(lock 內、確認接受後才套用);非 `IDLE` 以 state 原因拒絕,config 錯誤回 `rejected: Config reload failed: …`
+- `colcon build --symlink-install`:3 packages 成功;`colcon test --packages-select apriltag`:142 tests,0 failures
+- 虛擬測試 headless(不帶 `config_file`,走 ROS 參數 fallback):attach `SUCCEEDED`、`(held)`、`Leave reached 1.00m (forward=1.001m)`、detach `SUCCEEDED`、`(restored)`
+- `april_tag.launch.py --show-args`:自身只有 `config_file`(預設 `/mnt/work_space/april_tag_config.json`),其餘為 include 的 `realsense/camera.launch.py` 參數
+- 單獨啟動 `apriltag_control -p config_file:=<副本>`:`IDLE` attach → `[config] Reloaded`;`STAGE1` 中改 JSON 再 attach → `rejected: state=STAGE1`、無 reload;`stage2_distance: true`、`tag_sizes: 'abc'`、JSON 語法錯誤 → 皆拒絕並印原因;修好後接受
+- `apriltag_detection -p config_file:=…`:正常啟動;`tracking_tag_family: tag25h9` → 啟動即 `ValueError`
+- 未測:calibration 套用在實際對位(`use_calibration=true` 但 config 內 `stage1/2/detach` 皆 `null`)、`tools/calibrate.py` 寫回 JSON 的實際流程(只有單元測試);實機尚未測
+
+2026-11-12 修正 `save_calibration_point` 遇到壞檔會覆蓋整個 `april_tag_config.json`(新增 `calibration.read_config_dict`:檔案不存在 / JSON 錯誤 / 最外層非 object → `ValueError`、不寫不建檔;`calibrate.py` 在 `rclpy.init()` 前先檢查)後,在同一 container 內實測:
+
+- `colcon test --packages-select apriltag`:146 tests,0 failures
+- `calibrate.py --stage1 --file`:不存在 → `ERROR: Config file not found: '/tmp/none.json'`、`{bad` → `ERROR: Cannot parse …`(檔案內容不變)、`[]` → `ERROR: … must contain a JSON object, got 'list'`,皆立刻 exit 1、沒有 `Waiting up to …`、沒有產生檔案或 PNG
+- 未測:合法檔案的實際存檔(container 的實機 detection 在跑,避免寫入;由單元測試涵蓋)
 
 ## 7. `src/apriltag/README.md` 與實際不一致之處
 

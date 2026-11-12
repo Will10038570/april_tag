@@ -25,7 +25,7 @@ services:
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - TZ=Asia/Taipei   # local time for logs (tzdata is in the image)
       # All ROS nodes run on this host, so CycloneDDS is bound to loopback only
-      # (no robot / 192.168.6.10 peer). lo has no MULTICAST flag, so discovery
+      # (no external robot peer). lo has no MULTICAST flag, so discovery
       # uses the unicast peer 127.0.0.1; the "lo is not multicast-capable"
       # warning is expected. Works without any network cable plugged in.
       - CYCLONEDDS_URI=<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="lo"/></Interfaces></General><Discovery><Peers><Peer address="127.0.0.1"/></Peers><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>50</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>

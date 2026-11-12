@@ -236,28 +236,20 @@ docker exec -it april_tag_serive bash -ic '
   python3 /mnt/work_space/src/apriltag/tools/calibrate.py --detach'
 ```
 
-Each command saves the tracked tag's `z_ref` (forward distance, m), `x_ref` (optical lateral, m) and `yaw_ref` (rad) to `/mnt/work_space/calibration.json` (default; override with `--file PATH`) and writes an annotated PNG (`calibration_stage1.png` / `calibration_stage2.png` / `calibration_detach.png`) in the same directory, overwriting any previous one.
+Each command saves the tracked tag's `z_ref` (forward distance, m), `x_ref` (optical lateral, m) and `yaw_ref` (rad) to the `calibration` section of `april_tag_config.json` (default `/mnt/work_space/april_tag_config.json`; override with `--file PATH`; only that stage is updated, other sections are kept) and writes an annotated PNG (`calibration_stage1.png` / `calibration_stage2.png` / `calibration_detach.png`) in the same directory, overwriting any previous one.
+
+`--file` must be an existing file containing a JSON object. If it is missing, not valid JSON or not an object, `calibrate.py` exits 1 at once (before waiting for a tag) and writes nothing.
 
 Stages can be calibrated independently. A stage absent from the JSON falls back to the default distance (`stage1_distance`, `stage2_distance`, or `leave_distance`) with zero lateral / yaw offset.
 
 ### Enabling Calibration
 
-The default `april_tag.launch.py` defaults to `use_calibration:=true` and `calibration_file:=/mnt/work_space/calibration.json`. Calibration is active automatically once the JSON exists:
-
-```bash
-ros2 launch apriltag april_tag.launch.py manage_amcl_and_lidar_safety:=true
-```
-
-To temporarily disable calibration without editing the launch file:
-
-```bash
-ros2 launch apriltag april_tag.launch.py manage_amcl_and_lidar_safety:=true use_calibration:=false
-```
+Calibration is switched by `calibration.use_calibration` in `april_tag_config.json` (currently `true`); `april_tag.launch.py` takes only `config_file` (default `/mnt/work_space/april_tag_config.json`). `apriltag_control` re-reads the JSON each time an attach / detach is accepted, so saved points and `use_calibration` changes apply without a restart. To disable calibration, set `"use_calibration": false`.
 
 The startup log shows what was loaded and what each stage uses:
 
 ```
-[calibration] loaded from '.../calibration.json': ['stage1', 'stage2', 'detach']
+[calibration] loaded: ['stage1', 'stage2', 'detach']
 # at each stage start:
 [calibration] STAGE1: z_ref=0.5020m x_ref=0.0140m yaw_ref=0.0030rad
 ```
@@ -388,46 +380,58 @@ The once-per-second limit is `LOG_THROTTLE_SEC` in `control_node.py`.
 
 ## Configuration
 
-Parameters are hard-coded in `AprilTagDetectionNode.__init__()` (`apriltag/detection_node.py`) and `AprilTagControlNode.__init__()` (`apriltag/control_node.py`). Check the first two against the real robot before running on it:
+### `april_tag_config.json`
 
-| Parameter | Value | Where | Description |
+`april_tag.launch.py` takes only `config_file` (default `/mnt/work_space/april_tag_config.json`, the workspace root) and passes it to `apriltag_detection` and `apriltag_control`. Both nodes read the file at startup; a missing file, invalid JSON or a wrong type / value makes the node exit at startup.
+
+**Reload** — `apriltag_control` re-reads the file each time an attach / detach is accepted in `IDLE`; an invalid file rejects that cmd (`rejected: Config reload failed: …`) and nothing is changed. `apriltag_detection` reads it only at startup. Keys marked *startup only* need a restart (`docker restart april_tag_serive`) to take effect.
+
+| Key | Shipped value | Used by | Reload | Description |
+|---|---|---|---|---|
+| `detection.detect_tag_families` | `tag36h11` | detection | startup only | Families detected, space separated; one `pupil_apriltags` detector per family (one `Detector` only loads one family), CPU grows with each. `tag_size` is shared by all families |
+| `detection.tracking_tag_family` / `tracking_tag_id` | `tag36h11` / `0` | detection, control | detection: startup only; control: each cmd | Tag published on `tag_tracing` (the closest one of this family / id, `-1`: any id) and checked by control. The family must be in `detect_tag_families` and the id ≥ -1. Changing it without restarting detection makes control see a non-matching tag → TAG_LOST |
+| `tag_size.tag_size` | `0.0475` m | detection, control | detection: startup only; control: each cmd | **Edge of the tag's black square (8 × 8 cells, without the white border). Must match the printed tag**; control uses it only for the S4 yaw-precision table |
+| `tag_size.tag_sizes` | `""` | detection, control | as `tag_size` | Per-id sizes `'id:size ...'` (m, any family), e.g. `'3:0.095'`; other ids use `tag_size` |
+| `control.manage_amcl_and_lidar_safety` | `false` | control | each cmd | `false` skips every AMCL and lidar safety call (tracking is never blocked by them) |
+| `control.stage1_distance` / `stage2_distance` | `0.50` / `0.28` m | control | each cmd | Stage 1 / Stage 2 target forward distance to the tag (> 0) |
+| `control.leave_distance` | `1.0` m | control | each cmd | detach backs up until the tag is this far ahead (> 0) |
+| `control.dock_timeout` / `undock_timeout` | `300.0` s | control | each cmd | attach / detach timeout, from cmd accepted until it ends (> 0) |
+| `control.lost_target_timeout` | `1.0` s | control | each cmd | Tracked tag not seen for this long while running → TAG_LOST (> 0) |
+| `calibration.use_calibration` | `true` | control | each cmd | `false`: ignore the calibration points, behaviour unchanged |
+| `calibration.stage1` / `stage2` / `detach` | `null` | control | each cmd | Reference poses written by `tools/calibrate.py` (see [Calibration](#calibration)); `null` / invalid → default distance, zero lateral / yaw offset |
+| `yaw_estimator.s4_distances` | `[0.3, 0.5, 0.7]` m | control | each cmd | Yaw precision table: equivalent-distance breakpoints; beyond the last one yaw is not used. Non-empty, same length as `s4_sigmas_deg` |
+| `yaw_estimator.s4_sigmas_deg` | `[1.0, 2.0, 3.0]` deg | control | each cmd | Yaw precision table: sigma at each breakpoint |
+| `ros_interfaces.amcl_check_service` / `amcl_close_service` / `amcl_open_service` | `/check_mcl_if_trigger` / `/close_amcl` / `/open_amcl` | control | startup only | G7+ AMCL services (absolute names) |
+| `ros_interfaces.lidar_safety_topic` | `/g7_plc/disable_lidar_safety` | control | startup only | G7+ PLC lidar safety (`Bool`, `true` disables the safety field) |
+| `ros_interfaces.stage1_cmd_vel_topic` | `/cmd_vel` | control | startup only | Stage 1 velocity commands |
+| `ros_interfaces.stage2_cmd_vel_topic` | `/pre_cmd_vel` | control | startup only | Stage 2 and leaving velocity commands (G7+ precision mode) |
+
+Without `config_file` (e.g. `virtual_tracking.launch.py`) the nodes fall back to ROS parameters with the same names as the keys above (detection: `tag_families` for `detect_tag_families`). Code defaults then differ from the shipped JSON: `tag_size` `0.0635`, `manage_amcl_and_lidar_safety` `true`, `use_calibration` `false` (no calibration points).
+
+### ROS parameters not in the JSON (`apriltag_control`)
+
+| Parameter | Default |
+|---|---|
+| `config_file` | `''` (`april_tag.launch.py` passes `/mnt/work_space/april_tag_config.json`) |
+| `body_status_topic` | `/g7_body/simple_ui/body_status` |
+| `external_service_timeout` | `5.0` s (wait for service + wait for response, each) |
+| yaw estimator / S3 probe tuning (`quality_border_px`, `ref_tag_size`, `yaw_*`, `probe_*`, …) | see `AprilTagControlNode.__init__()`; `ref_tag_size` (`0.0475`) is the base size of the S4 table, change only when the table is recalibrated |
+
+### Hard-coded values (`apriltag_control`)
+
+Check `camera_y_offset` against the real robot before running on it.
+
+| Value | Setting | Where | Description |
 |---|---|---|---|
-| `tag_size` | `0.0635` m | `detection_node.py` | **Edge of the tag's black square (8 × 8 cells, without the white border). Must match the printed tag** |
-| `camera_y_offset` | `0.026` m (= `0.036` mount + `y_offset` `-0.01` trim) | `control_node.py` | Camera lateral offset from the robot centre line, + = left |
-| `tag_families` | `tag36h11` (ROS parameter, launch arg `detect_tag_families:=`) | `detection_node.py` | Families detected, space separated; one `pupil_apriltags` detector per family (one `Detector` only loads one family). `tag_size` is shared by all families |
-| `tracking_tag_family` / `tracking_tag_id` | `tag36h11` / `0` (ROS parameters, same launch args) | `detection_node.py` | Tag published on `tag_tracing`: the closest one of this family / id (`-1`: any id). The family must be in `tag_families` and the id ≥ -1, else the node exits at startup |
+| `camera_y_offset` | `0.026` m (= `0.036` mount + `y_offset` `-0.01` trim) | `control_node.py` | Camera lateral offset from the robot centre line, + = left; default lateral reference when not calibrated |
 | `stop_x/y/yaw_error_tolerance` | `0.05` m / `0.05` m / `0.05` rad | `control_node.py` | A stage is aligned when all errors stay within these |
 | `stop_hold_seconds` | `1.0` s | `control_node.py` | ... for this long |
-| `max_vx`, `max_vy` | `0.5` m/s | `control_node.py` | Linear velocity saturation |
-| `max_vw` | `0.5` rad/s | `control_node.py` | Angular velocity saturation |
+| `max_vx`, `max_vy` | `0.1` m/s | `control_node.py` | Linear velocity saturation; leave backs up at `-max_vx` |
+| `max_vw` | `0.05` rad/s | `control_node.py` | Angular velocity saturation |
 | `max_dt` | `0.2` s | `control_node.py` | Timestep cap (handles frame drops) |
 | `smooth_tau` | `0.5` s | `control_node.py` (`TrajectoryPlanner`) | Reference smoothing time constant |
 | LQR Q weights | `(1.0, 1.0, 0.5)` | `control.py` default | State cost: x, y, yaw |
 | LQR R weights | `(3.0, 1.0, 3.0)` | `control_node.py` | Control cost: vx, vy, vw (vy is penalised least, so lateral correction is fastest) |
-
-ROS parameters of `apriltag_control`:
-
-| Parameter | Default |
-|---|---|
-| `stage1_distance` | `0.50` m (Stage 1 target distance to the tag) |
-| `stage2_distance` | `0.28` m (Stage 2, final target distance to the tag) |
-| `s4_distances` | `[0.3, 0.5, 0.7]` m (yaw precision table: equivalent-distance breakpoints; beyond the last distance yaw is not used; must have the same length as `s4_sigmas_deg`) |
-| `s4_sigmas_deg` | `[1.0, 2.0, 3.0]` deg (yaw precision table: sigma at each breakpoint; same length as `s4_distances`) |
-| `tracking_tag_family` / `tracking_tag_id` | `tag36h11` / `0` (tag checked on `tag_tracing`; must match apriltag_detection's) |
-| `leave_distance` | `1.0` m (detach back-up distance; must be > 0) |
-| `dock_timeout` / `undock_timeout` | `300.0` s (attach / detach timeout; must be > 0) |
-| `lost_target_timeout` | `1.0` s (tracked tag not seen for this long while running → TAG_LOST; must be > 0) |
-| `manage_amcl_and_lidar_safety` | `true` (`false` skips every AMCL and lidar safety call; tracking is never blocked by them) |
-| `amcl_check_service` | `/check_mcl_if_trigger` |
-| `amcl_close_service` | `/close_amcl` |
-| `amcl_open_service` | `/open_amcl` |
-| `lidar_safety_topic` | `/g7_plc/disable_lidar_safety` |
-| `body_status_topic` | `/g7_body/simple_ui/body_status` |
-| `stage1_cmd_vel_topic` | `/cmd_vel` (Stage 1 velocity commands) |
-| `stage2_cmd_vel_topic` | `/pre_cmd_vel` (Stage 2 and leaving velocity commands, G7+ precision mode) |
-| `external_service_timeout` | `5.0` s (wait for service + wait for response, each) |
-| `use_calibration` | `false` (launch default `true`; `false`: ignore `calibration_file`, behaviour unchanged) |
-| `calibration_file` | `''` (launch default `/mnt/work_space/calibration.json`; path to calibration JSON; only read when `use_calibration=true`) |
 
 ## Project Structure
 

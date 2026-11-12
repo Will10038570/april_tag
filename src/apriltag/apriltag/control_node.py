@@ -451,36 +451,43 @@ class AprilTagControlNode(Node):
         """
         return f'[stage {self._state.value}] : '
 
-    def _reload_config(self) -> None:
-        """Re-read april_tag_config.json and update reloadable parameters.
+    def _read_config(self) -> Optional[dict]:
+        """Re-read and fully validate april_tag_config.json for a new cmd.
 
-        Called at the start of _start_cmd() while the node is IDLE, so
-        tracing_callback is dormant and no lock is needed for instance vars.
-        Raises ValueError on any config error; the caller rejects the service call.
+        Only reads; nothing on the node is changed, so it is safe in any state
+        and is called outside _control_lock (file I/O). Returns None when no
+        config_file is set (virtual_tracking.launch.py). Raises ValueError on
+        any config error; the caller rejects the service call.
         """
         if not self._config_file:
-            return
+            return None
         cfg = load_config(self._config_file)
-
-        # validate cross-field constraints before touching any instance var
-        new_family = str(cfg['detection']['tracking_tag_family']).strip()
-        new_id = int(cfg['detection']['tracking_tag_id'])
-        new_leave = float(cfg['control']['leave_distance'])
-        reason = validate_goal(new_id, new_family, new_leave)
+        # cross-field / format checks that the setters below would otherwise hit
+        reason = validate_goal(int(cfg['detection']['tracking_tag_id']),
+                               str(cfg['detection']['tracking_tag_family']).strip(),
+                               float(cfg['control']['leave_distance']))
         if reason is not None:
             raise ValueError(f'Invalid config: {reason}')
+        parse_tag_sizes(str(cfg['tag_size']['tag_sizes']))
+        return cfg
 
+    def _apply_config_locked(self, cfg: dict) -> None:
+        """Apply a config from _read_config(); the caller holds _control_lock.
+
+        Called only after a cmd is accepted while still IDLE (before the
+        transition), so tracing_callback and no worker use these values yet.
+        """
         self.manage_amcl_and_lidar_safety = bool(cfg['control']['manage_amcl_and_lidar_safety'])
         self.stage1_distance      = float(cfg['control']['stage1_distance'])
         self.stage2_distance      = float(cfg['control']['stage2_distance'])
-        self._goal_leave_distance = new_leave
+        self._goal_leave_distance = float(cfg['control']['leave_distance'])
         self.dock_timeout         = float(cfg['control']['dock_timeout'])
         self.undock_timeout       = float(cfg['control']['undock_timeout'])
         self.lost_target_timeout  = float(cfg['control']['lost_target_timeout'])
         self.tag_size             = float(cfg['tag_size']['tag_size'])
         self.tag_sizes            = parse_tag_sizes(str(cfg['tag_size']['tag_sizes']))
-        self._goal_tag_family     = new_family
-        self._goal_tag_id         = tag_id_filter(new_id)
+        self._goal_tag_family     = str(cfg['detection']['tracking_tag_family']).strip()
+        self._goal_tag_id         = tag_id_filter(int(cfg['detection']['tracking_tag_id']))
         self.use_calibration      = bool(cfg['calibration']['use_calibration'])
 
         cal = load_calibration_from_config(cfg)
@@ -786,12 +793,12 @@ class AprilTagControlNode(Node):
 
         Returns (accepted, its new cmd_id or None, reason).
         """
+        # read april_tag_config.json outside the lock; applied below only if accepted
+        cfg, cfg_error = None, None
         try:
-            self._reload_config()
+            cfg = self._read_config()
         except ValueError as exc:
-            reason = f'Config reload failed: {exc}'
-            self.get_logger().error(self._stage() + f'[cmd] {cmd} rejected: {reason}')
-            return False, None, reason
+            cfg_error = f'Config reload failed: {exc}'
         with self._control_lock:
             state = self._state
             # decided under the lock, so of two cmds only one leaves IDLE
@@ -800,6 +807,12 @@ class AprilTagControlNode(Node):
                           f'(only accepted in {", ".join(sorted(s.value for s in GOAL_RULES[cmd]))})')
                 self.get_logger().warn(self._stage() + f'[cmd] {cmd} {reason}, status unchanged')
                 return False, None, reason
+            if cfg_error is not None:
+                reason = f'rejected: {cfg_error}'
+                self.get_logger().error(self._stage() + f'[cmd] {cmd} {reason}, status unchanged')
+                return False, None, reason
+            if cfg is not None:
+                self._apply_config_locked(cfg)
             cmd_id = self._next_cmd_id
             self._next_cmd_id += 1
             self._goal_action = cmd

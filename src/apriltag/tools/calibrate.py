@@ -12,6 +12,8 @@ apriltag_control does not need to be running.
 Saves the tracked tag's z_ref / x_ref / yaw_ref from the current pose to the
 calibration section of april_tag_config.json (read-modify-write, only the
 specified stage is updated) and writes an annotated PNG alongside the JSON.
+--file must be an existing april_tag_config.json containing a JSON object;
+otherwise it exits 1 at once, without waiting for a tag or writing anything.
 
 Exit code: 0 success, 1 no valid tag / save failed, 2 argument error.
 """
@@ -27,7 +29,7 @@ from rclpy.node import Node
 from apriltag_interfaces.msg import TagTracing
 from sensor_msgs.msg import Image
 
-from apriltag.domain.calibration import CalibrationPoint, save_calibration_point
+from apriltag.domain.calibration import CalibrationPoint, read_config_dict, save_calibration_point
 from apriltag.domain.math_utils import quaternion_to_rotation_matrix, rotation_matrix_to_yaw_error
 
 WAIT_TIMEOUT = 10.0
@@ -52,6 +54,13 @@ def _parse_args():
 
 def main() -> int:
     stage, cal_file = _parse_args()
+
+    # fail fast: check the config file before waiting for a tag / saving a PNG
+    try:
+        read_config_dict(cal_file)
+    except ValueError as exc:
+        print(f'ERROR: {exc}', file=sys.stderr)
+        return 1
 
     rclpy.init()
     node = Node('apriltag_calibrator')
