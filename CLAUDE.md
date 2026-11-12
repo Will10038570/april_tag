@@ -101,7 +101,7 @@ docker exec april_tag_serive bash -ic '
 
 ### 3.2 虛擬端到端測試(建議每次改 code 後必跑)
 
-`virtual_tracking.launch.py` 會啟動真正的 `apriltag_detection`、`apriltag_control`,以及取代相機 / AMR / G7+ AMCL 與 lidar safety 的 `virtual_tracking_sim`(全部在 `wheelchair` namespace)。一次 run = sim 呼叫 `/wheelchair/attach` service(`std_srvs/SetBool` `data:true`;response 不帶 `cmd_id`,sim 在被接受後取 status 中第一個大於呼叫前的 `cmd_id`)(Stage 1 → Stage 2 → 回 `IDLE`,AMCL 關、lidar safety disabled)接著呼叫 `/wheelchair/detach`(退到 `leave_distance` 後還原 AMCL / lidar safety);sim 看 `/wheelchair/status` 出現 `IDLE` + 自己的 `cmd_id` 判斷結束。
+`virtual_tracking.launch.py` 會啟動真正的 `apriltag_detection`、`apriltag_control`,以及取代相機 / AMR / G7+ AMCL 與 lidar safety 的 `virtual_tracking_sim`(全部在 `wheelchair` namespace)。一次 run = sim 呼叫 `/wheelchair/attach` service(`std_srvs/SetBool` `data:true`;response 不帶 `cmd_id`,sim 在被接受後取 status 中第一個大於呼叫前的 `cmd_id`)(Stage 1 → Stage 2 → 回 `IDLE`,AMCL 關、lidar safety disabled)接著呼叫 `/wheelchair/detach`(退到 `calibration.detach.z_ref` 後還原 AMCL / lidar safety);sim 看 `/wheelchair/status` 出現 `IDLE` + 自己的 `cmd_id` 判斷結束。
 
 **安全注意:** `virtual_tracking.launch.py` 的 `domain_id` 預設是 65(機器人在 `.ros2_setup` 的 `ROS_DOMAIN_ID`,目前 72,但仍請勿依賴這點),而 `apriltag_control` 會發 `/cmd_vel`、`/pre_cmd_vel`、`/g7_plc/disable_lidar_safety` 並呼叫 AMCL service。跑虛擬測試時:
 
@@ -159,11 +159,11 @@ docker exec -it april_tag_serive bash -ic '
 | `init_x` / `init_y` / `init_yaw_deg` | `-1.0` / `0.15` / `10.0` |
 | `headless` / `auto_start` | `false` / `false` |
 | `log_dir` | `virtual_tracking_logs` |
-| `manage_amcl_and_lidar_safety` | `true`(注意:與 `april_tag.launch.py` 的預設 `false` 不同) |
-| `stage1_distance` / `stage2_distance` / `leave_distance` | `0.50` / `0.28` / `1.0`(sim 會從 `apriltag_control` 讀回,不直接設在 sim 上) |
-| `detect_tag_families` | `tag36h11`(detection 偵測的 family) |
-| `tracking_tag_family` / `tracking_tag_id` | `tag36h11` / `0`(**同時傳給 detection 與 control**:發到 `/wheelchair/tag_tracing` 的 tag,`-1` = 任何 id;family 不在 `detect_tag_families` 時 detection 啟動即 `ValueError` 結束。sim 畫的是 tag36h11 id 0;`tracking_tag_id:=5` → `tag_tracing` 一直 `valid=false`,status `IDLE` `error_code=1`) |
-| `dock_timeout` / `undock_timeout` / `lost_target_timeout` | `300.0` / `300.0` / `1.0` s(例:`dock_timeout:=3.0` 測 TIMEOUT,`error_code=4`) |
+| `config_file` | 安裝的 `share/apriltag/config/virtual_tracking_config.json`(原始檔 `src/apriltag/config/virtual_tracking_config.json`) |
+
+detection / control / sim 的其他設定全部在 `config_file`(2026-11-12 起 launch 不再有 `tracking_tag_*`、`dock_timeout`、`stage*_distance` 等參數)。與實機 `april_tag_config.json` 的差異:`manage_amcl_and_lidar_safety: true`、`tag_size: 0.0635`;calibration 點 `z_ref` 0.50 / 0.28 / 1.0、`x_ref` 0.026、`yaw_ref` 0(**`x_ref` 必須等於 sim 的 `camera_y_offset` 0.026、`yaw_ref` 0**,sim 的 ground truth 才一致)。sim 從同一檔讀 `tag_size`、stage 距離(`calibration.*.z_ref`)與畫的 tag id(`tracking_tag_id`,`-1` → 0)。
+
+變化測試:複製該檔、改值後 `config_file:=/tmp/xxx.json`(檔案放 container 的 `/tmp`)。例:`control.dock_timeout: 3.0` → `error_code=4`。**已知限制:改 `tracking_tag_id` 測不到 TAG_LOST**(sim 會跟著畫同一個 id,attach 照樣成功;之前 `tracking_tag_id:=5` → `error_code=1` 的測法已失效)。
 
 手動送 cmd 測試(另開終端,同樣設 `ROS_DOMAIN_ID=99` 與 `lo` 的 `CYCLONEDDS_URI`):用 `headless:=true auto_start:=false` 啟動,sim 的物理與相機照常運作,但不會自己送 cmd。指令見第 4 節(`tools/attach.py` / `detach.py` `true|false`,或 `ros2 service call /wheelchair/attach std_srvs/srv/SetBool "{data: true}"`、`ros2 topic echo /wheelchair/status`)。工具呼叫完 service 就結束(不會卡住終端),結果看 status。
 
@@ -182,7 +182,7 @@ docker exec april_tag_serive bash -ic '
   colcon test --packages-select apriltag && colcon test-result --all'
 ```
 
-`src/apriltag/test/` 內有 `test_state_machine.py`(轉移表、cmd 接受表與取消表)、`test_cmd_flow.py`(status JSON、參數檢查、outcome / error_code)、`test_leave_step.py`、`test_target_flow.py`(`choose_best_target`、`tag_matches`)、`test_yaw_*.py`、`test_tag_size.py`、`test_config_loader.py`(`april_tag_config.json` 驗證、calibration 讀寫),2026-11-12 共 142 tests。新增的 pytest 請放在 `src/apriltag/test/`,同樣用上面的指令在 container 內執行。
+`src/apriltag/test/` 內有 `test_state_machine.py`(轉移表、cmd 接受表與取消表)、`test_cmd_flow.py`(status JSON、參數檢查、outcome / error_code)、`test_leave_step.py`、`test_target_flow.py`(`choose_best_target`、`tag_matches`)、`test_yaw_*.py`、`test_tag_size.py`、`test_config_loader.py`(`april_tag_config.json` 驗證、calibration 讀寫)、`test_speed_limits.py`(max / min 速度限制;`test_config_loader.py` 另含 tolerance、calibration 必填、removed key 檢查),2026-11-12 共 212 tests。新增的 pytest 請放在 `src/apriltag/test/`,同樣用上面的指令在 container 內執行。
 
 ---
 
@@ -197,7 +197,7 @@ docker exec april_tag_serive bash -ic '
 docker exec -it april_tag_serive bash -ic '
   ros2 launch apriltag april_tag.launch.py'
 # 所有參數統一由 /mnt/work_space/april_tag_config.json 設定(manage_amcl_and_lidar_safety、
-# stage1/2_distance、tracking_tag_*、leave_distance、timeout、tag_size、calibration 等)
+# stage1/2_tolerance、tracking_tag_*、timeout、max_/min_vx/vy/vw、tag_size、calibration(stage / leave 距離)等)
 # 若要換設定檔:config_file:=/path/to/april_tag_config.json
 # 每次送 attach / detach service 時 control node 會自動重新讀取 JSON,不需重啟即可套用變更
 
@@ -216,23 +216,23 @@ docker exec -it april_tag_serive bash -ic 'python3 /mnt/work_space/src/apriltag/
 # 或直接呼叫 service(std_srvs/SetBool;response 立即回 success=接受與否、message=純文字原因,不帶 cmd_id;cmd_id 看 status)
 # 對位(成功後 status 為 IDLE + 該 cmd_id + error_code 0,AMCL 關、lidar safety disabled)
 docker exec -it april_tag_serive bash -ic 'ros2 service call /wheelchair/attach std_srvs/srv/SetBool "{data: true}"'
-# 離開:/wheelchair/detach data:true(IDLE 時接受,不需先對位;退到 leave_distance,完成後開 AMCL、enable lidar safety)
+# 離開:/wheelchair/detach data:true(IDLE 時接受,不需先對位;退到 calibration.detach.z_ref,完成後開 AMCL、enable lidar safety)
 # 停止:同一個 service 送 data:false(attach 停 STAGE1 / STAGE2、detach 停 LEAVING;success=true → IDLE、error_code=0、error_msg 為 `Cancelled cmd_id=n. …`,停止並還原;已在 ending 時 msg 為 already ending,結果以 status 為準;IDLE 或另一種 cmd 在跑時 success=false)
 ```
 
 介面依 `[service_robot] wheelchair_interface.pdf`(v0.1),差異:`detach` = leaving(不管夾爪,`/wheelchair/attached` 固定發 `false`)、status 的 state 字串為 `IDLE` / `Attaching(STAGE1)` / `Attaching(STAGE2)` / `Detaching`(`control_node.py` 的 `STATUS_STATE`,對應 enum `IDLE` / `STAGE1` / `STAGE2` / `LEAVING`;log 與 service response 仍用 enum 名稱;沒有 `CANCELLED` / `ERROR`,結束一律回 `IDLE`,看 `error_code` / `error_msg`)、錯誤碼沿用下列舊編號(之後再改成 PDF 的)、沒有 `/wheelchair/get_status`、cmd 改成兩個 `std_srvs/SetBool` service(取代 `/wheelchair/cmd` topic,`data:false` = cancel,沒有 `reset`,`cmd_id` 由 `apriltag_control` 給)。
 
 - `/wheelchair/attach`、`/wheelchair/detach`(`std_srvs/SetBool`):立即回 `success`(接受與否)與純文字 `message`(`attach accepted` / `detach accepted`、`cancel requested`、`already ending, result unchanged`、`nothing running`、`rejected: state=… (only accepted in …)`;2026-10-27 起不是 JSON、不帶 `cmd_id`)。`data:true` 只在 `IDLE` 接受,每次接受 `cmd_id` +1(開機後從 1 起算,重啟重算;只出現在 status);非 `IDLE` → `success=false`、`[cmd] … rejected …, status unchanged`。`data:false` 只取消同一個 service 的執行中 cmd(`CANCEL_RULES`:attach → `STAGE1` / `STAGE2`、detach → `LEAVING`),回 `cancel requested`;`IDLE` 時 `success=false`(`nothing running`);另一種 cmd 在跑時 `success=false`、`rejected: state=LEAVING (only accepted in STAGE1, STAGE2)`。
-- `/wheelchair/status`(`std_msgs/String` JSON,reliable、transient_local、depth 1,5 Hz):`state`、`cmd_id`(開機後 0)、`attached`(false)、`error_code`、`error_msg`、`stamp`(epoch s),以及除錯欄位 `x_error` / `y_error` / `yaw_error` / `last_frame_age`(未知時 `null`)。cmd 結束 = `IDLE` + 該 `cmd_id`;`error_code` / `error_msg` 與轉到 `IDLE` 在同一個 lock 內寫入。`error_msg`:執行中 `""`、成功 `Attach succeeded` / `Detach succeeded`(`cmd_flow.py` 的 `SUCCESS_MSG`)、取消 `Cancelled cmd_id=n. elapsed=…s`、失敗為原因。
+- `/wheelchair/status`(`std_msgs/String` JSON,reliable、transient_local、depth 1,5 Hz):`state`、`cmd_id`(開機後 0)、`attached`(false)、`error_code`、`error_msg`、`stamp`(epoch s),以及除錯欄位 `x_error` / `y_error` / `yaw_error` / `last_frame_age` / `cmd_vx` / `cmd_vy` / `cmd_wz`(未知時 `null`)。`cmd_v*` 是最近一次送到 `/cmd_vel` 或 `/pre_cmd_vel` 的速度(停車零速也算,兩個 topic 記一筆;5 Hz 只帶最新一筆),超過 1 s(`control_node.py` 的 `CMD_VEL_MAX_AGE`)或開機後沒送過時為 `null`。cmd 結束 = `IDLE` + 該 `cmd_id`;`error_code` / `error_msg` 與轉到 `IDLE` 在同一個 lock 內寫入。`error_msg`:執行中 `""`、成功 `Attach succeeded` / `Detach succeeded`(`cmd_flow.py` 的 `SUCCESS_MSG`)、取消 `Cancelled cmd_id=n. elapsed=…s`、失敗為原因。
 - `error_code`:0 OK(成功或 `data:false` 取消,以 `error_msg` 是否以 `Cancelled` 開頭區分)、1 TAG_LOST、2 AMCL_SERVICE_FAIL(restore 失敗也是,取消後 restore 失敗亦同)、3 LIDAR_SERVICE_FAIL(保留未用)、4 TIMEOUT、5 OTHER、6 NODE_SHUTDOWN(2026-10-27 起;之前 5 是 ACTION_CANCELED、6 OTHER、7 NODE_SHUTDOWN)。
 - `/wheelchair/attached`(`std_msgs/Bool`,transient_local,5 Hz):固定 `false`。
 - `/g7_body/simple_ui/body_status`(`std_msgs/Int32`,reliable、transient_local、depth 1,參數 `body_status_topic`;絕對路徑,不在 `wheelchair` namespace):只在 state 改變時發一次,進 `STAGE1` → `1`、進 `LEAVING` → `2`、回 `IDLE` → `0`(成功或失敗都一樣);進 `STAGE2` 與開機時不發。
 
-選 tag 在 **detection**:依 launch 參數 `tracking_tag_family` / `tracking_tag_id`(預設 `tag36h11` / `0`,`-1` = 任何 id),每張影像取前向距離 z 最小(且 > 0)的一個,發到 `/wheelchair/tag_tracing`(`TagTracing`:`header`(同該影像的 `TagPoseArray`)、`valid`、`tag`(`TagPose`)、`image_width/height`;沒有符合的 tag 時 `valid=false`、`tag` 為空)。launch 把同一組 `tracking_tag_*` 也傳給 `apriltag_control`,它只訂閱 `/wheelchair/tag_tracing` 並以此比對:`valid=false` 或不符都當作 tag 不見(不符時每個 tag 只 warn 一次;RUNNING 步驟中超過 `lost_target_timeout`,預設 1 s,以收到資料的時間計 → `TAG_LOST`)。yaw estimator / probe 在 cmd 開始與 `tag_tracing` 的 id 改變時 reset。`leave_distance`(預設 1.0 m)是 control 的參數,不再由指令帶入。
+選 tag 在 **detection**:依 config 的 `detection.tracking_tag_family` / `tracking_tag_id`(預設 `tag36h11` / `0`,`-1` = 任何 id),每張影像取前向距離 z 最小(且 > 0)的一個,發到 `/wheelchair/tag_tracing`(`TagTracing`:`header`(同該影像的 `TagPoseArray`)、`valid`、`tag`(`TagPose`)、`image_width/height`;沒有符合的 tag 時 `valid=false`、`tag` 為空)。launch 把同一組 `tracking_tag_*` 也傳給 `apriltag_control`,它只訂閱 `/wheelchair/tag_tracing` 並以此比對:`valid=false` 或不符都當作 tag 不見(不符時每個 tag 只 warn 一次;RUNNING 步驟中超過 `lost_target_timeout`,預設 1 s,以收到資料的時間計 → `TAG_LOST`)。yaw estimator / probe 在 cmd 開始與 `tag_tracing` 的 id 改變時 reset。leave 距離是 `calibration.detach.z_ref`(出廠 1.0 m),不由指令帶入。
 
 `apriltag_control` 是狀態機:`IDLE → STAGE1 → STAGE2 → IDLE`(`attach`)與 `IDLE → LEAVING → IDLE`(`detach`),每個非 IDLE state 內有 `preparing → running → ending` 三個步驟(詳見 README 的 State Machine)。每個被接受的 attach / detach 在一條 worker thread 跑。AMCL / lidar safety 由各 state 自己切換:`STAGE1` 準備時 enable lidar、關 AMCL;`STAGE2` 準備時 disable lidar;Stage 2 成功只停車就回 `IDLE`(AMCL 維持關、lidar 維持 disabled);`LEAVING` 結束、任何失敗 / cancel / timeout 與 shutdown 都會 enable lidar 並確保 AMCL 打開(不記錄是誰關的)。整個 cmd 有 timeout(`dock_timeout` / `undock_timeout`,預設 300 s,從 cmd 接受算到進入 ending)。
 
-`april_tag.launch.py` 只接受 `config_file` 一個參數;`manage_amcl_and_lidar_safety`、stage 距離(`stage1_distance=0.50`、`stage2_distance=0.28`)等全部由 `april_tag_config.json` 的 `control` 區塊設定(預設 `manage_amcl_and_lidar_safety=false`),Stage 1 速度發到 `/cmd_vel`,Stage 2 與 leave 發到 `/pre_cmd_vel`(G7+ 精準模式)。leave 不用 planner / LQR:固定發 `vx=-max_vx`(-0.1 m/s)、`vy=wz=0`,直到 camera→tag 前向距離 ≥ `leave_distance` 立即停(不檢查 y / yaw、無 hold)。
+`april_tag.launch.py` 只接受 `config_file` 一個參數(include RealSense 時以 scoped `GroupAction` 傳 `config_file:=''` 給它:`rs_launch.py` 也有同名 launch 參數,會把我們的 JSON 當相機 YAML 讀,遇 `null` 讓整個 launch 崩潰,2026-11-12 修正前 HEAD 即如此);`manage_amcl_and_lidar_safety`(預設 `false`)等由 `april_tag_config.json` 的 `control` 區塊設定。**stage / leave 目標只來自 `calibration` 的 `stage1` / `stage2` / `detach` 三個點(必填,`z_ref` = 目標前向距離、`x_ref` / `yaw_ref` = 橫向 / yaw 參考;出廠值 `z_ref` 0.50 / 0.28 / 1.0、`x_ref` 0.026、`yaw_ref` 0,等同舊預設)**,沒有 `stage*_distance` / `leave_distance` / `use_calibration`(留著會被 control 拒絕並提示替代欄位)。到位判斷用 `control.stage1_tolerance` / `stage2_tolerance`(`x` / `y` m、`yaw` rad、`hold_seconds` s,出廠皆 0.05 / 0.05 / 0.05 / 1.0;Stage 1 的 x / y 也是 S3 yaw probe 的啟動條件)。`config_file` 對兩個 node 都是必填;detection 只驗證共用區塊,calibration 不完整時只有 control 啟動失敗(camera / detection 照跑,可用 `calibrate.py` 校正後 `docker restart`),Stage 1 速度發到 `/cmd_vel`,Stage 2 與 leave 發到 `/pre_cmd_vel`(G7+ 精準模式)。Stage 1 / 2 的速度每軸先限制在 `max_vx` / `max_vy` / `max_vw`(0.1 / 0.1 m/s、0.05 rad/s),再把非 0 且 `|v| < min_*`(`min_vx` / `min_vy` / `min_vw`,皆 0.01;補償 G7+ 低速 deadband)的值改成 `sign(v)·min`,0 維持 0(`control_flow.clamp_control`);六個值都在 JSON `control` 區塊、缺一不可,須 max > 0、0 ≤ min ≤ max。leave 不用 planner / LQR:固定發 `vx=-max_vx`(-0.1 m/s)、`vy=wz=0`,直到 camera→tag 前向距離 ≥ `leave_distance` 立即停(不檢查 y / yaw、無 hold)。
 
 `apriltag_detection` 啟動後就一直偵測,不受 `apriltag_control` 控制(沒有 enable service)。debug 影像所有 tag 一律畫綠框。每張影像(收到 `camera_info` 之後)發一則 `apriltag_interfaces/msg/TagPoseArray` 到 `/wheelchair/apriltag_poses`,包含 `tag_families`(launch 參數 `detect_tag_families`,以空白分隔,預設 `tag36h11`;每個 family 一個 detector,CPU 隨數量增加)內所有偵測到的 tag(`family`、`id` 字串、`pose`),沒有 tag 時 `tags` 為空;每個 tag 廣播 TF `<camera_frame> → <family>_<id>`(如 `tag36h11_0`)。`/wheelchair/apriltag_poses` 只作參考 / 除錯,control 不訂閱。沒有 cmd 執行時 `apriltag_control` 會忽略 `tag_tracing`。RealSense 相機(`realsense/launch/camera.launch.py`)也在 `wheelchair` namespace:`/wheelchair/camera/camera/color/*`。
 
@@ -404,6 +404,28 @@ ros2 run rqt_image_view rqt_image_view /wheelchair/apriltag/marked_image
 - `colcon test --packages-select apriltag`:146 tests,0 failures
 - `calibrate.py --stage1 --file`:不存在 → `ERROR: Config file not found: '/tmp/none.json'`、`{bad` → `ERROR: Cannot parse …`(檔案內容不變)、`[]` → `ERROR: … must contain a JSON object, got 'list'`,皆立刻 exit 1、沒有 `Waiting up to …`、沒有產生檔案或 PNG
 - 未測:合法檔案的實際存檔(container 的實機 detection 在跑,避免寫入;由單元測試涵蓋)
+
+2026-11-12 `max_vx` / `max_vy` / `max_vw` 改由 `april_tag_config.json` `control` 區塊設定,新增 `min_vx` / `min_vy` / `min_vw`(0.01;Stage 1 / 2 非 0 且小於 min 時送 `sign(v)·min`)後,在同一 container(`sleep infinity`)內實測(domain 99、`lo`):
+
+- `colcon test --packages-select apriltag`:177 tests(新增 `test_speed_limits.py`),0 failures
+- 虛擬測試 headless:attach `SUCCEEDED`(Stage 2 elapsed 14.8 s,之前約 12.7 s)、`(held)`、`Leave reached 1.00m (forward=1.001m)`、detach `SUCCEEDED`、`(restored)`;`*_cmd_raw.csv` 651 筆,每軸為 0 或 `|v| ∈ [0.01, max]`
+- 單獨啟動 `apriltag_control -p config_file:=<副本>`:IDLE 時把副本改成 `min_vx: 0.2` 再 attach → `rejected: Config reload failed: control.min_vx (0.2) must be <= max_vx (0.1)`;用該檔啟動 → `ValueError` 結束
+- 未測:實機(min 是否足以讓 G7+ 在低速動起來、目標附近是否來回擺動)
+
+2026-11-12 對位 tolerance 移到 `april_tag_config.json`(`control.stage1_tolerance` / `stage2_tolerance`)、刪除 `stage1_distance` / `stage2_distance` / `leave_distance` / `use_calibration`(目標只來自 calibration 三個點,必填)、`config_file` 改必填(刪除 ROS 參數 fallback)、虛擬測試改用 `config/virtual_tracking_config.json`、`april_tag.launch.py` 不再把 `config_file` 漏給 RealSense 後,在同一 container(`sleep infinity`)內實測(domain 99、`lo`):
+
+- `colcon test --packages-select apriltag`:212 tests,0 failures
+- 虛擬測試 headless:`[calibration] STAGE1: z_ref=0.5000m x_ref=0.0260m … tolerance x=0.050m …`、`Stage 2 aligned at 0.28m`(elapsed 16.4 s)、`(held)`、`Leave reached 1.00m (forward=1.000m)`、`SUCCEEDED` ×2、`(restored)`;副本 `dock_timeout: 3.0` → `error_code=4`
+- 單獨啟動 control:加回 `stage1_distance` / `use_calibration` → `… was removed; …`;`calibration.stage2: null` → `calibration.stage2 is missing or incomplete …`;`stage2_tolerance.yaw: 0` → `must be positive`;IDLE 時改壞檔再 attach / detach → `rejected: Config reload failed: …`;沒給 `config_file`(control、detection)→ `config_file is required`;calibration 全 `null` 時 detection 正常啟動
+- `april_tag.launch.py`(無相機):修正前 HEAD 的 config 與新 config 皆 `Caught exception in launch: Unexpected type for parameter value None`;修正後 calibration 全 `null` → 只有 control `ValueError` 結束,launch / detection 繼續跑;出廠 config → detection、control 都起來。用 3.2 的 `lo` URI(沒有 `MaxAutoParticipantIndex`)跑實機 launch 時偶爾 `rmw handle is invalid`,改用 container 預設 `CYCLONEDDS_URI`(`MaxAutoParticipantIndex=50`)即正常
+- 已知限制:改 `tracking_tag_id` 測不到 TAG_LOST(sim 跟著畫同 id)
+- 未測:實機(相機、對位)
+
+2026-11-12 `/wheelchair/status` 新增 `cmd_vx` / `cmd_vy` / `cmd_wz`(`cmd_flow.recent_cmd`、`control_node._last_cmd`)後,在同一 container(`sleep infinity`)內實測(domain 99、container 預設 `CYCLONEDDS_URI`;3.2 的 `lo` URI 這次 `Failed to find a free participant index`,因為沒有 `MaxAutoParticipantIndex`):
+
+- `colcon test --packages-select apriltag`:217 tests,0 failures
+- 虛擬測試 headless:attach `SUCCEEDED`(Stage 2 elapsed 12.6 s)、`(held)`、`Leave reached 1.00m (forward=1.002m)`、detach `SUCCEEDED`、`(restored)`;`ros2 topic echo /wheelchair/status`:開機 `null`,Stage 1 / 2 為實際速度(每軸 0 或 `|v| ∈ [0.01, max]`),`Detaching` 為 `-0.1, 0.0, 0.0`,結束後 `IDLE` 連續 5 則 `0.0`(1 s)後變 `null`
+- 未測:實機
 
 ## 7. `src/apriltag/README.md` 與實際不一致之處
 

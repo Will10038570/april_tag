@@ -29,8 +29,10 @@ class Codes:
 
 
 def status_json(state: str, cmd_id: int, error_code: int, error_msg: str, stamp: float,
-                x_error: float, y_error: float, yaw_error: float, last_frame_age: float) -> str:
-    """/wheelchair/status JSON; x/y/yaw error and last_frame_age are debug fields, null if unknown."""
+                x_error: float, y_error: float, yaw_error: float, last_frame_age: float,
+                cmd_vx: float, cmd_vy: float, cmd_wz: float) -> str:
+    """/wheelchair/status JSON; x/y/yaw error, last_frame_age and the last sent
+    cmd_vel (cmd_vx / cmd_vy m/s, cmd_wz rad/s) are debug fields, null if unknown."""
     def num(v):
         return float(v) if v is not None and math.isfinite(v) else None
 
@@ -46,23 +48,33 @@ def status_json(state: str, cmd_id: int, error_code: int, error_msg: str, stamp:
         'y_error': num(y_error),
         'yaw_error': num(yaw_error),
         'last_frame_age': num(last_frame_age),
+        'cmd_vx': num(cmd_vx),
+        'cmd_vy': num(cmd_vy),
+        'cmd_wz': num(cmd_wz),
     }, allow_nan=False)
 
 
-def validate_goal(tag_id: int, tag_family: str,
-                  distance_m: Optional[float] = None) -> Optional[str]:
-    """Return None if the tag / leave parameters are valid, else the reason.
+def recent_cmd(last_cmd: Optional[Tuple[float, float, float, float]], now: float,
+               max_age: float) -> Tuple[float, float, float]:
+    """(vx, vy, wz) of last_cmd = (vx, vy, wz, sent) if sent at most max_age before now, else NaN.
+
+    now and sent are on the same clock (time.monotonic()).
+    """
+    if last_cmd is None or now - last_cmd[3] > max_age:
+        return math.nan, math.nan, math.nan
+    return float(last_cmd[0]), float(last_cmd[1]), float(last_cmd[2])
+
+
+def validate_goal(tag_id: int, tag_family: str) -> Optional[str]:
+    """Return None if the tracked tag parameters are valid, else the reason.
 
     Only the format is checked: a family / id that apriltag_detection does not
-    track ends with TAG_LOST. distance_m None is not checked; given it must be
-    finite and > 0.
+    track ends with TAG_LOST.
     """
     if int(tag_id) < -1:
         return f'tag_id {int(tag_id)} must be >= 0, or -1 for any id'
     if not str(tag_family).strip():
         return 'tag_family is empty'
-    if distance_m is not None and not (math.isfinite(distance_m) and distance_m > 0.0):
-        return f'distance_m {distance_m} must be > 0'
     return None
 
 

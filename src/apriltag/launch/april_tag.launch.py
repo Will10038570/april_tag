@@ -2,7 +2,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -27,13 +27,20 @@ def generate_launch_description():
         'config_file', default_value=_DEFAULT_CONFIG,
         description='path to april_tag_config.json')
 
-    camera = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution(
-                [FindPackageShare('realsense'), 'launch', 'camera.launch.py']
-            )
+    # realsense2_camera's rs_launch.py also reads a 'config_file' launch argument
+    # (a YAML of camera parameters) and would load april_tag_config.json as one,
+    # failing on its nulls; give it its own "''" (= none). The scoped GroupAction
+    # keeps that value from leaking back to apriltag_detection / apriltag_control.
+    camera = GroupAction([
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                PathJoinSubstitution(
+                    [FindPackageShare('realsense'), 'launch', 'camera.launch.py']
+                )
+            ),
+            launch_arguments={'config_file': "''"}.items(),
         ),
-    )
+    ])
 
     apriltag_detection = Node(
         package='apriltag',

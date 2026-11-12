@@ -1,0 +1,43 @@
+{
+  "_comment": "Virtual test config for launch/virtual_tracking.launch.py. calibration x_ref must equal the sim camera_y_offset (0.026 m) and yaw_ref 0, so the sim ground truth matches; copy this file and pass config_file:= for variant tests (tracking_tag_id 5 -> TAG_LOST, dock_timeout 3.0 -> TIMEOUT).",
+  "detection": {
+    "detect_tag_families": "tag36h11",
+    "tracking_tag_family": "tag36h11",
+    "tracking_tag_id": 0
+  },
+  "tag_size": {
+    "tag_size": 0.0635,
+    "tag_sizes": ""
+  },
+  "control": {
+    "manage_amcl_and_lidar_safety": true,
+    "stage1_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 1.0},
+    "stage2_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 1.0},
+    "dock_timeout": 300.0,
+    "undock_timeout": 300.0,
+    "lost_target_timeout": 1.0,
+    "max_vx": 0.1,
+    "max_vy": 0.1,
+    "max_vw": 0.05,
+    "min_vx": 0.01,
+    "min_vy": 0.01,
+    "min_vw": 0.01
+  },
+  "calibration": {
+    "stage1": {"z_ref": 0.5, "x_ref": 0.026, "yaw_ref": 0.0, "stamp": null, "image_path": null},
+    "stage2": {"z_ref": 0.28, "x_ref": 0.026, "yaw_ref": 0.0, "stamp": null, "image_path": null},
+    "detach": {"z_ref": 1.0, "x_ref": 0.026, "yaw_ref": 0.0, "stamp": null, "image_path": null}
+  },
+  "yaw_estimator": {
+    "s4_distances": [0.3, 0.5, 0.7],
+    "s4_sigmas_deg": [1.0, 2.0, 3.0]
+  },
+  "ros_interfaces": {
+    "amcl_check_service": "/check_mcl_if_trigger",
+    "amcl_close_service": "/close_amcl",
+    "amcl_open_service": "/open_amcl",
+    "lidar_safety_topic": "/g7_plc/disable_lidar_safety",
+    "stage1_cmd_vel_topic": "/cmd_vel",
+    "stage2_cmd_vel_topic": "/pre_cmd_vel"
+  }
+}

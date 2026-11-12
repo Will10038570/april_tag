@@ -190,12 +190,10 @@ def test_predict_follows_published_wz():
 # ---- in-position check: yaw_abs_f, never yaw_f ------------------------------------
 
 def error_is_zero(target, tol=0.05):
-    # same check as AprilTagControlNode._error_is_zero (x / y / yaw tolerances 0.05)
-    from types import SimpleNamespace
-    from apriltag.control_node import AprilTagControlNode
-    node = SimpleNamespace(stop_x_error_tolerance=tol, stop_y_error_tolerance=tol,
-                           stop_yaw_error_tolerance=tol)
-    return AprilTagControlNode._error_is_zero(node, target)
+    # the in-position check apriltag_control uses (x / y / yaw tolerances 0.05)
+    from apriltag.domain.config_loader import StageTolerance
+    from apriltag.runtime.control_flow import in_tolerance
+    return in_tolerance(target, StageTolerance(x=tol, y=tol, yaw=tol, hold_seconds=1.0))
 
 
 def test_aligned_noisy_yaw_holds_in_position_for_1s():

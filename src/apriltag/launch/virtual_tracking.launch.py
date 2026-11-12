@@ -9,13 +9,18 @@ Runs in ROS domain 65, the same as the robot: apriltag_control publishes the
 absolute /cmd_vel, /pre_cmd_vel and /g7_plc/disable_lidar_safety and calls the AMCL
 services, so unplug the robot's network cable before running it. CLI debugging:
     ROS_DOMAIN_ID=65 ros2 topic echo /cmd_vel
+
+All node settings come from config_file (default: the installed
+config/virtual_tracking_config.json). Variant tests: copy it, change e.g.
+tracking_tag_id to 5 (TAG_LOST) or dock_timeout to 3.0 (TIMEOUT), and pass
+config_file:=/path/to/copy.json.
 """
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable, Shutdown
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
+from launch_ros.substitutions import FindPackageShare
 
 
 # log lines without time; ros2 launch's '[<process>-N] ' prefix is dropped
@@ -38,26 +43,11 @@ def generate_launch_description():
         DeclareLaunchArgument('auto_start', default_value='false',
                               description='send attach as soon as apriltag_control publishes its status'),
         DeclareLaunchArgument('log_dir', default_value='virtual_tracking_logs'),
-        DeclareLaunchArgument('manage_amcl_and_lidar_safety', default_value='true',
-                              description='false: apriltag_control skips AMCL / lidar safety'),
-        # detection families; the sim draws tag36h11 id 0
-        DeclareLaunchArgument('detect_tag_families', default_value='tag36h11'),
-        # tag apriltag_detection publishes on tag_tracing and apriltag_control
-        # tracks (tracking_tag_id:=5: the drawn id 0 is never tracked,
-        # tag_tracing is always valid=false, the cmd ends with TAG_LOST)
-        DeclareLaunchArgument('tracking_tag_family', default_value='tag36h11'),
-        DeclareLaunchArgument('tracking_tag_id', default_value='0', description='-1 = any id'),
-        DeclareLaunchArgument('leave_distance', default_value='1.0', description='detach back-up distance (m)'),
-        # the sim draws its tag with the same size
-        DeclareLaunchArgument('tag_size', default_value='0.0635'),
-        DeclareLaunchArgument('tag_sizes', default_value=''),
-        # simulation's own stage distances, independent of launch/april_tag.launch.py;
-        # the sim reads them back from apriltag_control
-        DeclareLaunchArgument('stage1_distance', default_value='0.50'),
-        DeclareLaunchArgument('stage2_distance', default_value='0.28'),
-        DeclareLaunchArgument('dock_timeout', default_value='300.0'),
-        DeclareLaunchArgument('undock_timeout', default_value='300.0'),
-        DeclareLaunchArgument('lost_target_timeout', default_value='1.0'),
+        # every apriltag_detection / apriltag_control / sim setting (tag, tag size,
+        # timeouts, calibration points = stage / leave distances, tolerances);
+        # for variant tests copy it and pass config_file:=/path/to/copy.json
+        DeclareLaunchArgument('config_file', default_value=PathJoinSubstitution(
+            [FindPackageShare('apriltag'), 'config', 'virtual_tracking_config.json'])),
     ]
 
     apriltag_detection = Node(
@@ -67,13 +57,7 @@ def generate_launch_description():
         namespace='wheelchair',
         output='screen',
         output_format=OUTPUT_FORMAT,
-        parameters=[{
-            'tag_families': ParameterValue(LaunchConfiguration('detect_tag_families'), value_type=str),
-            'tracking_tag_family': ParameterValue(LaunchConfiguration('tracking_tag_family'), value_type=str),
-            'tracking_tag_id': ParameterValue(LaunchConfiguration('tracking_tag_id'), value_type=int),
-            'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
-            'tag_sizes': ParameterValue(LaunchConfiguration('tag_sizes'), value_type=str),
-        }],
+        parameters=[{'config_file': LaunchConfiguration('config_file')}],
     )
 
     apriltag_control = Node(
@@ -84,20 +68,7 @@ def generate_launch_description():
         output='screen',
         output_format=OUTPUT_FORMAT,
         additional_env=CONTROL_LOG_ENV,
-        parameters=[{
-            'manage_amcl_and_lidar_safety': ParameterValue(
-                LaunchConfiguration('manage_amcl_and_lidar_safety'), value_type=bool),
-            'tracking_tag_family': ParameterValue(LaunchConfiguration('tracking_tag_family'), value_type=str),
-            'tracking_tag_id': ParameterValue(LaunchConfiguration('tracking_tag_id'), value_type=int),
-            'leave_distance': ParameterValue(LaunchConfiguration('leave_distance'), value_type=float),
-            'stage1_distance': ParameterValue(LaunchConfiguration('stage1_distance'), value_type=float),
-            'stage2_distance': ParameterValue(LaunchConfiguration('stage2_distance'), value_type=float),
-            'dock_timeout': ParameterValue(LaunchConfiguration('dock_timeout'), value_type=float),
-            'undock_timeout': ParameterValue(LaunchConfiguration('undock_timeout'), value_type=float),
-            'lost_target_timeout': ParameterValue(LaunchConfiguration('lost_target_timeout'), value_type=float),
-            'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
-            'tag_sizes': ParameterValue(LaunchConfiguration('tag_sizes'), value_type=str),
-        }],
+        parameters=[{'config_file': LaunchConfiguration('config_file')}],
     )
 
     virtual_tracking_sim = Node(
@@ -114,7 +85,7 @@ def generate_launch_description():
             'headless': LaunchConfiguration('headless'),
             'auto_start': LaunchConfiguration('auto_start'),
             'log_dir': LaunchConfiguration('log_dir'),
-            'tag_size': ParameterValue(LaunchConfiguration('tag_size'), value_type=float),
+            'config_file': LaunchConfiguration('config_file'),
         }],
         # quitting the dashboard ends the whole test, so no detection/control
         # is left running

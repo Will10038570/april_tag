@@ -1,7 +1,33 @@
 """Load and validate april_tag_config.json."""
 
 import json
+import math
 import os
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+from apriltag.domain.calibration import CalibrationPoint, require_calibration
+from apriltag.runtime.control_flow import validate_speed_limits
+
+# keys that no longer exist, and what replaces them; only apriltag_control
+# checks them (validate_control_config), so apriltag_detection still starts
+REMOVED_KEYS = {
+    ('control', 'stage1_distance'): 'set calibration.stage1.z_ref',
+    ('control', 'stage2_distance'): 'set calibration.stage2.z_ref',
+    ('control', 'leave_distance'): 'set calibration.detach.z_ref',
+    ('calibration', 'use_calibration'): 'calibration is always used',
+}
+
+TOLERANCE_STAGES = ('stage1', 'stage2')
+
+
+@dataclass(frozen=True)
+class StageTolerance:
+    """In-position tolerance of one stage: |x|, |y| (m), |yaw| (rad), held hold_seconds (s)."""
+    x: float
+    y: float
+    yaw: float
+    hold_seconds: float
 
 
 def load_config(path: str) -> dict:
@@ -83,14 +109,19 @@ def _validate_config(data: dict) -> None:
 
     ctrl = _require_section(data, 'control')
     _require_bool(ctrl, 'control', 'manage_amcl_and_lidar_safety')
-    for key in ('stage1_distance', 'stage2_distance', 'leave_distance',
-                'dock_timeout', 'undock_timeout', 'lost_target_timeout'):
+    for key in ('dock_timeout', 'undock_timeout', 'lost_target_timeout'):
         v = _require_num(ctrl, 'control', key)
         if v <= 0.0:
             raise ValueError(f'control.{key} must be positive')
+    speed = {key: _require_num(ctrl, 'control', key)
+             for key in ('max_vx', 'max_vy', 'max_vw', 'min_vx', 'min_vy', 'min_vw')}
+    reason = validate_speed_limits(**speed)
+    if reason is not None:
+        raise ValueError(f'control.{reason}')
 
-    cal = _require_section(data, 'calibration')
-    _require_bool(cal, 'calibration', 'use_calibration')
+    # only its presence: the points are checked by validate_control_config, so
+    # apriltag_detection / tools/calibrate.py work before calibrating
+    _require_section(data, 'calibration')
 
     ye = _require_section(data, 'yaw_estimator')
     dists = _require_num_list(ye, 'yaw_estimator', 's4_distances')
@@ -105,3 +136,38 @@ def _validate_config(data: dict) -> None:
     for key in ('amcl_check_service', 'amcl_close_service', 'amcl_open_service',
                 'lidar_safety_topic', 'stage1_cmd_vel_topic', 'stage2_cmd_vel_topic'):
         _require_str(ri, 'ros_interfaces', key)
+
+
+def _parse_tolerance(ctrl: dict, key: str) -> StageTolerance:
+    name = f'control.{key}'
+    sec = ctrl.get(key)
+    if not isinstance(sec, dict):
+        raise ValueError(f'Missing or invalid {name} (an object with x, y, yaw, hold_seconds)')
+    values = {}
+    for field in ('x', 'y', 'yaw', 'hold_seconds'):
+        v = sec.get(field)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f'{name}.{field} must be a number, got {type(v).__name__!r}')
+        if field == 'hold_seconds':
+            if v < 0.0:
+                raise ValueError(f'{name}.{field} must be >= 0')
+        elif v <= 0.0:
+            raise ValueError(f'{name}.{field} must be positive')
+        values[field] = float(v)
+    return StageTolerance(**values)
+
+
+def validate_control_config(
+        data: dict) -> Tuple[Dict[str, StageTolerance], Dict[str, CalibrationPoint]]:
+    """apriltag_control's own checks on a config from load_config().
+
+    Rejects removed keys, and returns the in-position tolerances
+    {'stage1', 'stage2'} and the calibration points {'stage1', 'stage2',
+    'detach'}, all required. Raises ValueError naming the bad field.
+    """
+    for (section, key), hint in REMOVED_KEYS.items():
+        if key in data.get(section, {}):
+            raise ValueError(f'{section}.{key} was removed; {hint}')
+    ctrl = data['control']
+    tolerances = {s: _parse_tolerance(ctrl, f'{s}_tolerance') for s in TOLERANCE_STAGES}
+    return tolerances, require_calibration(data)

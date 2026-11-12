@@ -25,11 +25,11 @@ The package runs as two nodes under the `wheelchair` namespace (the RealSense ca
       /cmd_vel (Stage 1) / /pre_cmd_vel (Stage 2, leaving)
 ```
 
-Target loss is checked by a timer in `apriltag_control`: `tag_tracing` messages with `valid=false` or with a tag that does not match are ignored (a mismatch is warned once per tag: `[target] tag_tracing has … tracking …; treated as not seen`), so the tag counts as lost after `lost_target_timeout` (launch argument, default 1.0 s; checked only in the `running` step, against the time the poses were received).
+Target loss is checked by a timer in `apriltag_control`: `tag_tracing` messages with `valid=false` or with a tag that does not match are ignored (a mismatch is warned once per tag: `[target] tag_tracing has … tracking …; treated as not seen`), so the tag counts as lost after `control.lost_target_timeout` (config, shipped 1.0 s; checked only in the `running` step, against the time the poses were received).
 
 `TagPoseArray` (`apriltag_interfaces/msg`): `std_msgs/Header header` (image stamp, camera frame) and `TagPose[] tags`; `TagPose`: `string family` (e.g. `tag36h11`), `string id` (decimal, e.g. `"0"`), `geometry_msgs/Pose pose` (camera optical frame, m). `TagTracing`: `std_msgs/Header header` (same as the image's `TagPoseArray`), `bool valid`, `TagPose tag` (empty when `valid` is false), `image_width` / `image_height`. Nothing is published before `camera_info` has been received.
 
-Both nodes get the same `tracking_tag_family` / `tracking_tag_id` from the launch files. With `tracking_tag_id:=-1` the closest tag of the family is tracked, whatever its id.
+Both nodes get the same `detection.tracking_tag_family` / `tracking_tag_id` from the config file. With `tracking_tag_id` `-1` the closest tag of the family is tracked, whatever its id.
 
 `apriltag_control` resets its yaw estimator / probe when a cmd starts and when the tag id on `tag_tracing` changes (only possible with `-1`).
 
@@ -49,7 +49,7 @@ attach (only in IDLE)
                       (AMCL stays closed, lidar safety stays disabled)
 detach (only in IDLE)
  ├─ LEAVING preparing: publish Bool(true) (disable lidar safety), close AMCL (only if on)
- ├─ LEAVING running:   back straight at -max_vx on /pre_cmd_vel until tag forward distance >= leave_distance
+ ├─ LEAVING running:   back straight at -max_vx on /pre_cmd_vel until tag forward distance >= calibration.detach.z_ref
  └─ LEAVING ending:    stop → publish Bool(false) → open AMCL (only if off) → check → IDLE
 
 any other end (tag lost / cancel / timeout / failure), in any state:
@@ -86,9 +86,9 @@ Each non-`IDLE` state runs three steps, logged as `[step] STATE OLD -> NEW (reas
 | State | Meaning | AMCL | Lidar safety |
 |---|---|---|---|
 | `IDLE` | Nothing running | as the last procedure left it | as the last procedure left it |
-| `STAGE1` | preparing: enable lidar safety, close AMCL; running: track `stage1_distance` on `/cmd_vel` | off | enabled |
-| `STAGE2` | preparing: disable lidar safety; running: track `stage2_distance` on `/pre_cmd_vel`; ending (aligned): stop only | off | disabled |
-| `LEAVING` | preparing: disable lidar safety, close AMCL; running: back straight at `-max_vx` on `/pre_cmd_vel` until the camera-to-tag forward distance ≥ `leave_distance` (no planner / LQR); ending: enable lidar safety, open AMCL | off → on | disabled → enabled |
+| `STAGE1` | preparing: enable lidar safety, close AMCL; running: track `calibration.stage1` on `/cmd_vel` | off | enabled |
+| `STAGE2` | preparing: disable lidar safety; running: track `calibration.stage2` on `/pre_cmd_vel`; ending (aligned): stop only | off | disabled |
+| `LEAVING` | preparing: disable lidar safety, close AMCL; running: back straight at `-max_vx` on `/pre_cmd_vel` until the camera-to-tag forward distance ≥ `calibration.detach.z_ref` (no planner / LQR); ending: enable lidar safety, open AMCL | off → on | disabled → enabled |
 
 `apriltag_detection` runs in every state; outside `running` its poses are ignored.
 
@@ -107,7 +107,7 @@ Every cmd also has a whole-cmd timeout (`dock_timeout` for attach / `undock_time
 
 - Real-time AprilTag detection via `pupil_apriltags`, several families at once, all tags published with family and id
 - Two-stage docking: align at 50 cm (Stage 1), then at 28 cm (Stage 2), then back to `IDLE` with AMCL closed and lidar safety disabled
-- Leaving: `detach` backs straight up until the tag is `leave_distance` away, then restores AMCL and lidar safety
+- Leaving: `detach` backs straight up until the tag is `calibration.detach.z_ref` away, then restores AMCL and lidar safety
 - Discrete-time LQR controller with DARE-based gain computation
 - Safety watchdog: safe-stop when the target is lost for too long
 - G7+ integration: each state switches AMCL / the PLC lidar safety field itself (Stage 1 closes AMCL, Stage 2 disables lidar safety, leaving makes sure both are off before it moves and restores both at the end); every failure path restores both
@@ -158,24 +158,17 @@ Launch the camera and both AprilTag nodes under the `wheelchair` namespace:
 
 ```bash
 ros2 launch apriltag april_tag.launch.py
-# more families / other timeouts:
-ros2 launch apriltag april_tag.launch.py detect_tag_families:="tag36h11 tag25h9" dock_timeout:=90.0
+# another config file:
+ros2 launch apriltag april_tag.launch.py config_file:=/path/to/april_tag_config.json
 ```
 
-| Launch argument | Default | Node |
-|---|---|---|
-| `detect_tag_families` | `tag36h11` | detection (`tag_families`): families to detect, space separated; each family adds one detector run per image |
-| `tracking_tag_family` / `tracking_tag_id` | `tag36h11` / `0` | detection: the tag published on `tag_tracing` (closest one; `-1` = any id); the family must be in `detect_tag_families`. control: the same values, to check `tag_tracing` |
-| `leave_distance` | `1.0` m | control: `detach` backs up until the tag is this far ahead of the camera (> 0) |
-| `dock_timeout` / `undock_timeout` | `300.0` / `300.0` s | control: attach / detach timeout (TIMEOUT) |
-| `lost_target_timeout` | `1.0` s | control: tracked tag not seen for this long while running → TAG_LOST |
-| `manage_amcl_and_lidar_safety` | `false` | control |
+`config_file` (default `/mnt/work_space/april_tag_config.json`) is the only launch argument; every setting is in that file (see [Configuration](#configuration)). The included RealSense `rs_launch.py` has a launch argument of the same name (a YAML of camera parameters), so `april_tag.launch.py` passes it `config_file:=''` inside a scoped `GroupAction`; otherwise the camera launch would load the JSON and fail on its `null` values.
 
 To run the nodes alone in the same namespace:
 
 ```bash
-ros2 run apriltag apriltag_detection --ros-args -r __ns:=/wheelchair
-ros2 run apriltag apriltag_control --ros-args -r __ns:=/wheelchair
+ros2 run apriltag apriltag_detection --ros-args -r __ns:=/wheelchair -p config_file:=/mnt/work_space/april_tag_config.json
+ros2 run apriltag apriltag_control --ros-args -r __ns:=/wheelchair -p config_file:=/mnt/work_space/april_tag_config.json
 ```
 
 Print what detection publishes at most 5 Hz. Parameter `topic` (launch argument of `detection_viewer.launch.py`): `tag_tracing` (default; header, `valid`, image size, then the tracked tag if valid) or `apriltag_poses` (header, then family / id / position / orientation of each tag):
@@ -240,18 +233,20 @@ Each command saves the tracked tag's `z_ref` (forward distance, m), `x_ref` (opt
 
 `--file` must be an existing file containing a JSON object. If it is missing, not valid JSON or not an object, `calibrate.py` exits 1 at once (before waiting for a tag) and writes nothing.
 
-Stages can be calibrated independently. A stage absent from the JSON falls back to the default distance (`stage1_distance`, `stage2_distance`, or `leave_distance`) with zero lateral / yaw offset.
+Stages can be calibrated independently. There are no default distances: `apriltag_control` requires all three points (`stage1`, `stage2`, `detach`, each with numeric `z_ref` > 0, `x_ref`, `yaw_ref`), and exits at startup (or rejects the attach / detach on reload) naming the missing one, e.g. `calibration.stage2 is missing or incomplete …`. `apriltag_detection` and `calibrate.py` do not check them, so a stage can be calibrated while `apriltag_control` is down; with a scoped `GroupAction` the launch keeps the camera and detection running when control exits. After saving, restart the container (`docker restart april_tag_serive`) if control had exited, otherwise the next attach / detach re-reads the file.
 
-### Enabling Calibration
+The shipped `april_tag_config.json` holds the previous defaults as points (`z_ref` 0.50 / 0.28 / 1.0 m, `x_ref` 0.026 m = the former `camera_y_offset`, `yaw_ref` 0), which behave as before calibration; `calibrate.py` overwrites them one by one.
 
-Calibration is switched by `calibration.use_calibration` in `april_tag_config.json` (currently `true`); `april_tag.launch.py` takes only `config_file` (default `/mnt/work_space/april_tag_config.json`). `apriltag_control` re-reads the JSON each time an attach / detach is accepted, so saved points and `use_calibration` changes apply without a restart. To disable calibration, set `"use_calibration": false`.
+### Using Calibration
 
-The startup log shows what was loaded and what each stage uses:
+Each stage targets its point: `desired_distance = z_ref`, lateral error `y = -t.x + x_ref`, yaw error `yaw - yaw_ref`. Leave uses only `detach.z_ref` (its `x_ref` / `yaw_ref` only shift the y / yaw errors shown in the status). `apriltag_control` re-reads the JSON each time an attach / detach is accepted, so saved points apply without a restart.
+
+The log shows what is used:
 
 ```
-[calibration] loaded: ['stage1', 'stage2', 'detach']
+[calibration] stage1(z_ref=0.5000m x_ref=0.0260m yaw_ref=0.0000rad), stage2(…), detach(…); tolerance stage1(x=0.050m y=0.050m yaw=0.050rad hold=1.00s), stage2(…)
 # at each stage start:
-[calibration] STAGE1: z_ref=0.5020m x_ref=0.0140m yaw_ref=0.0030rad
+[calibration] STAGE1: z_ref=0.5000m x_ref=0.0260m yaw_ref=0.0000rad; tolerance x=0.050m y=0.050m yaw=0.050rad hold=1.00s
 ```
 
 ## Virtual End-to-End Test
@@ -264,7 +259,7 @@ Run it inside the Docker container (needs `DISPLAY`):
 ros2 launch apriltag virtual_tracking.launch.py
 ```
 
-The stage / leave distances are not set on the sim: it reads `stage1_distance` / `stage2_distance` / `leave_distance` from `apriltag_control` at startup (`apriltag_control/get_parameters`) and sends no cmd before that. Set them with `stage1_distance:=… stage2_distance:=… leave_distance:=…` on the test launch.
+All three nodes read the launch argument `config_file`, default `config/virtual_tracking_config.json` (installed to `share/apriltag/config/`): the same keys as `april_tag_config.json`, with `tag_size` `0.0635`, `manage_amcl_and_lidar_safety` `true` and calibration points `z_ref` 0.50 / 0.28 / 1.0 m, `x_ref` 0.026 m, `yaw_ref` 0. The sim takes its tag size, drawn tag id (`detection.tracking_tag_id`, `-1` → `0`) and stage / leave distances (`calibration.*.z_ref`) from that file. Its ground truth uses its own `camera_y_offset` (0.026 m), so keep `x_ref` 0.026 and `yaw_ref` 0 in a test config. For variant tests copy the file, change it and pass `config_file:=/path/to/copy.json` (e.g. `control.dock_timeout` `3.0` → TIMEOUT, `error_code` 4).
 
 A run is an `attach` call followed by a `detach` call; the reply has no `cmd_id`, so the sim takes it from the status: the first `cmd_id` above the one seen before the call, once the call is accepted. A cmd has ended when `/wheelchair/status` shows `IDLE` with its `cmd_id` (`error_code` 0 with `error_msg` starting with `Cancelled` CANCELED, other 0 SUCCEEDED, else ABORTED); a rejected call, or one without a response after `cmd_reject_timeout` (sim parameter, 2.0 s), ends the run as REJECTED. When the attach succeeds the sim logs `aligned: amcl=off lidar_safety=disabled (held)` (or an error if they were restored too early) and waits in its `ALIGNED` phase (`apriltag_control` is in `IDLE`); Leave (`l`) sends `detach` (headless: sent automatically). The run ends with the detach. Leave without a previous Start runs a leave-only run.
 
@@ -292,7 +287,7 @@ ros2 launch apriltag virtual_tracking.launch.py headless:=true auto_start:=true 
     init_x:=-1.0 init_y:=0.15 init_yaw_deg:=10.0
 ```
 
-The sim's camera intrinsics, camera mount offset, tag size and stage distances are ROS parameters of `virtual_tracking_sim`; the sim draws `tag36h11` id `0` (sim parameter `tag_id`), the default `tracking_tag_family` / `tracking_tag_id` of the test launch; `tracking_tag_id:=5` makes `tag_tracing` always `valid=false` (TAG_LOST, `error_code` 1). `tag_size`, `camera_y_offset` and the stage distances must match the values in `detection_node.py` / `control_node.py`.
+The sim's camera intrinsics and camera mount offset are ROS parameters of `virtual_tracking_sim`. It always draws a `tag36h11` tag with the config's `tracking_tag_id`, so changing `tracking_tag_id` in a test config does **not** produce TAG_LOST (known limitation).
 
 ## Topics
 
@@ -327,17 +322,18 @@ Follows `[service_robot] wheelchair_interface.pdf` (v0.1) with these differences
 | Service | Effect |
 |---|---|
 | `attach` `true` | Only in `IDLE`: Stage 1 + 2 (dock). Gets a new `cmd_id` n (1, 2, … since the node started; status `cmd_id` = n), error cleared. Succeeds in `IDLE` with AMCL closed, lidar safety disabled. Else `success=false` |
-| `detach` `true` | Only in `IDLE`, with or without a previous attach (new `cmd_id` like attach): back straight up until the tag is `leave_distance` ahead, then restore AMCL / lidar safety |
+| `detach` `true` | Only in `IDLE`, with or without a previous attach (new `cmd_id` like attach): back straight up until the tag is `calibration.detach.z_ref` ahead, then restore AMCL / lidar safety |
 | `attach` / `detach` `false` | Only the running cmd of the same service (`attach`: `STAGE1` / `STAGE2`, `detach`: `LEAVING`): `success=true` (`cancel requested`); stop at once, restore, `IDLE` with `error_code` 0 and `error_msg` `Cancelled cmd_id=n. elapsed=…s` (`error_code` 2 if the restore failed). If the cmd is already ending (e.g. just aligned) `msg` is `already ending, result unchanged` and the status keeps its own result, so always check the status `error_code` / `error_msg`. In `IDLE`: `success=false` (`nothing running`); the other cmd running: `success=false`, e.g. `rejected: state=LEAVING (only accepted in STAGE1, STAGE2)`, status unchanged |
 
 `/wheelchair/status` (`std_msgs/String`, reliable, transient_local, depth 1, 5 Hz):
 
 ```json
 {"state": "Attaching(STAGE1)", "cmd_id": 17, "attached": false, "error_code": 0, "error_msg": "", "stamp": 1792389633.11,
- "x_error": 0.12, "y_error": -0.02, "yaw_error": 0.01, "last_frame_age": 0.03}
+ "x_error": 0.12, "y_error": -0.02, "yaw_error": 0.01, "last_frame_age": 0.03,
+ "cmd_vx": 0.1, "cmd_vy": -0.02, "cmd_wz": 0.01}
 ```
 
-`state` is the `TrackingState` as a status string (`STATUS_STATE` in `control_node.py`: `IDLE`, `Attaching(STAGE1)`, `Attaching(STAGE2)`, `Detaching`; logs and service replies keep the enum value, e.g. `STAGE1`); `cmd_id` the current / last cmd (0 after startup); `stamp` the publish time (epoch s); `x_error` / `y_error` (m), `yaw_error` (rad) and `last_frame_age` (s, node clock − `header.stamp` of the newest frame with the tracked tag) are debug fields, `null` when unknown. A cmd has ended when the state is `IDLE` with its `cmd_id`; `error_code` 0 means it succeeded (`error_msg` `Attach succeeded` / `Detach succeeded`) or was cancelled (`error_msg` starts with `Cancelled`); while running `error_msg` is `""`, after a failure it is the reason. `error_code` / `error_msg` are written together with the change to `IDLE`.
+`state` is the `TrackingState` as a status string (`STATUS_STATE` in `control_node.py`: `IDLE`, `Attaching(STAGE1)`, `Attaching(STAGE2)`, `Detaching`; logs and service replies keep the enum value, e.g. `STAGE1`); `cmd_id` the current / last cmd (0 after startup); `stamp` the publish time (epoch s); `x_error` / `y_error` (m), `yaw_error` (rad) and `last_frame_age` (s, node clock − `header.stamp` of the newest frame with the tracked tag) and `cmd_vx` / `cmd_vy` (m/s), `cmd_wz` (rad/s) are debug fields, `null` when unknown. `cmd_vx` / `cmd_vy` / `cmd_wz` are the last velocity sent on `/cmd_vel` or `/pre_cmd_vel` (stops included, as `0`; status is 5 Hz, so only the newest of the ~30 Hz commands is shown), `null` if none was sent within the last 1 s (`CMD_VEL_MAX_AGE` in `control_node.py`) or since startup. A cmd has ended when the state is `IDLE` with its `cmd_id`; `error_code` 0 means it succeeded (`error_msg` `Attach succeeded` / `Detach succeeded`) or was cancelled (`error_msg` starts with `Cancelled`); while running `error_msg` is `""`, after a failure it is the reason. `error_code` / `error_msg` are written together with the change to `IDLE`.
 
 | `error_code` | Meaning |
 |---|---|
@@ -393,12 +389,12 @@ The once-per-second limit is `LOG_THROTTLE_SEC` in `control_node.py`.
 | `tag_size.tag_size` | `0.0475` m | detection, control | detection: startup only; control: each cmd | **Edge of the tag's black square (8 × 8 cells, without the white border). Must match the printed tag**; control uses it only for the S4 yaw-precision table |
 | `tag_size.tag_sizes` | `""` | detection, control | as `tag_size` | Per-id sizes `'id:size ...'` (m, any family), e.g. `'3:0.095'`; other ids use `tag_size` |
 | `control.manage_amcl_and_lidar_safety` | `false` | control | each cmd | `false` skips every AMCL and lidar safety call (tracking is never blocked by them) |
-| `control.stage1_distance` / `stage2_distance` | `0.50` / `0.28` m | control | each cmd | Stage 1 / Stage 2 target forward distance to the tag (> 0) |
-| `control.leave_distance` | `1.0` m | control | each cmd | detach backs up until the tag is this far ahead (> 0) |
+| `control.stage1_tolerance` / `stage2_tolerance` | `{"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 1.0}` each | control | each cmd | In-position check of Stage 1 / Stage 2: \|x\|, \|y\| (m) and \|yaw\| (rad, filtered size minus `yaw_ref`) within these for `hold_seconds` (s). x / y / yaw > 0, `hold_seconds` ≥ 0. `stage1_tolerance` x / y also gate the S3 yaw probe |
 | `control.dock_timeout` / `undock_timeout` | `300.0` s | control | each cmd | attach / detach timeout, from cmd accepted until it ends (> 0) |
 | `control.lost_target_timeout` | `1.0` s | control | each cmd | Tracked tag not seen for this long while running → TAG_LOST (> 0) |
-| `calibration.use_calibration` | `true` | control | each cmd | `false`: ignore the calibration points, behaviour unchanged |
-| `calibration.stage1` / `stage2` / `detach` | `null` | control | each cmd | Reference poses written by `tools/calibrate.py` (see [Calibration](#calibration)); `null` / invalid → default distance, zero lateral / yaw offset |
+| `control.max_vx` / `max_vy` / `max_vw` | `0.1` / `0.1` m/s, `0.05` rad/s | control | each cmd | Stage 1 / 2 per-axis velocity saturation (> 0); leave backs up at `-max_vx` |
+| `control.min_vx` / `min_vy` / `min_vw` | `0.01` / `0.01` m/s, `0.01` rad/s | control | each cmd | Stage 1 / 2 per-axis minimum (G7+ deadband): after the max clip, a non-zero \|v\| below min is sent as `sign(v)·min`; `0` stays `0` (≥ 0, ≤ max; `0` disables). Not applied to leave or stop commands |
+| `calibration.stage1` / `stage2` / `detach` | `z_ref` 0.50 / 0.28 / 1.0 m, `x_ref` 0.026 m, `yaw_ref` 0 | control | each cmd | **Required.** Target pose of Stage 1 / Stage 2 / leave: `z_ref` = target forward distance (> 0; `detach`: leave distance), `x_ref` (m) / `yaw_ref` (rad) = lateral / yaw reference. Written by `tools/calibrate.py` (see [Calibration](#calibration)); `stamp` / `image_path` are metadata only |
 | `yaw_estimator.s4_distances` | `[0.3, 0.5, 0.7]` m | control | each cmd | Yaw precision table: equivalent-distance breakpoints; beyond the last one yaw is not used. Non-empty, same length as `s4_sigmas_deg` |
 | `yaw_estimator.s4_sigmas_deg` | `[1.0, 2.0, 3.0]` deg | control | each cmd | Yaw precision table: sigma at each breakpoint |
 | `ros_interfaces.amcl_check_service` / `amcl_close_service` / `amcl_open_service` | `/check_mcl_if_trigger` / `/close_amcl` / `/open_amcl` | control | startup only | G7+ AMCL services (absolute names) |
@@ -406,28 +402,21 @@ The once-per-second limit is `LOG_THROTTLE_SEC` in `control_node.py`.
 | `ros_interfaces.stage1_cmd_vel_topic` | `/cmd_vel` | control | startup only | Stage 1 velocity commands |
 | `ros_interfaces.stage2_cmd_vel_topic` | `/pre_cmd_vel` | control | startup only | Stage 2 and leaving velocity commands (G7+ precision mode) |
 
-Without `config_file` (e.g. `virtual_tracking.launch.py`) the nodes fall back to ROS parameters with the same names as the keys above (detection: `tag_families` for `detect_tag_families`). Code defaults then differ from the shipped JSON: `tag_size` `0.0635`, `manage_amcl_and_lidar_safety` `true`, `use_calibration` `false` (no calibration points).
+`config_file` is required by both nodes (`config_file is required` otherwise). `apriltag_detection` checks only the shared sections, so it starts with incomplete calibration; `apriltag_control` additionally requires both tolerances and all three calibration points, and rejects removed keys with a hint: `control.stage1_distance` / `stage2_distance` / `leave_distance` (→ `calibration.stage1` / `stage2` / `detach` `.z_ref`) and `calibration.use_calibration` (calibration is always used).
 
 ### ROS parameters not in the JSON (`apriltag_control`)
 
 | Parameter | Default |
 |---|---|
-| `config_file` | `''` (`april_tag.launch.py` passes `/mnt/work_space/april_tag_config.json`) |
+| `config_file` | `''`, required (`april_tag.launch.py` passes `/mnt/work_space/april_tag_config.json`) |
 | `body_status_topic` | `/g7_body/simple_ui/body_status` |
 | `external_service_timeout` | `5.0` s (wait for service + wait for response, each) |
 | yaw estimator / S3 probe tuning (`quality_border_px`, `ref_tag_size`, `yaw_*`, `probe_*`, …) | see `AprilTagControlNode.__init__()`; `ref_tag_size` (`0.0475`) is the base size of the S4 table, change only when the table is recalibrated |
 
 ### Hard-coded values (`apriltag_control`)
 
-Check `camera_y_offset` against the real robot before running on it.
-
 | Value | Setting | Where | Description |
 |---|---|---|---|
-| `camera_y_offset` | `0.026` m (= `0.036` mount + `y_offset` `-0.01` trim) | `control_node.py` | Camera lateral offset from the robot centre line, + = left; default lateral reference when not calibrated |
-| `stop_x/y/yaw_error_tolerance` | `0.05` m / `0.05` m / `0.05` rad | `control_node.py` | A stage is aligned when all errors stay within these |
-| `stop_hold_seconds` | `1.0` s | `control_node.py` | ... for this long |
-| `max_vx`, `max_vy` | `0.1` m/s | `control_node.py` | Linear velocity saturation; leave backs up at `-max_vx` |
-| `max_vw` | `0.05` rad/s | `control_node.py` | Angular velocity saturation |
 | `max_dt` | `0.2` s | `control_node.py` | Timestep cap (handles frame drops) |
 | `smooth_tau` | `0.5` s | `control_node.py` (`TrajectoryPlanner`) | Reference smoothing time constant |
 | LQR Q weights | `(1.0, 1.0, 0.5)` | `control.py` default | State cost: x, y, yaw |
@@ -488,9 +477,9 @@ apriltag_ws/
 
 ### Docking Stages
 
-1. **Stage 1** — track to `stage1_distance` (0.50 m). When all errors stay within tolerance for `stop_hold_seconds`, the robot stops and Stage 2 disables the lidar safety field before it moves.
-2. **Stage 2** — track to `stage2_distance` (0.28 m). When converged the robot stops and the node returns to `IDLE` (AMCL closed, lidar safety disabled); then the cmd succeeds.
-3. **Leave** (`detach`) — no planner / LQR: every tag pose publishes `vx = -max_vx, vy = 0, wz = 0` on `/pre_cmd_vel` until the camera-to-tag forward distance ≥ `leave_distance`; y / yaw are not checked and there is no hold time. Then the robot stops (`Leave reached 1.00m (forward=…m).`) and AMCL / lidar safety are restored. Losing the tag for `lost_target_timeout` stops the robot and aborts the leave.
+1. **Stage 1** — track to `calibration.stage1` (`z_ref` 0.50 m shipped). When all errors stay within `control.stage1_tolerance` for its `hold_seconds`, the robot stops and Stage 2 disables the lidar safety field before it moves.
+2. **Stage 2** — track to `calibration.stage2` (`z_ref` 0.28 m shipped). When within `control.stage2_tolerance` for its `hold_seconds` the robot stops and the node returns to `IDLE` (AMCL closed, lidar safety disabled); then the cmd succeeds.
+3. **Leave** (`detach`) — no planner / LQR: every tag pose publishes `vx = -max_vx, vy = 0, wz = 0` on `/pre_cmd_vel` until the camera-to-tag forward distance ≥ `calibration.detach.z_ref`; y / yaw are not checked and there is no hold time. Then the robot stops (`Leave reached 1.00m (forward=…m).`) and AMCL / lidar safety are restored. Losing the tag for `lost_target_timeout` stops the robot and aborts the leave.
 
 ### Trajectory Planner
 

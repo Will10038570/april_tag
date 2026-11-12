@@ -20,7 +20,7 @@ from std_msgs.msg import Bool, Int32, String
 from std_srvs.srv import Empty, SetBool, Trigger
 
 from apriltag.control import LQRTracker, TrajectoryPlanner
-from apriltag.domain.config_loader import load_config
+from apriltag.domain.config_loader import StageTolerance, load_config, validate_control_config
 from apriltag.domain.math_utils import (
     optical_to_control_error,
     parse_tag_sizes,
@@ -34,19 +34,22 @@ from apriltag.runtime.cmd_flow import (
     SUCCESS_MSG,
     Codes,
     final_outcome,
+    recent_cmd,
     status_json,
     tag_id_filter,
     validate_goal,
 )
-from apriltag.runtime.control_flow import leave_step, publish_control
+from apriltag.runtime.control_flow import in_tolerance, leave_step, publish_control, validate_speed_limits
 from apriltag.runtime.safety_guard import handle_target_lost
 from apriltag.runtime.target_flow import ANY_TAG_ID, tag_matches
 from apriltag.runtime.yaw_probe import YawProbe, YawProbeConfig
 from apriltag.yaw_estimator import YawEstimator, YawEstimatorConfig
-from apriltag.domain.calibration import CalibrationPoint, load_calibration_from_config
+from apriltag.domain.calibration import CalibrationPoint
 
 # high-rate messages (cmd_vel, status) are logged at most once per this period
 LOG_THROTTLE_SEC = 1.0
+# status cmd_vx / cmd_vy / cmd_wz are null when the last sent cmd_vel is older than this (s)
+CMD_VEL_MAX_AGE = 1.0
 # /wheelchair/status (heartbeat) and timeout check period (s), 5 Hz
 STATUS_PERIOD = 0.2
 # transient_local: a restarted subscriber gets the current status at once
@@ -56,10 +59,10 @@ STATUS_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
 
 class TrackingState(Enum):
     IDLE = 'IDLE'        # nothing running; AMCL / lidar safety as the last procedure left them
-    STAGE1 = 'STAGE1'    # enable lidar safety, close AMCL; track stage1_distance on /cmd_vel
-    STAGE2 = 'STAGE2'    # disable lidar safety; track stage2_distance on /pre_cmd_vel
-    LEAVING = 'LEAVING'  # disable lidar safety, close AMCL; back straight to the
-                         # leave_distance; restore AMCL / lidar safety
+    STAGE1 = 'STAGE1'    # enable lidar safety, close AMCL; track calibration.stage1 on /cmd_vel
+    STAGE2 = 'STAGE2'    # disable lidar safety; track calibration.stage2 on /pre_cmd_vel
+    LEAVING = 'LEAVING'  # disable lidar safety, close AMCL; back straight to
+                         # calibration.detach.z_ref; restore AMCL / lidar safety
 
 
 class Step(Enum):
@@ -78,6 +81,8 @@ ALLOWED_TRANSITIONS = {
 }
 # states with a running goal; velocity is published only in their RUNNING step
 ACTIVE_STATES = frozenset({S.STAGE1, S.STAGE2, S.LEAVING})
+# calibration point (and, for STAGE1 / STAGE2, in-position tolerance) of each active state
+CAL_KEY = {S.STAGE1: 'stage1', S.STAGE2: 'stage2', S.LEAVING: 'detach'}
 # cmd -> states in which it is accepted; a running cmd is stopped by its own
 # service with data=false
 GOAL_RULES = {
@@ -153,7 +158,7 @@ class AprilTagControlNode(Node):
     enters LEAVING: it disables lidar safety, closes AMCL (both are usually
     already so after Stage 2), then backs straight up at max_vx on
     /pre_cmd_vel, without the planner / LQR, until the tag is at least
-    leave_distance ahead of the camera; then it stops, enables lidar safety
+    calibration.detach.z_ref ahead of the camera; then it stops, enables lidar safety
     and makes sure AMCL is open before IDLE. A failure, cancel, timeout or
     target loss in any state ends the same way as LEAVING: stop, restore AMCL
     / lidar safety, IDLE. Node shutdown restores them too. With
@@ -187,18 +192,19 @@ class AprilTagControlNode(Node):
     def __init__(self):
         super().__init__('apriltag_control')
 
-        # Config loading: if config_file is set, all JSON-covered params are read from
-        # the file; otherwise individual ROS params are used (backward compat for
-        # virtual_tracking.launch.py which does not pass config_file).
+        # all JSON-covered params come from config_file (required); a bad
+        # config raises ValueError and the node fails
         _cfg_file = str(self.declare_parameter('config_file', '').value)
+        if not _cfg_file:
+            raise ValueError('config_file is required (path to april_tag_config.json).')
         self._config_file = _cfg_file
-        _cfg = load_config(_cfg_file) if _cfg_file else None   # raises ValueError → node fails
+        _cfg = load_config(_cfg_file)
+        # in-position tolerances {'stage1', 'stage2'} and calibration points
+        # {'stage1', 'stage2', 'detach'}; all required
+        self._tolerances, self._calibration = validate_control_config(_cfg)
 
-        def jp(section: str, key: str, ros_name: str, default):
-            """Return value from JSON config if available, else from a ROS parameter."""
-            if _cfg is not None:
-                return _cfg[section][key]
-            return self.declare_parameter(ros_name, default).value
+        def jp(section: str, key: str):
+            return _cfg[section][key]
 
         # the tracked tag, picked by apriltag_detection
         self.tracing_sub = self.create_subscription(TagTracing,
@@ -212,8 +218,8 @@ class AprilTagControlNode(Node):
         self._mismatch_warned: Optional[Tuple[str, str]] = None
         ## tag size: real black-border side (m), tag_sizes 'id:size ...' per id;
         # must match apriltag_detection. Only the S4 table conversion uses it here.
-        self.tag_size = float(jp('tag_size', 'tag_size', 'tag_size', 0.0635))
-        self.tag_sizes = parse_tag_sizes(str(jp('tag_size', 'tag_sizes', 'tag_sizes', '')))
+        self.tag_size = float(jp('tag_size', 'tag_size'))
+        self.tag_sizes = parse_tag_sizes(str(jp('tag_size', 'tag_sizes')))
         if self.tag_size <= 0.0:
             raise ValueError('Parameter tag_size must be positive.')
 
@@ -228,8 +234,8 @@ class AprilTagControlNode(Node):
             sigma_dh=float(p('sigma_dh', 0.39)),
             snr_lo=float(p('c_sign_snr_lo', 1.0)),
             snr_hi=float(p('c_sign_snr_hi', 2.0)),
-            s4_distances=[float(v) for v in jp('yaw_estimator', 's4_distances', 's4_distances', [0.3, 0.5, 0.7])],
-            s4_sigmas_deg=[float(v) for v in jp('yaw_estimator', 's4_sigmas_deg', 's4_sigmas_deg', [1.0, 2.0, 3.0])],
+            s4_distances=[float(v) for v in jp('yaw_estimator', 's4_distances')],
+            s4_sigmas_deg=[float(v) for v in jp('yaw_estimator', 's4_sigmas_deg')],
             # base size of the S4 table, not the tag in use: change only when
             # the table is recalibrated
             ref_tag_size=float(p('ref_tag_size', 0.0475)),
@@ -262,15 +268,9 @@ class AprilTagControlNode(Node):
         # wz actually published last (0 after a stop), for the yaw filter
         self._last_wz_cmd = 0.0
 
-        ## AprilTag distance parameters
-        # two-stage desired forward distances to tag (m)
-        self.stage1_distance = float(jp('control', 'stage1_distance', 'stage1_distance', 0.50))
-        self.stage2_distance = float(jp('control', 'stage2_distance', 'stage2_distance', 0.28))
-        self.desired_distance = self.stage1_distance
-        # camera lateral offset in AMR control frame (+left / -right)
-        # self.camera_y_offset = 0.036
-        self.y_offset = -0.01
-        self.camera_y_offset = 0.036 + self.y_offset
+        # target forward distance to the tag (m) of the running state:
+        # its calibration point's z_ref, set when it starts running
+        self.desired_distance = self._calibration['stage1'].z_ref
 
         ## control-related state and parameters
         # trajectory planner and LQR tracker
@@ -280,22 +280,32 @@ class AprilTagControlNode(Node):
         self.lqr_tracker = LQRTracker(r_weights=(3.0, 1.0, 3.0))
         # Stage 1: normal cmd_vel; Stage 2 and leaving: G7+ precision cmd_vel,
         # same as the final approach of G7+ AutoCharging
-        self.stage1_cmd_vel_topic = str(jp('ros_interfaces', 'stage1_cmd_vel_topic', 'stage1_cmd_vel_topic', '/cmd_vel'))
-        self.stage2_cmd_vel_topic = str(jp('ros_interfaces', 'stage2_cmd_vel_topic', 'stage2_cmd_vel_topic', '/pre_cmd_vel'))
+        self.stage1_cmd_vel_topic = str(jp('ros_interfaces', 'stage1_cmd_vel_topic'))
+        self.stage2_cmd_vel_topic = str(jp('ros_interfaces', 'stage2_cmd_vel_topic'))
         self.stage1_cmd_pub = self.create_publisher(Twist, self.stage1_cmd_vel_topic, 10)
         self.stage2_cmd_pub = self.create_publisher(Twist, self.stage2_cmd_vel_topic, 10)
         # capture time (s) of the last pose used for control, for dt
         self._last_stamp = None
-        self.max_vx = 0.1
-        self.max_vy = 0.1
-        self.max_vw = 0.05
+        # per-axis speed limits for Stage 1 / 2 (vx, vy m/s; vw rad/s): clip to
+        # max, then raise a non-zero |v| below min to min (G7+ deadband);
+        # leave backs up at -max_vx
+        self.max_vx = float(jp('control', 'max_vx'))
+        self.max_vy = float(jp('control', 'max_vy'))
+        self.max_vw = float(jp('control', 'max_vw'))
+        self.min_vx = float(jp('control', 'min_vx'))
+        self.min_vy = float(jp('control', 'min_vy'))
+        self.min_vw = float(jp('control', 'min_vw'))
+        _speed_reason = validate_speed_limits(self.max_vx, self.max_vy, self.max_vw,
+                                              self.min_vx, self.min_vy, self.min_vw)
+        if _speed_reason is not None:
+            raise ValueError(f'Parameter {_speed_reason}.')
         self.max_dt = 0.2
         self.latest_plan = None
         # whole-cmd timeouts (s), from attach / detach accepted until it ends
-        self.dock_timeout = float(jp('control', 'dock_timeout', 'dock_timeout', 300.0))
-        self.undock_timeout = float(jp('control', 'undock_timeout', 'undock_timeout', 300.0))
+        self.dock_timeout = float(jp('control', 'dock_timeout'))
+        self.undock_timeout = float(jp('control', 'undock_timeout'))
         # target not seen for this long (s) while running ends the cmd (TAG_LOST)
-        self.lost_target_timeout = float(jp('control', 'lost_target_timeout', 'lost_target_timeout', 1.0))
+        self.lost_target_timeout = float(jp('control', 'lost_target_timeout'))
         for name in ('dock_timeout', 'undock_timeout', 'lost_target_timeout'):
             if not getattr(self, name) > 0.0:
                 raise ValueError(f'Parameter {name} must be positive.')
@@ -310,51 +320,25 @@ class AprilTagControlNode(Node):
         self._idle.set()
         self._stage_logger = _StageLogger(self)
         self._error_zero_since = None
-        self.stop_hold_seconds = 1.0
-        self.stop_x_error_tolerance = 0.05
-        self.stop_y_error_tolerance = 0.05
-        self.stop_yaw_error_tolerance = 0.05
+        # in-position tolerance of the running stage (None while leaving / IDLE)
+        self._active_tol: Optional[StageTolerance] = None
         # set when the running goal has a result (its state is in ENDING)
         self._tracking_done = threading.Event()
         self._tracking_result: dict = {}
         self._latest_best_target: dict = {}
         self._tracking_start_time: Optional[float] = None
-        # tag the cmds track (same values as apriltag_detection's) and the
-        # leave distance (m, camera-to-tag forward distance to back up to)
-        tag_family = str(jp('detection', 'tracking_tag_family', 'tracking_tag_family', 'tag36h11')).strip()
-        tag_id = int(jp('detection', 'tracking_tag_id', 'tracking_tag_id', 0))
-        leave_distance = float(jp('control', 'leave_distance', 'leave_distance', 1.0))
-        reason = validate_goal(tag_id, tag_family, leave_distance)
+        # tag the cmds track (same values as apriltag_detection's)
+        tag_family = str(jp('detection', 'tracking_tag_family')).strip()
+        tag_id = int(jp('detection', 'tracking_tag_id'))
+        reason = validate_goal(tag_id, tag_family)
         if reason is not None:
-            raise ValueError(f'Invalid tracking_tag_family / tracking_tag_id / leave_distance: {reason}')
+            raise ValueError(f'Invalid tracking_tag_family / tracking_tag_id: {reason}')
         self._goal_tag_family = tag_family
         self._goal_tag_id = tag_id_filter(tag_id)
-        self._goal_leave_distance = leave_distance
-        # calibration reference points (loaded at startup if use_calibration=true)
-        self.use_calibration = bool(jp('calibration', 'use_calibration', 'use_calibration', False))
-        self._cal_stage1: Optional[CalibrationPoint] = None
-        self._cal_stage2: Optional[CalibrationPoint] = None
-        self._cal_detach: Optional[CalibrationPoint] = None
-        self._active_x_ref: float = self.camera_y_offset   # replaced per-stage at RUNNING start
-        self._active_yaw_ref: float = 0.0
-        if self.use_calibration:
-            if _cfg is not None:
-                cal = load_calibration_from_config(_cfg)
-                self._cal_stage1 = cal.get('stage1')
-                self._cal_stage2 = cal.get('stage2')
-                self._cal_detach = cal.get('detach')
-                loaded = [k for k, v in cal.items() if v is not None]
-                missing = [k for k, v in cal.items() if v is None]
-                if loaded:
-                    self.get_logger().info(
-                        self._stage() + f'[calibration] loaded: {loaded}'
-                        + (f'; no calibration for: {missing}' if missing else ''))
-                else:
-                    self.get_logger().warn(
-                        self._stage() + '[calibration] no valid stages found in config. Using defaults.')
-            else:
-                self.get_logger().warn(
-                    self._stage() + '[calibration] use_calibration=true but no config_file; using defaults.')
+        # x / yaw references of the running state (its calibration point's
+        # x_ref / yaw_ref), set when it starts running
+        self._active_x_ref: float = self._calibration['stage1'].x_ref
+        self._active_yaw_ref: float = self._calibration['stage1'].yaw_ref
         # the running cmd, set in _cmd_callback under _control_lock: cmd
         # (ATTACH / DETACH) and deadline (monotonic)
         self._goal_action: Optional[str] = None
@@ -367,6 +351,9 @@ class AprilTagControlNode(Node):
         self._error_msg = ''
         # header.stamp (s, ROS time) of the newest frame with the tracked tag
         self._last_frame_stamp: Optional[float] = None
+        # last sent cmd_vel (vx, vy, wz, time.monotonic()) on either topic, stops
+        # included; None until the first one (under _control_lock)
+        self._last_cmd: Optional[Tuple[float, float, float, float]] = None
 
         # tracing_callback and the lost-target timer share the default
         # (mutually exclusive) group, so they never run concurrently.
@@ -379,19 +366,14 @@ class AprilTagControlNode(Node):
         ## external services (AMCL, PLC lidar safety)
         # False: never call the AMCL / lidar safety services, so tracking is
         # not blocked by them; True: switch AMCL and lidar safety as below
-        self.manage_amcl_and_lidar_safety = bool(jp(
-            'control', 'manage_amcl_and_lidar_safety', 'manage_amcl_and_lidar_safety', True))
+        self.manage_amcl_and_lidar_safety = bool(jp('control', 'manage_amcl_and_lidar_safety'))
         # check: success=True means AMCL is running
-        self.amcl_check_service = str(jp(
-            'ros_interfaces', 'amcl_check_service', 'amcl_check_service', '/check_mcl_if_trigger'))
-        self.amcl_close_service = str(jp(
-            'ros_interfaces', 'amcl_close_service', 'amcl_close_service', '/close_amcl'))
-        self.amcl_open_service = str(jp(
-            'ros_interfaces', 'amcl_open_service', 'amcl_open_service', '/open_amcl'))
+        self.amcl_check_service = str(jp('ros_interfaces', 'amcl_check_service'))
+        self.amcl_close_service = str(jp('ros_interfaces', 'amcl_close_service'))
+        self.amcl_open_service = str(jp('ros_interfaces', 'amcl_open_service'))
         # Bool data=True disables the lidar safety field, False enables it;
         # fire-and-forget, same as G7+ AutoCharging
-        self.lidar_safety_topic = str(jp(
-            'ros_interfaces', 'lidar_safety_topic', 'lidar_safety_topic', '/g7_plc/disable_lidar_safety'))
+        self.lidar_safety_topic = str(jp('ros_interfaces', 'lidar_safety_topic'))
         self.external_service_timeout = float(self.declare_parameter(
             'external_service_timeout', 5.0).value)
 
@@ -433,8 +415,8 @@ class AprilTagControlNode(Node):
             self._stage() + f'dock_timeout={self.dock_timeout:.1f}s undock_timeout={self.undock_timeout:.1f}s '
             f'lost_target_timeout={self.lost_target_timeout:.2f}s tracking {self._goal_tag_family} id '
             + ('any' if self._goal_tag_id == ANY_TAG_ID else self._goal_tag_id)
-            + f' leave_distance={self._goal_leave_distance:.2f}m'
         )
+        self._log_calibration()
         self.get_logger().info(
             self._stage() + f'State {self._state.value}. Call {self.attach_srv.srv_name} or '
             f'{self.detach_srv.srv_name} to start.'
@@ -464,11 +446,11 @@ class AprilTagControlNode(Node):
         cfg = load_config(self._config_file)
         # cross-field / format checks that the setters below would otherwise hit
         reason = validate_goal(int(cfg['detection']['tracking_tag_id']),
-                               str(cfg['detection']['tracking_tag_family']).strip(),
-                               float(cfg['control']['leave_distance']))
+                               str(cfg['detection']['tracking_tag_family']).strip())
         if reason is not None:
             raise ValueError(f'Invalid config: {reason}')
         parse_tag_sizes(str(cfg['tag_size']['tag_sizes']))
+        validate_control_config(cfg)
         return cfg
 
     def _apply_config_locked(self, cfg: dict) -> None:
@@ -478,22 +460,21 @@ class AprilTagControlNode(Node):
         transition), so tracing_callback and no worker use these values yet.
         """
         self.manage_amcl_and_lidar_safety = bool(cfg['control']['manage_amcl_and_lidar_safety'])
-        self.stage1_distance      = float(cfg['control']['stage1_distance'])
-        self.stage2_distance      = float(cfg['control']['stage2_distance'])
-        self._goal_leave_distance = float(cfg['control']['leave_distance'])
         self.dock_timeout         = float(cfg['control']['dock_timeout'])
         self.undock_timeout       = float(cfg['control']['undock_timeout'])
         self.lost_target_timeout  = float(cfg['control']['lost_target_timeout'])
+        self.max_vx               = float(cfg['control']['max_vx'])
+        self.max_vy               = float(cfg['control']['max_vy'])
+        self.max_vw               = float(cfg['control']['max_vw'])
+        self.min_vx               = float(cfg['control']['min_vx'])
+        self.min_vy               = float(cfg['control']['min_vy'])
+        self.min_vw               = float(cfg['control']['min_vw'])
         self.tag_size             = float(cfg['tag_size']['tag_size'])
         self.tag_sizes            = parse_tag_sizes(str(cfg['tag_size']['tag_sizes']))
         self._goal_tag_family     = str(cfg['detection']['tracking_tag_family']).strip()
         self._goal_tag_id         = tag_id_filter(int(cfg['detection']['tracking_tag_id']))
-        self.use_calibration      = bool(cfg['calibration']['use_calibration'])
-
-        cal = load_calibration_from_config(cfg)
-        self._cal_stage1 = cal.get('stage1')
-        self._cal_stage2 = cal.get('stage2')
-        self._cal_detach = cal.get('detach')
+        # already validated by _read_config()
+        self._tolerances, self._calibration = validate_control_config(cfg)
 
         new_dists = [float(v) for v in cfg['yaw_estimator']['s4_distances']]
         new_sigs  = [float(v) for v in cfg['yaw_estimator']['s4_sigmas_deg']]
@@ -507,6 +488,15 @@ class AprilTagControlNode(Node):
 
         self.get_logger().info(
             self._stage() + f'[config] Reloaded from {self._config_file!r}')
+        self._log_calibration()
+
+    def _log_calibration(self) -> None:
+        """Log the calibration points and in-position tolerances in use."""
+        cal = ', '.join(f'{k}(z_ref={p.z_ref:.4f}m x_ref={p.x_ref:.4f}m yaw_ref={p.yaw_ref:.4f}rad)'
+                        for k, p in self._calibration.items())
+        tol = ', '.join(f'{k}(x={t.x:.3f}m y={t.y:.3f}m yaw={t.yaw:.3f}rad hold={t.hold_seconds:.2f}s)'
+                        for k, t in self._tolerances.items())
+        self.get_logger().info(self._stage() + f'[calibration] {cal}; tolerance {tol}')
 
     def _transition_locked(self, new: TrackingState, step: Optional[Step], reason: str) -> bool:
         """Change state (and its step) if allowed; the caller must hold _control_lock."""
@@ -533,11 +523,8 @@ class AprilTagControlNode(Node):
         self.get_logger().info(
             self._stage() + f'[step] {self._state.value} {old.value if old else "-"} -> {step.value} ({reason})')
 
-    def _reset_control_locked(self, desired_distance: float) -> None:
+    def _reset_control_locked(self) -> None:
         """Reset the controller for a new tracking phase; the caller must hold _control_lock."""
-        self.desired_distance = desired_distance
-        self._active_x_ref = self.camera_y_offset   # restored to default; overridden below if calibrated
-        self._active_yaw_ref = 0.0
         self._error_zero_since = None
         self._last_stamp = None
         self._last_target_time = None
@@ -545,25 +532,26 @@ class AprilTagControlNode(Node):
         self.trajectory_planner.reset()
         self.lqr_tracker.reset()
 
-    def _begin_running_locked(self, desired_distance: float, reason: str) -> None:
-        """PREPARING -> RUNNING with a fresh controller; the caller must hold _control_lock."""
+    def _begin_running_locked(self, reason: str) -> None:
+        """PREPARING -> RUNNING with a fresh controller; the caller must hold _control_lock.
+
+        Targets the state's calibration point (STAGE1: stage1, STAGE2: stage2,
+        LEAVING: detach) and, in STAGE1 / STAGE2, its in-position tolerance.
+        """
         # _last_target_time is reset too, so the watchdog starts counting now
-        self._reset_control_locked(desired_distance)
-        if self.use_calibration:
-            _CAL = {S.STAGE1: self._cal_stage1, S.STAGE2: self._cal_stage2,
-                    S.LEAVING: self._cal_detach}
-            _cal = _CAL.get(self._state)
-            if _cal is not None:
-                self.desired_distance = _cal.z_ref
-                self._active_x_ref = _cal.x_ref
-                self._active_yaw_ref = _cal.yaw_ref
-                self.get_logger().info(
-                    self._stage() + f'[calibration] {self._state.value}: '
-                    f'z_ref={_cal.z_ref:.4f}m x_ref={_cal.x_ref:.4f}m yaw_ref={_cal.yaw_ref:.4f}rad')
-            else:
-                self.get_logger().info(
-                    self._stage() + f'[calibration] {self._state.value}: no calibration, '
-                    f'using defaults (desired_distance={self.desired_distance:.4f}m)')
+        self._reset_control_locked()
+        key = CAL_KEY[self._state]
+        point = self._calibration[key]
+        self.desired_distance = point.z_ref
+        self._active_x_ref = point.x_ref
+        self._active_yaw_ref = point.yaw_ref
+        self._active_tol = self._tolerances.get(key)
+        tol = self._active_tol
+        self.get_logger().info(
+            self._stage() + f'[calibration] {self._state.value}: z_ref={point.z_ref:.4f}m '
+            f'x_ref={point.x_ref:.4f}m yaw_ref={point.yaw_ref:.4f}rad'
+            + (f'; tolerance x={tol.x:.3f}m y={tol.y:.3f}m yaw={tol.yaw:.3f}rad '
+               f'hold={tol.hold_seconds:.2f}s' if tol is not None else ''))
         self._set_step_locked(Step.RUNNING, reason)
 
     def _is_running_locked(self) -> bool:
@@ -615,6 +603,9 @@ class AprilTagControlNode(Node):
         for pub in (self.stage1_cmd_pub, self.stage2_cmd_pub):
             publish_twist(pub, 0.0, 0.0, 0.0)
             self.get_logger().info(self._stage() + f'[publish] {pub.topic_name} {label} vx=0 vy=0 wz=0')
+        # one entry for both topics; no caller holds the (non-reentrant) lock
+        with self._control_lock:
+            self._last_cmd = (0.0, 0.0, 0.0, time.monotonic())
 
     def _publish_stop_command(self) -> None:
         self._publish_zero_on_all('stop')
@@ -628,6 +619,7 @@ class AprilTagControlNode(Node):
             pub = self.stage1_cmd_pub if self._state is S.STAGE1 else self.stage2_cmd_pub
             publish_twist(pub, vx, vy, vw)
             self._last_wz_cmd = float(vw)
+            self._last_cmd = (float(vx), float(vy), float(vw), time.monotonic())
         self.get_logger().info(
             self._stage() + f'[publish] {pub.topic_name} vx={vx:+.3f} vy={vy:+.3f} wz={vw:+.3f}',
             throttle_duration_sec=LOG_THROTTLE_SEC,
@@ -742,7 +734,8 @@ class AprilTagControlNode(Node):
             message += ' Restore failed, see apriltag_control log.'
         outcome, error_code = final_outcome(outcome, error_code, ok)
         with self._control_lock:
-            self._reset_control_locked(self.stage1_distance)
+            self._reset_control_locked()
+            self._active_tol = None
             self._goal_deadline = None
             # written together with IDLE, so IDLE + cmd_id never shows a stale error_code
             self._error_code = int(error_code)
@@ -831,7 +824,7 @@ class AprilTagControlNode(Node):
             else:
                 self._transition_locked(
                     S.LEAVING, Step.PREPARING,
-                    f'detach cmd_id={cmd_id} accepted, back to {self._goal_leave_distance:.2f}m')
+                    f'detach cmd_id={cmd_id} accepted, back to {self._calibration["detach"].z_ref:.2f}m')
         self.get_logger().info(self._stage() + f'[cmd] {cmd} cmd_id={cmd_id} accepted, timeout {timeout:.1f}s')
         threading.Thread(target=self._run_goal, args=(cmd, cmd_id), daemon=True).start()
         return True, cmd_id, f'{cmd} accepted'
@@ -890,11 +883,10 @@ class AprilTagControlNode(Node):
                 return False
             self._tracking_start_time = time.monotonic()
             self._begin_running_locked(
-                self.stage1_distance,
                 'lidar safety enabled, AMCL closed'
                 if self.manage_amcl_and_lidar_safety else 'AMCL / lidar safety unmanaged')
         self.get_logger().info(
-            self._stage() + f'Stage 1 ({self.stage1_distance:.2f}m) started. Tracking target...')
+            self._stage() + f'Stage 1 ({self.desired_distance:.2f}m) started. Tracking target...')
         return True
 
     def _prepare_stage2(self) -> None:
@@ -906,9 +898,8 @@ class AprilTagControlNode(Node):
             if not (self._state is S.STAGE2 and self._step is Step.PREPARING):
                 return
             self._begin_running_locked(
-                self.stage2_distance,
                 'lidar safety disabled' if self.manage_amcl_and_lidar_safety else 'lidar safety unmanaged')
-        self.get_logger().info(self._stage() + f'Advancing to Stage 2 ({self.stage2_distance:.2f}m).')
+        self.get_logger().info(self._stage() + f'Advancing to Stage 2 ({self.desired_distance:.2f}m).')
 
     def _prepare_leaving(self) -> bool:
         """LEAVING PREPARING: disable lidar safety, close AMCL; False if ended."""
@@ -926,11 +917,10 @@ class AprilTagControlNode(Node):
                 return False
             self._tracking_start_time = time.monotonic()
             self._begin_running_locked(
-                self._goal_leave_distance,
                 'lidar safety disabled, AMCL closed'
                 if self.manage_amcl_and_lidar_safety else 'AMCL / lidar safety unmanaged')
         self.get_logger().info(
-            self._stage() + f'Leaving started: backing up to {self._goal_leave_distance:.2f}m.')
+            self._stage() + f'Leaving started: backing up to {self.desired_distance:.2f}m.')
         return True
 
     def _wait_motion_done(self) -> None:
@@ -962,10 +952,12 @@ class AprilTagControlNode(Node):
         with self._control_lock:
             stamp = self._last_frame_stamp
             active = self._state in ACTIVE_STATES
+            cmd_vx, cmd_vy, cmd_wz = recent_cmd(self._last_cmd, time.monotonic(), CMD_VEL_MAX_AGE)
             text = status_json(
                 STATUS_STATE[self._state], self._cmd_id, self._error_code, self._error_msg, time.time(),
                 t.get('x_error', math.nan), t.get('y_error', math.nan), t.get('yaw_error', math.nan),
-                (now.nanoseconds * 1e-9 - stamp) if stamp is not None else math.nan)
+                (now.nanoseconds * 1e-9 - stamp) if stamp is not None else math.nan,
+                cmd_vx, cmd_vy, cmd_wz)
             self.status_pub.publish(String(data=text))
         self.attached_pub.publish(Bool(data=False))
         if active:
@@ -984,15 +976,6 @@ class AprilTagControlNode(Node):
         time.sleep(0.2)
 
     # ---- control ------------------------------------------------------------------
-
-    def _error_is_zero(self, target) -> bool:
-        if target is None:
-            return False
-        return (
-            abs(float(target.get('x_error', 0.0))) <= self.stop_x_error_tolerance
-            and abs(float(target.get('y_error', 0.0))) <= self.stop_y_error_tolerance
-            and abs(float(target.get('yaw_error', 0.0))) <= self.stop_yaw_error_tolerance
-        )
 
     # watchdog: tracing_callback ignores frames without the tracked tag (and
     # detection may stop publishing), so target loss is checked on a timer
@@ -1089,8 +1072,8 @@ class AprilTagControlNode(Node):
         wz_override = self.yaw_probe.step(
             now=now,
             enabled=(tracking_state is S.STAGE1
-                     and abs(x_f) <= self.stop_x_error_tolerance
-                     and abs(est.y_f) <= self.stop_y_error_tolerance),
+                     and abs(x_f) <= self._tolerances['stage1'].x
+                     and abs(est.y_f) <= self._tolerances['stage1'].y),
             c_sign=est.c_sign,
             yaw_abs_f=est.yaw_abs_f,
         )
@@ -1111,6 +1094,9 @@ class AprilTagControlNode(Node):
                 publish_twist_fn=self._publish_control_command,
                 logger=self._stage_logger,
                 wz_override=wz_override,
+                min_vx=self.min_vx,
+                min_vy=self.min_vy,
+                min_vw=self.min_vw,
             )
         except Exception as exc:
             self.get_logger().warn(self._stage() + f"Control publish failed: {exc}")
@@ -1131,7 +1117,8 @@ class AprilTagControlNode(Node):
             'y_error': est.y_f,
             'yaw_error': yaw_abs_cal,
         }
-        if not self._error_is_zero(done_target):
+        tol = self._active_tol
+        if tol is None or not in_tolerance(done_target, tol):
             self._error_zero_since = None
             return
 
@@ -1139,15 +1126,15 @@ class AprilTagControlNode(Node):
             self._error_zero_since = now
 
         hold_time = now - self._error_zero_since
-        if hold_time < self.stop_hold_seconds:
+        if hold_time < tol.hold_seconds:
             return
 
         converged = (
             f'offset converged within tol: '
-            f'x_f={x_f:.6f} (<= {self.stop_x_error_tolerance:.3f}), '
-            f'y_f={est.y_f:.6f} (<= {self.stop_y_error_tolerance:.3f}), '
-            f'yaw_abs_f={est.yaw_abs_f:.6f} (<= {self.stop_yaw_error_tolerance:.3f}), '
-            f'held_for={hold_time:.2f}s (>= {self.stop_hold_seconds:.2f}s).'
+            f'x_f={x_f:.6f} (<= {tol.x:.3f}), '
+            f'y_f={est.y_f:.6f} (<= {tol.y:.3f}), '
+            f'yaw_abs_f={est.yaw_abs_f:.6f} (<= {tol.yaw:.3f}), '
+            f'held_for={hold_time:.2f}s (>= {tol.hold_seconds:.2f}s).'
         )
         if tracking_state is S.STAGE1:
             self._publish_stop_command()
@@ -1158,20 +1145,20 @@ class AprilTagControlNode(Node):
                 # the execute thread disables lidar safety, then Stage 2 runs
                 self._transition_locked(S.STAGE2, Step.PREPARING, 'Stage 1 aligned')
             self.get_logger().info(
-                self._stage() + f'Stage 1 aligned at {self.stage1_distance:.2f}m. '
+                self._stage() + f'Stage 1 aligned at {self.desired_distance:.2f}m. '
                 f'Stopped; starting Stage 2'
                 + (' after disabling lidar safety.' if self.manage_amcl_and_lidar_safety else '.')
             )
         elif tracking_state is S.STAGE2:
             # back to IDLE without restoring: AMCL stays closed, lidar safety disabled
             self._request_end(
-                True, f'Stage 2 aligned at {self.stage2_distance:.2f}m. {converged} '
+                True, f'Stage 2 aligned at {self.desired_distance:.2f}m. {converged} '
                 + ('AMCL off, lidar safety disabled; send detach to restore.'
                    if self.manage_amcl_and_lidar_safety else 'AMCL / lidar safety unmanaged.'),
                 Codes.OK, only_in=frozenset({S.STAGE2}))
 
     def _leave_step(self, x_error: float) -> None:
-        """LEAVING: back straight at max_vx until the tag is leave_distance away."""
+        """LEAVING: back straight at max_vx until the tag is calibration.detach.z_ref away."""
         try:
             reached, vx, vy, vw = leave_step(x_error, self.max_vx)
         except ValueError as exc:
@@ -1179,9 +1166,9 @@ class AprilTagControlNode(Node):
             self._safe_stop()
             return
         if reached:
-            forward = x_error + self._goal_leave_distance
+            forward = x_error + self.desired_distance
             self._request_end(
-                True, f'Leave reached {self._goal_leave_distance:.2f}m (forward={forward:.3f}m).',
+                True, f'Leave reached {self.desired_distance:.2f}m (forward={forward:.3f}m).',
                 Codes.OK)
             return
         self._publish_control_command(vx, vy, vw)

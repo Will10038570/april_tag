@@ -1,5 +1,6 @@
 """Control pipeline helpers extracted from AprilTag ROS node."""
 
+import math
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -59,12 +60,46 @@ def sanitize_control(vx: float, vy: float, vw: float, logger) -> Tuple[float, fl
     return vx, vy, vw
 
 
-def clamp_control(vx: float, vy: float, vw: float, max_vx: float, max_vy: float, max_vw: float) -> Tuple[float, float, float]:
+def _apply_min(v: float, min_v: float) -> float:
+    """Raise a non-zero |v| below min_v to sign(v) * min_v; 0 stays 0."""
+    if v != 0.0 and abs(v) < min_v:
+        return math.copysign(min_v, v)
+    return v
+
+
+def clamp_control(
+    vx: float, vy: float, vw: float,
+    max_vx: float, max_vy: float, max_vw: float,
+    min_vx: float = 0.0, min_vy: float = 0.0, min_vw: float = 0.0,
+) -> Tuple[float, float, float]:
+    """Per axis: clip to [-max, max], then raise non-zero |v| < min to min.
+
+    With 0 <= min <= max (validate_speed_limits) the result is 0 or
+    |v| in [min, max]. min = 0 keeps the old max-only behaviour.
+    """
     return (
-        max(min(vx, max_vx), -max_vx),
-        max(min(vy, max_vy), -max_vy),
-        max(min(vw, max_vw), -max_vw),
+        _apply_min(max(min(vx, max_vx), -max_vx), min_vx),
+        _apply_min(max(min(vy, max_vy), -max_vy), min_vy),
+        _apply_min(max(min(vw, max_vw), -max_vw), min_vw),
     )
+
+
+def validate_speed_limits(
+    max_vx: float, max_vy: float, max_vw: float,
+    min_vx: float, min_vy: float, min_vw: float,
+) -> Optional[str]:
+    """Return why the speed limits are invalid, or None if they are valid.
+
+    Each max must be > 0, each min >= 0, and min <= max on every axis.
+    """
+    for axis, max_v, min_v in (('vx', max_vx, min_vx), ('vy', max_vy, min_vy), ('vw', max_vw, min_vw)):
+        if not (math.isfinite(max_v) and max_v > 0.0):
+            return f'max_{axis} ({max_v}) must be positive'
+        if not (math.isfinite(min_v) and min_v >= 0.0):
+            return f'min_{axis} ({min_v}) must be >= 0'
+        if min_v > max_v:
+            return f'min_{axis} ({min_v}) must be <= max_{axis} ({max_v})'
+    return None
 
 
 def compute_dt(now: float, last_time: float, max_dt: float) -> Tuple[float, float]:
@@ -89,6 +124,9 @@ def publish_control(
     publish_twist_fn,
     logger,
     wz_override: Optional[float] = None,
+    min_vx: float = 0.0,
+    min_vy: float = 0.0,
+    min_vw: float = 0.0,
 ):
     """Run one control step and publish twist; return state updates.
 
@@ -101,16 +139,16 @@ def publish_control(
     if wz_override is not None:
         vw = float(wz_override)
     vx, vy, vw = sanitize_control(vx, vy, vw, logger)
-    vx, vy, vw = clamp_control(vx, vy, vw, max_vx, max_vy, max_vw)
+    vx, vy, vw = clamp_control(vx, vy, vw, max_vx, max_vy, max_vw, min_vx, min_vy, min_vw)
     publish_twist_fn(vx, vy, vw)
 
     return new_last_time, plan
 
 
 def leave_step(x_error: float, max_vx: float) -> Tuple[bool, float, float, float]:
-    """leave_cs: back straight until the tag is at least leave_distance away.
+    """leave_cs: back straight until the tag is at least calibration.detach.z_ref away.
 
-    x_error = forward - leave_distance (m). Returns (reached, vx, vy, wz):
+    x_error = forward - detach z_ref (m). Returns (reached, vx, vy, wz):
     reached -> (True, 0, 0, 0); otherwise (False, -max_vx, 0, 0).
     """
     if not np.isfinite(x_error):
@@ -118,3 +156,14 @@ def leave_step(x_error: float, max_vx: float) -> Tuple[bool, float, float, float
     if x_error >= 0.0:
         return True, 0.0, 0.0, 0.0
     return False, -max_vx, 0.0, 0.0
+
+
+def in_tolerance(target: Optional[Dict[str, float]], tol) -> bool:
+    """In-position check: |x|, |y|, |yaw| of target within tol (a StageTolerance)."""
+    if target is None:
+        return False
+    return (
+        abs(float(target.get('x_error', 0.0))) <= tol.x
+        and abs(float(target.get('y_error', 0.0))) <= tol.y
+        and abs(float(target.get('yaw_error', 0.0))) <= tol.yaw
+    )

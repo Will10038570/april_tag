@@ -52,7 +52,6 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import Twist
 from rcl_interfaces.msg import Log
-from rcl_interfaces.srv import GetParameters
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSHistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -61,6 +60,8 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Empty, SetBool, Trigger
 
+from apriltag.domain.calibration import require_calibration
+from apriltag.domain.config_loader import load_config
 from apriltag.domain.math_utils import optical_to_control_error
 
 WINDOW_NAME = 'AprilTag virtual tracking'
@@ -245,15 +246,18 @@ class VirtualTrackingSim(Node):
         def param(name, default):
             return self.declare_parameter(name, default).value
 
-        # must match apriltag_detection / apriltag_control
-        self.tag_size = float(param('tag_size', 0.0635))
-        # stage / leave distances are read from apriltag_control at startup, so
-        # the sim always follows its parameters; these values only fill the
-        # dashboard until then, and no cmd is sent before they are read.
-        # Index stage - 1: Stage 1, Stage 2, leave (stage 3, leave_distance)
-        self.stage_distances = (0.50, 0.28, 1.0)
-        self.stage_distances_known = False
-        self.tag_id = int(param('tag_id', 0))
+        # the same config_file as apriltag_detection / apriltag_control: tag
+        # size, drawn tag id and the stage / leave distances (calibration z_ref)
+        config_file = str(param('config_file', ''))
+        if not config_file:
+            raise ValueError('config_file is required (path to the virtual test config).')
+        config = load_config(config_file)
+        calibration = require_calibration(config)
+        self.tag_size = float(config['tag_size']['tag_size'])
+        # Index stage - 1: Stage 1, Stage 2, leave (stage 3, calibration.detach)
+        self.stage_distances = tuple(calibration[k].z_ref for k in ('stage1', 'stage2', 'detach'))
+        # tracking_tag_id -1 (any id): draw id 0
+        self.tag_id = max(int(config['detection']['tracking_tag_id']), 0)
 
         # virtual camera (RealSense D435 colour at 640x480 is roughly fx = fy = 615)
         self.width = int(param('image_width', 640))
@@ -325,9 +329,6 @@ class VirtualTrackingSim(Node):
         self.cmd_clients = {c: self.create_client(SetBool, c) for c in ('attach', 'detach')}
         self.create_subscription(String, 'status', self._on_status, STATUS_QOS)
         self.create_timer(0.2, self._check_rejected)
-        self.control_param_client = self.create_client(GetParameters, 'apriltag_control/get_parameters')
-        self._control_param_future = None
-        self._control_param_timer = self.create_timer(1.0, self._fetch_stage_distances)
 
         self._last_physics = time.monotonic()
         self.create_timer(1.0 / float(param('physics_rate', 50.0)), self._physics_step)
@@ -440,31 +441,8 @@ class VirtualTrackingSim(Node):
 
     # ---- cmd / status -----------------------------------------------------
 
-    def _fetch_stage_distances(self):
-        """Read stage1/2_distance and leave_distance from apriltag_control once it is up."""
-        if self._control_param_future is not None or not self.control_param_client.service_is_ready():
-            return
-        request = GetParameters.Request(names=['stage1_distance', 'stage2_distance', 'leave_distance'])
-        self._control_param_future = self.control_param_client.call_async(request)
-        self._control_param_future.add_done_callback(self._on_stage_distances)
-
-    def _on_stage_distances(self, future):
-        response = future.result()
-        values = [v.double_value for v in response.values] if response is not None else []
-        if len(values) != 3:
-            self.get_logger().warn('Cannot read stage distances from apriltag_control, retrying.')
-            self._control_param_future = None
-            return
-        self._control_param_timer.cancel()
-        with self.lock:
-            self.stage_distances = tuple(values)
-            self.stage_distances_known = True
-        self.get_logger().info(
-            f'Stage distances from apriltag_control: stage1={values[0]:.2f}m stage2={values[1]:.2f}m '
-            f'leave={values[2]:.2f}m')
-
     def _try_auto_start(self):
-        if self.stage_distances_known and self.status_seen:
+        if self.status_seen:
             self._auto_start_timer.cancel()
             self.start()
 
@@ -500,9 +478,6 @@ class VirtualTrackingSim(Node):
                 return
             if not self.status_seen:
                 self.result_message = 'No status from apriltag_control yet.'
-                return
-            if not self.stage_distances_known:
-                self.result_message = 'Stage distances not read from apriltag_control yet.'
                 return
             self._begin_run_locked(stage=1)
             self.phase = 'STARTING'
@@ -546,16 +521,13 @@ class VirtualTrackingSim(Node):
             if self.phase == 'ALIGNED':
                 self.run.leave_t = time.monotonic() - self.run_start
             else:
-                if not self.stage_distances_known:
-                    self.result_message = 'Stage distances not read from apriltag_control yet.'
-                    return
                 self._begin_run_locked(stage=3)
                 self.run.leave_t = 0.0
             self.phase = 'LEAVING'
             self.stage = 3
             self._prepare_cmd_locked()
         self._call_cmd('detach', 'LEAVING')
-        self.get_logger().info(f'leave_distance={self.stage_distances[2]:.2f}m.')
+        self.get_logger().info(f'leave distance (calibration.detach.z_ref)={self.stage_distances[2]:.2f}m.')
 
     def reset(self):
         self.stop()

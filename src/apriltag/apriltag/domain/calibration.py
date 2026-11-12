@@ -1,16 +1,17 @@
 """Calibration reference points for apriltag_control.
 
-Each stage (stage1, stage2, detach) can have a CalibrationPoint that records
-the tag pose at the desired docking/leaving position. When use_calibration is
-true, apriltag_control uses z_ref in place of the default stage distance and
-applies x_ref / yaw_ref offsets to the control error so the robot converges to
-the recorded pose rather than a fixed distance + zero lateral / yaw.
+Each stage (stage1, stage2, detach) has a CalibrationPoint that records the
+tag pose at the desired docking / leaving position. apriltag_control requires
+all three: z_ref is the stage's target forward distance (detach: the leave
+distance), and x_ref / yaw_ref offset the control error so the robot
+converges to the recorded pose.
 
 Calibration data is stored in the 'calibration' section of april_tag_config.json
 and written there by tools/calibrate.py.
 """
 
 import json
+import math
 import os
 from dataclasses import asdict, dataclass
 from typing import Dict, Optional
@@ -27,34 +28,33 @@ class CalibrationPoint:
     image_path: Optional[str] = None     # saved PNG path — metadata only
 
 
-def load_calibration_from_config(config: dict) -> Dict[str, Optional[CalibrationPoint]]:
-    """Extract calibration points from a loaded april_tag_config dict.
+def require_calibration(config: dict) -> Dict[str, CalibrationPoint]:
+    """Return the calibration points {'stage1', 'stage2', 'detach'} of a config dict.
 
-    Returns a dict keyed by stage name ('stage1', 'stage2', 'detach'), each
-    value either a CalibrationPoint or None (not found / invalid).
-    Per-stage entries with missing / invalid fields are silently set to None.
+    Every point must be an object with numeric (not bool), finite z_ref,
+    x_ref, yaw_ref and z_ref > 0; otherwise ValueError names the point.
     """
-    result: Dict[str, Optional[CalibrationPoint]] = {s: None for s in _STAGES}
-    cal = config.get('calibration', {})
+    cal = config.get('calibration')
+    if not isinstance(cal, dict):
+        raise ValueError("Missing or invalid section 'calibration' in config")
+    result: Dict[str, CalibrationPoint] = {}
     for stage in _STAGES:
         entry = cal.get(stage)
+        bad = (f'calibration.{stage} is missing or incomplete '
+               '(need numeric z_ref, x_ref, yaw_ref; z_ref > 0)')
         if not isinstance(entry, dict):
-            continue
-        try:
-            z_ref = float(entry['z_ref'])
-            x_ref = float(entry['x_ref'])
-            yaw_ref = float(entry['yaw_ref'])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if z_ref <= 0.0:
-            continue
+            raise ValueError(bad)
+        values = []
+        for key in ('z_ref', 'x_ref', 'yaw_ref'):
+            v = entry.get(key)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError(bad)
+            values.append(float(v))
+        if values[0] <= 0.0:
+            raise ValueError(bad)
         result[stage] = CalibrationPoint(
-            z_ref=z_ref,
-            x_ref=x_ref,
-            yaw_ref=yaw_ref,
-            stamp=entry.get('stamp'),
-            image_path=entry.get('image_path'),
-        )
+            z_ref=values[0], x_ref=values[1], yaw_ref=values[2],
+            stamp=entry.get('stamp'), image_path=entry.get('image_path'))
     return result
 
 
@@ -92,7 +92,7 @@ def save_calibration_point(path: str, stage: str, point: CalibrationPoint) -> No
         raise ValueError(f'Unknown calibration stage {stage!r}; must be one of {_STAGES}')
     data = read_config_dict(path)
     if not isinstance(data.get('calibration'), dict):
-        data['calibration'] = {'use_calibration': True}
+        data['calibration'] = {}
     data['calibration'][stage] = asdict(point)
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
