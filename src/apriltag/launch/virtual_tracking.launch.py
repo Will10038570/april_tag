@@ -5,22 +5,29 @@ with AMCL closed and lidar safety disabled) followed by a detach cmd, both
 called by the sim on the /wheelchair/attach / detach services; headless + auto_start runs both and checks AMCL
 / lidar safety after the attach (held) and at the end (restored).
 
-Runs in ROS domain 65, the same as the robot: apriltag_control publishes the
+Runs in ROS domain domain_id (default 65). apriltag_control publishes the
 absolute /cmd_vel, /pre_cmd_vel and /g7_plc/disable_lidar_safety and calls the AMCL
-services, so unplug the robot's network cable before running it. CLI debugging:
-    ROS_DOMAIN_ID=65 ros2 topic echo /cmd_vel
+services; the robot's domain is set in docker/.ros2_setup, but do not rely on it
+being different: unplug the robot's network cable, or use domain_id:=99 with
+CycloneDDS on loopback only. CLI debugging:
+    ROS_DOMAIN_ID=99 ros2 topic echo /cmd_vel
 
-All node settings come from config_file (default: the installed
-config/virtual_tracking_config.json). Variant tests: copy it, change e.g.
-tracking_tag_id to 5 (TAG_LOST) or dock_timeout to 3.0 (TIMEOUT), and pass
-config_file:=/path/to/copy.json.
+All node settings come from config_file (default: the workspace root's
+virtual_tracking_config.json, next to april_tag_config.json, read directly, so
+edits apply without a colcon build; apriltag_detection and the sim read it only at start,
+so relaunch after editing it). Variant tests: copy it, change e.g.
+control.dock_timeout to 3.0 (TIMEOUT, error_code 4), and pass
+config_file:=/path/to/copy.json. TAG_LOST (error_code 1): hide_tag_after:=5.0
+(the sim stops drawing the tag 5 s after the run starts).
 """
 
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable, Shutdown
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
 
 
 # log lines without time; ros2 launch's '[<process>-N] ' prefix is dropped
@@ -29,6 +36,12 @@ OUTPUT_FORMAT = '{line}'
 # apriltag_control prefixes every message with '[stage <STATE>] : ', giving
 # '[INFO] [wheelchair.apriltag_control][stage LEAVING] : ...'
 CONTROL_LOG_ENV = {'RCUTILS_CONSOLE_OUTPUT_FORMAT': '[{severity}] [{name}]{message}'}
+
+# Default config: install/apriltag/share/apriltag → ../../../../ = workspace root,
+# so edits to <workspace>/virtual_tracking_config.json apply without a build
+_pkg_share = get_package_share_directory('apriltag')
+_DEFAULT_CONFIG = os.path.normpath(os.path.join(
+    _pkg_share, '..', '..', '..', '..', 'virtual_tracking_config.json'))
 
 
 def generate_launch_description():
@@ -43,11 +56,14 @@ def generate_launch_description():
         DeclareLaunchArgument('auto_start', default_value='false',
                               description='send attach as soon as apriltag_control publishes its status'),
         DeclareLaunchArgument('log_dir', default_value='virtual_tracking_logs'),
+        DeclareLaunchArgument('hide_tag_after', default_value='-1.0',
+                              description='sim stops drawing the tag this many seconds after a run '
+                                          'starts (TAG_LOST test); < 0 = never'),
         # every apriltag_detection / apriltag_control / sim setting (tag, tag size,
-        # timeouts, calibration points = stage / leave distances, tolerances);
+        # timeouts, calibration points = stage / leave distances, tolerances); the
+        # default is the src file itself (no build needed, relaunch after editing);
         # for variant tests copy it and pass config_file:=/path/to/copy.json
-        DeclareLaunchArgument('config_file', default_value=PathJoinSubstitution(
-            [FindPackageShare('apriltag'), 'config', 'virtual_tracking_config.json'])),
+        DeclareLaunchArgument('config_file', default_value=_DEFAULT_CONFIG),
     ]
 
     apriltag_detection = Node(
@@ -85,6 +101,7 @@ def generate_launch_description():
             'headless': LaunchConfiguration('headless'),
             'auto_start': LaunchConfiguration('auto_start'),
             'log_dir': LaunchConfiguration('log_dir'),
+            'hide_tag_after': LaunchConfiguration('hide_tag_after'),
             'config_file': LaunchConfiguration('config_file'),
         }],
         # quitting the dashboard ends the whole test, so no detection/control

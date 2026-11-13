@@ -1,17 +1,17 @@
 {
-  "_comment": "Virtual test config for launch/virtual_tracking.launch.py. calibration x_ref must equal the sim camera_y_offset (0.026 m) and yaw_ref 0, so the sim ground truth matches; copy this file and pass config_file:= for variant tests (tracking_tag_id 5 -> TAG_LOST, dock_timeout 3.0 -> TIMEOUT).",
+  "_comment": "Virtual test config for launch/virtual_tracking.launch.py, read by apriltag_detection, apriltag_control and virtual_tracking_sim. The sim ground truth uses each calibration point (z_ref, x_ref, yaw_ref; detach has only z_ref) like apriltag_control, so any calibrated values work; the factory x_ref 0.026 equals the sim camera_y_offset, giving goals on the tag centre line. Copy this file and pass config_file:= for variant tests (control.dock_timeout 3.0 -> TIMEOUT); TAG_LOST: launch argument hide_tag_after:=5.0.",
   "detection": {
     "detect_tag_families": "tag36h11",
     "tracking_tag_family": "tag36h11",
     "tracking_tag_id": 0
   },
   "tag_size": {
-    "tag_size": 0.0635,
+    "tag_size": 0.0475,
     "tag_sizes": ""
   },
   "control": {
     "manage_amcl_and_lidar_safety": true,
-    "stage1_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 1.0},
+    "stage1_tolerance": {"x": 0.001, "y": 0.001, "yaw": 0.05, "hold_seconds": 1.0},
     "stage2_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 1.0},
     "dock_timeout": 300.0,
     "undock_timeout": 300.0,
@@ -24,9 +24,9 @@
     "min_vw": 0.01
   },
   "calibration": {
-    "stage1": {"z_ref": 0.5, "x_ref": 0.026, "yaw_ref": 0.0, "stamp": null, "image_path": null},
-    "stage2": {"z_ref": 0.28, "x_ref": 0.026, "yaw_ref": 0.0, "stamp": null, "image_path": null},
-    "detach": {"z_ref": 1.0, "x_ref": 0.026, "yaw_ref": 0.0, "stamp": null, "image_path": null}
+    "stage1": {"z_ref": 0.5, "x_ref": 0.0, "yaw_ref": 0},
+    "stage2": {"z_ref": 0.28, "x_ref": 0.026, "yaw_ref": 1.0},
+    "detach": {"z_ref": 0.8}
   },
   "yaw_estimator": {
     "s4_distances": [0.3, 0.5, 0.7],

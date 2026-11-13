@@ -3,8 +3,10 @@
 Each stage (stage1, stage2, detach) has a CalibrationPoint that records the
 tag pose at the desired docking / leaving position. apriltag_control requires
 all three: z_ref is the stage's target forward distance (detach: the leave
-distance), and x_ref / yaw_ref offset the control error so the robot
-converges to the recorded pose.
+distance), and for stage1 / stage2 x_ref / yaw_ref offset the control error
+so the robot converges to the recorded pose. detach has only z_ref (the leave
+backs up straight and checks only the forward distance); its x_ref / yaw_ref
+are 0.0 in memory and are neither read from nor written to the file.
 
 Calibration data is stored in the 'calibration' section of april_tag_config.json
 and written there by tools/calibrate.py.
@@ -13,10 +15,12 @@ and written there by tools/calibrate.py.
 import json
 import math
 import os
-from dataclasses import asdict, dataclass
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict
 
 _STAGES = ('stage1', 'stage2', 'detach')
+# stages stored with z_ref only (x_ref / yaw_ref are 0.0 in memory)
+_Z_ONLY_STAGES = ('detach',)
 
 
 @dataclass
@@ -24,15 +28,14 @@ class CalibrationPoint:
     z_ref: float            # optical frame forward distance (m) at calibrated position, > 0
     x_ref: float            # optical frame lateral (x) at calibrated position (m)
     yaw_ref: float          # yaw at calibrated position (rad)
-    stamp: Optional[float] = None        # epoch seconds — metadata only, not used in control
-    image_path: Optional[str] = None     # saved PNG path — metadata only
 
 
 def require_calibration(config: dict) -> Dict[str, CalibrationPoint]:
     """Return the calibration points {'stage1', 'stage2', 'detach'} of a config dict.
 
-    Every point must be an object with numeric (not bool), finite z_ref,
-    x_ref, yaw_ref and z_ref > 0; otherwise ValueError names the point.
+    stage1 / stage2 must be objects with numeric (not bool), finite z_ref,
+    x_ref, yaw_ref and z_ref > 0; detach needs only such a z_ref (its x_ref /
+    yaw_ref are 0.0). Other keys are ignored. Otherwise ValueError names the point.
     """
     cal = config.get('calibration')
     if not isinstance(cal, dict):
@@ -40,22 +43,28 @@ def require_calibration(config: dict) -> Dict[str, CalibrationPoint]:
     result: Dict[str, CalibrationPoint] = {}
     for stage in _STAGES:
         entry = cal.get(stage)
+        keys = _stage_keys(stage)
         bad = (f'calibration.{stage} is missing or incomplete '
-               '(need numeric z_ref, x_ref, yaw_ref; z_ref > 0)')
+               f'(need numeric {", ".join(keys)}; z_ref > 0)')
         if not isinstance(entry, dict):
             raise ValueError(bad)
-        values = []
-        for key in ('z_ref', 'x_ref', 'yaw_ref'):
+        values = {}
+        for key in keys:
             v = entry.get(key)
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
                 raise ValueError(bad)
-            values.append(float(v))
-        if values[0] <= 0.0:
+            values[key] = float(v)
+        if values['z_ref'] <= 0.0:
             raise ValueError(bad)
         result[stage] = CalibrationPoint(
-            z_ref=values[0], x_ref=values[1], yaw_ref=values[2],
-            stamp=entry.get('stamp'), image_path=entry.get('image_path'))
+            z_ref=values['z_ref'], x_ref=values.get('x_ref', 0.0),
+            yaw_ref=values.get('yaw_ref', 0.0))
     return result
+
+
+def _stage_keys(stage: str) -> tuple:
+    """Keys stored for a stage: detach z_ref only, stage1 / stage2 all three."""
+    return ('z_ref',) if stage in _Z_ONLY_STAGES else ('z_ref', 'x_ref', 'yaw_ref')
 
 
 def read_config_dict(path: str) -> dict:
@@ -82,8 +91,9 @@ def read_config_dict(path: str) -> dict:
 def save_calibration_point(path: str, stage: str, point: CalibrationPoint) -> None:
     """Update one stage in april_tag_config.json (read-modify-write).
 
-    Reads the full config JSON, updates only config['calibration'][stage],
-    and writes the whole file back.
+    Reads the full config JSON, replaces only config['calibration'][stage]
+    (stage1 / stage2: z_ref, x_ref, yaw_ref; detach: z_ref only), and writes
+    the whole file back.
     Raises ValueError for an unknown stage name, or (via read_config_dict) when
     the file does not exist, is not valid JSON or is not a JSON object; the
     file is not written (nor created) in those cases.
@@ -93,6 +103,6 @@ def save_calibration_point(path: str, stage: str, point: CalibrationPoint) -> No
     data = read_config_dict(path)
     if not isinstance(data.get('calibration'), dict):
         data['calibration'] = {}
-    data['calibration'][stage] = asdict(point)
+    data['calibration'][stage] = {key: float(getattr(point, key)) for key in _stage_keys(stage)}
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)

@@ -29,7 +29,7 @@ VALID = {
                 'min_vx': 0.01, 'min_vy': 0.01, 'min_vw': 0.01},
     'calibration': {'stage1': {'z_ref': 0.5, 'x_ref': 0.026, 'yaw_ref': 0.0},
                     'stage2': {'z_ref': 0.28, 'x_ref': 0.01, 'yaw_ref': 0.02},
-                    'detach': {'z_ref': 1.0, 'x_ref': 0.026, 'yaw_ref': 0.0}},
+                    'detach': {'z_ref': 1.0}},
     'yaw_estimator': {'s4_distances': [0.3, 0.5, 0.7], 's4_sigmas_deg': [1.0, 2.0, 3.0]},
     'ros_interfaces': {'amcl_check_service': '/check_mcl_if_trigger',
                        'amcl_close_service': '/close_amcl',
@@ -61,14 +61,26 @@ def test_shipped_config_is_valid():
     validate_control_config(load_config(str(REPO_CONFIG)))
 
 
-VIRTUAL_CONFIG = pathlib.Path(__file__).resolve().parents[1] / 'config' / 'virtual_tracking_config.json'
+# the virtual test config, next to april_tag_config.json at the workspace root
+VIRTUAL_CONFIG = pathlib.Path(__file__).resolve().parents[3] / 'virtual_tracking_config.json'
 
 
 def test_virtual_config_is_valid():
     tol, cal = validate_control_config(load_config(str(VIRTUAL_CONFIG)))
-    # the sim's ground truth assumes the previous defaults
+    # keep the factory calibration values (the sim's ground truth follows any values)
     assert [cal[k].z_ref for k in ('stage1', 'stage2', 'detach')] == [0.5, 0.28, 1.0]
-    assert all(cal[k].x_ref == pytest.approx(0.026) and cal[k].yaw_ref == 0.0 for k in cal)
+    assert all(cal[k].x_ref == pytest.approx(0.026) and cal[k].yaw_ref == 0.0
+               for k in ('stage1', 'stage2'))
+    assert (cal['detach'].x_ref, cal['detach'].yaw_ref) == (0.0, 0.0)
+
+
+@pytest.mark.parametrize('path', [REPO_CONFIG, VIRTUAL_CONFIG], ids=['april_tag', 'virtual'])
+def test_shipped_configs_clean(path):
+    if not path.exists():
+        pytest.skip(f'{path.name} not found')
+    cal = json.loads(path.read_text())['calibration']
+    assert set(cal['stage1']) == set(cal['stage2']) == {'z_ref', 'x_ref', 'yaw_ref'}
+    assert list(cal['detach']) == ['z_ref']
 
 
 def test_missing_file(tmp_path):
@@ -193,15 +205,23 @@ def test_invalid_tolerance(stage, field, value):
         validate_control_config(data)
 
 
-@pytest.mark.parametrize('stage', ['stage1', 'stage2', 'detach'])
-@pytest.mark.parametrize('entry', [
+_BAD_Z = [
     None,
     {'x_ref': 0.0, 'yaw_ref': 0.0},                    # z_ref missing
     {'z_ref': 0.0, 'x_ref': 0.0, 'yaw_ref': 0.0},      # z_ref must be > 0
+    {'z_ref': True},                                   # bool is not a number
+    {'z_ref': float('inf'), 'x_ref': 0.0, 'yaw_ref': 0.0},
+]
+_BAD_X_YAW = [
     {'z_ref': 0.5, 'x_ref': True, 'yaw_ref': 0.0},     # bool is not a number
     {'z_ref': 0.5, 'x_ref': 0.0, 'yaw_ref': '0'},
-    {'z_ref': float('inf'), 'x_ref': 0.0, 'yaw_ref': 0.0},
-])
+    {'z_ref': 0.5, 'yaw_ref': 0.0},                    # x_ref missing
+]
+
+
+@pytest.mark.parametrize('stage, entry',
+                         [(s, e) for s in ('stage1', 'stage2', 'detach') for e in _BAD_Z]
+                         + [(s, e) for s in ('stage1', 'stage2') for e in _BAD_X_YAW])
 def test_invalid_calibration_point(stage, entry):
     data = copy.deepcopy(VALID)
     data['calibration'][stage] = entry
@@ -209,6 +229,26 @@ def test_invalid_calibration_point(stage, entry):
         validate_control_config(data)
     with pytest.raises(ValueError, match=f'calibration.{stage}'):
         require_calibration(data)
+
+
+@pytest.mark.parametrize('entry', [
+    {'z_ref': 1.2},
+    # old keys are ignored: x_ref / yaw_ref are not used by detach
+    {'z_ref': 1.2, 'x_ref': 0.5, 'yaw_ref': 0.3, 'stamp': 123.0, 'image_path': '/x.png'},
+    {'z_ref': 1.2, 'x_ref': True, 'yaw_ref': '0'},
+])
+def test_detach_only_z_ref(entry):
+    data = copy.deepcopy(VALID)
+    data['calibration']['detach'] = entry
+    point = validate_control_config(data)[1]['detach']
+    assert (point.z_ref, point.x_ref, point.yaw_ref) == (pytest.approx(1.2), 0.0, 0.0)
+
+
+def test_extra_calibration_keys_ignored():
+    data = copy.deepcopy(VALID)
+    data['calibration']['stage1'].update(stamp=1700000000.0, image_path='/mnt/work_space/a.png')
+    point = validate_control_config(data)[1]['stage1']
+    assert (point.z_ref, point.x_ref, point.yaw_ref) == (0.5, pytest.approx(0.026), 0.0)
 
 
 def test_save_calibration_keeps_other_sections(tmp_path):
@@ -221,6 +261,25 @@ def test_save_calibration_keeps_other_sections(tmp_path):
     assert data['calibration']['stage1'] == VALID['calibration']['stage1']
     assert 'use_calibration' not in data['calibration']
     assert require_calibration(data)['stage2'].z_ref == pytest.approx(0.3)
+
+
+def test_save_stage_writes_three_keys(tmp_path):
+    path = _write(tmp_path, VALID)
+    save_calibration_point(path, 'stage2', CalibrationPoint(z_ref=0.3, x_ref=0.01, yaw_ref=-0.02))
+    saved = json.loads(pathlib.Path(path).read_text())['calibration']['stage2']
+    assert saved == {'z_ref': 0.3, 'x_ref': 0.01, 'yaw_ref': -0.02}
+
+
+def test_save_detach_writes_only_z_ref(tmp_path):
+    data = copy.deepcopy(VALID)
+    # an old detach entry is replaced as a whole
+    data['calibration']['detach'] = {'z_ref': 1.0, 'x_ref': 0.026, 'yaw_ref': 0.0,
+                                     'stamp': None, 'image_path': None}
+    path = _write(tmp_path, data)
+    save_calibration_point(path, 'detach', CalibrationPoint(z_ref=0.9, x_ref=0.05, yaw_ref=0.1))
+    saved = json.loads(pathlib.Path(path).read_text())['calibration']
+    assert saved['detach'] == {'z_ref': 0.9}
+    assert saved['stage1'] == VALID['calibration']['stage1']
 
 
 def test_save_calibration_creates_section(tmp_path):

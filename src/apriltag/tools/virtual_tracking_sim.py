@@ -9,6 +9,12 @@ apriltag_detection and apriltag_control nodes run unmodified:
   /cmd_vel (Stage 1) and /pre_cmd_vel (Stage 2 and leaving);
 - a synthetic camera image of the tag is rendered from the AMR/tag relative
   pose and published with camera_info, so apriltag_detection really detects it;
+- the stage / leave targets, in-position tolerances, speed limits and ROS
+  interface names come from the same config_file as apriltag_control; the
+  ground truth uses each stage's calibration point (z_ref, x_ref, yaw_ref;
+  detach has only z_ref, its x_ref / yaw_ref are 0) exactly as
+  apriltag_control does, and the stage shown follows the status state
+  (Attaching(STAGE1) / Attaching(STAGE2) / Detaching);
 - Start calls the /wheelchair/attach service (std_srvs/SetBool, data=true), whose response
   gives the cmd_id (or rejects it: the run ends as REJECTED). When /wheelchair/status shows
   IDLE with its cmd_id, error_code 0 and error_msg 'Attach succeeded' (a cancel is
@@ -22,7 +28,11 @@ apriltag_detection and apriltag_control nodes run unmodified:
 - a fake G7+ node (FakeG7Services) stands in for AMCL and the PLC lidar safety.
   It only keeps two bool flags, switched through the same AMCL services and lidar
   safety topic apriltag_control uses on the robot, so the call order and restores
-  can be checked.
+  can be checked;
+- body_status (G7+ UI topic) is recorded during a run and compared with the
+  values the accepted cmds should give (attach 1, 0; detach 2, 0);
+- the tag can be hidden (h key, or hide_tag_after seconds after a run starts)
+  to test TAG_LOST.
 
 The OpenCV dashboard shows a top view (drag the AMR to set the initial pose),
 the camera image, pose errors (ground truth vs. controller status) and the
@@ -33,6 +43,7 @@ Controls:
                mouse wheel or a / d = rotate 2 deg (only while not running)
     keys       s = start, l = leave (in ALIGNED, or a leave-only run when idle),
                x = stop (data=false on the running cmd's service), r = reset to initial pose,
+               h = hide / show the tag,
                + / - = zoom top view, q or Esc = quit
 """
 
@@ -57,11 +68,12 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSHistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Int32, String
 from std_srvs.srv import Empty, SetBool, Trigger
 
-from apriltag.domain.calibration import require_calibration
-from apriltag.domain.config_loader import load_config
+from apriltag.domain.app_types import ControlState
+from apriltag.domain.calibration import CalibrationPoint
+from apriltag.domain.config_loader import load_config, validate_control_config
 from apriltag.domain.math_utils import optical_to_control_error
 
 WINDOW_NAME = 'AprilTag virtual tracking'
@@ -76,6 +88,10 @@ STATE_NUMBERS = {'IDLE': 0, 'Attaching(STAGE1)': 1, 'Attaching(STAGE2)': 2, 'Det
 STATUS_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
 STAGE_LABELS = {1: 'S1', 2: 'S2', 3: 'L'}
+# sim stage -> calibration point apriltag_control targets in that state
+STAGE_KEYS = {1: 'stage1', 2: 'stage2', 3: 'detach'}
+# body_status values arrive on another topic than status: compare them this long after a run ends (s)
+BODY_STATUS_CHECK_DELAY = 0.5
 
 
 # --------------------------------------------------------------------------
@@ -120,6 +136,31 @@ def tag_in_optical(robot_pose: np.ndarray, camera_offset: np.ndarray) -> Tuple[n
     t = cam_axes.T @ (np.zeros(3) - np.array([cam_x, cam_y, 0.0]))
     r_mat = cam_axes.T @ TAG_AXES_WORLD
     return t, r_mat
+
+
+def ground_truth(pose: np.ndarray, camera_offset: np.ndarray, point: CalibrationPoint) -> ControlState:
+    """Noise-free control error toward one calibration point, as apriltag_control computes it.
+
+    Same formula as apriltag_control: optical_to_control_error with the
+    point's z_ref / x_ref, then yaw minus yaw_ref (detach: x_ref = yaw_ref = 0).
+    """
+    t, r_mat = tag_in_optical(pose, camera_offset)
+    err = optical_to_control_error(t, point.z_ref, r_mat, point.x_ref)
+    return ControlState(err.x_error, err.y_error, err.yaw_error - point.yaw_ref)
+
+
+def goal_pose(camera_offset: np.ndarray, point: CalibrationPoint) -> Tuple[float, float, float]:
+    """Robot (x, y, yaw) in world where ground_truth() toward point is all zero.
+
+    With the tag at the origin facing -x the measured yaw is minus the camera
+    heading, and the tag sits at optical (x_ref, z_ref) from the camera.
+    """
+    th = -point.yaw_ref
+    right = np.array([math.sin(th), -math.cos(th)])
+    forward = np.array([math.cos(th), math.sin(th)])
+    cam = -(point.x_ref * right + point.z_ref * forward)
+    robot = cam - rot2(th) @ np.asarray(camera_offset, dtype=float)
+    return float(robot[0]), float(robot[1]), float(th)
 
 
 def make_tag_board(tag_id: int, cell_px: int = 16) -> np.ndarray:
@@ -181,15 +222,16 @@ class FakeG7Services(Node):
     asked for, so the sim can show and check the state.
     """
 
-    def __init__(self):
+    def __init__(self, interfaces: dict):
+        """interfaces: the config's ros_interfaces section (same names apriltag_control uses)."""
         super().__init__('fake_g7_services')
         self.lock = threading.Lock()
         self.amcl_on = True
         self.lidar_safety_disabled = False
-        self.create_service(Trigger, '/check_mcl_if_trigger', self._on_check_amcl)
-        self.create_service(Empty, '/close_amcl', self._on_close_amcl)
-        self.create_service(Empty, '/open_amcl', self._on_open_amcl)
-        self.create_subscription(Bool, '/g7_plc/disable_lidar_safety', self._on_lidar_safety, 10)
+        self.create_service(Trigger, interfaces['amcl_check_service'], self._on_check_amcl)
+        self.create_service(Empty, interfaces['amcl_close_service'], self._on_close_amcl)
+        self.create_service(Empty, interfaces['amcl_open_service'], self._on_open_amcl)
+        self.create_subscription(Bool, interfaces['lidar_safety_topic'], self._on_lidar_safety, 10)
 
     def state(self) -> Tuple[bool, bool]:
         with self.lock:
@@ -199,19 +241,19 @@ class FakeG7Services(Node):
         with self.lock:
             response.success = self.amcl_on
         response.message = 'amcl is on' if response.success else 'amcl is off'
-        self.get_logger().info(f'check_mcl_if_trigger -> {response.message}')
+        self.get_logger().info(f'check AMCL -> {response.message}')
         return response
 
     def _on_close_amcl(self, _request, response):
         with self.lock:
             self.amcl_on = False
-        self.get_logger().info('close_amcl -> amcl off')
+        self.get_logger().info('close AMCL -> amcl off')
         return response
 
     def _on_open_amcl(self, _request, response):
         with self.lock:
             self.amcl_on = True
-        self.get_logger().info('open_amcl -> amcl on')
+        self.get_logger().info('open AMCL -> amcl on')
         return response
 
     def _on_lidar_safety(self, msg):
@@ -229,33 +271,41 @@ class FakeG7Services(Node):
 class RunLog:
     # physics samples: (t, x, y, yaw, gt_x_err, gt_y_err, gt_yaw_err, vx, vy, wz, stage)
     samples: List[tuple] = field(default_factory=list)
-    # controller status: (t, x_err, y_err, yaw_err, cmd_id, state number, last_frame_age)
+    # controller status: (t, x_err, y_err, yaw_err, cmd_id, state number, last_frame_age,
+    # cmd_vx, cmd_vy, cmd_wz)
     feedback: List[tuple] = field(default_factory=list)
     stage2_t: Optional[float] = None
     leave_t: Optional[float] = None
     # every /cmd_vel and /pre_cmd_vel message as received: (t, vx, vy, wz)
     cmd_raw: List[tuple] = field(default_factory=list)
+    # body_status values received during the run, and the ones the accepted cmds should give
+    body_status: List[int] = field(default_factory=list)
+    body_expected: List[int] = field(default_factory=list)
 
 
 class VirtualTrackingSim(Node):
 
-    def __init__(self, fake_g7: FakeG7Services):
+    def __init__(self):
         super().__init__('virtual_tracking_sim')
-        self.fake_g7 = fake_g7
 
         def param(name, default):
             return self.declare_parameter(name, default).value
 
-        # the same config_file as apriltag_detection / apriltag_control: tag
-        # size, drawn tag id and the stage / leave distances (calibration z_ref)
+        # the same config_file as apriltag_detection / apriltag_control, checked
+        # the same way: tag size, drawn tag id, calibration points (stage /
+        # leave targets), tolerances, speed limits and ROS interface names
         config_file = str(param('config_file', ''))
         if not config_file:
             raise ValueError('config_file is required (path to the virtual test config).')
         config = load_config(config_file)
-        calibration = require_calibration(config)
+        self.tolerances, self.calibration = validate_control_config(config)
         self.tag_size = float(config['tag_size']['tag_size'])
         # Index stage - 1: Stage 1, Stage 2, leave (stage 3, calibration.detach)
-        self.stage_distances = tuple(calibration[k].z_ref for k in ('stage1', 'stage2', 'detach'))
+        self.stage_distances = tuple(self.calibration[STAGE_KEYS[s]].z_ref for s in (1, 2, 3))
+        ctrl = config['control']
+        self.max_v = tuple(float(ctrl[k]) for k in ('max_vx', 'max_vy', 'max_vw'))
+        interfaces = config['ros_interfaces']
+        self.fake_g7 = FakeG7Services(interfaces)
         # tracking_tag_id -1 (any id): draw id 0
         self.tag_id = max(int(config['detection']['tracking_tag_id']), 0)
 
@@ -285,6 +335,9 @@ class VirtualTrackingSim(Node):
         self.log_dir = os.path.abspath(os.path.expanduser(str(param('log_dir', 'virtual_tracking_logs'))))
         # a cmd service call without a response by then ends the run as REJECTED (s)
         self.cmd_reject_timeout = float(param('cmd_reject_timeout', 2.0))
+        # stop drawing the tag this long after a run starts (s, < 0: never), to test TAG_LOST
+        self.hide_tag_after = float(param('hide_tag_after', -1.0))
+        body_status_topic = str(param('body_status_topic', '/g7_body/simple_ui/body_status'))
 
         self.board = make_tag_board(self.tag_id)
 
@@ -317,13 +370,22 @@ class VirtualTrackingSim(Node):
         self.tag_visible = False
         self.png_request: Optional[str] = None
         self.finished = threading.Event()
+        # tag not drawn in the camera image (h key, or hide_tag_after)
+        self.tag_hidden = False
+        self.tag_auto_hidden = False
+        # body_status is recorded until the run's check (counter: a reset drops a pending check)
+        self.body_recording = False
+        self.run_serial = 0
+        self._body_check_timer = None
 
         image_qos = QoSProfile(history=QoSHistoryPolicy.KEEP_LAST, depth=1)
         self.image_pub = self.create_publisher(Image, 'camera/camera/color/image_raw', image_qos)
         self.info_pub = self.create_publisher(CameraInfo, 'camera/camera/color/camera_info', 10)
-        # apriltag_control: Stage 1 on /cmd_vel, Stage 2 on /pre_cmd_vel
-        self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
-        self.create_subscription(Twist, '/pre_cmd_vel', self._on_cmd_vel, 10)
+        # apriltag_control: Stage 1 on stage1_cmd_vel_topic (/cmd_vel), Stage 2 and leave
+        # on stage2_cmd_vel_topic (/pre_cmd_vel)
+        self.create_subscription(Twist, interfaces['stage1_cmd_vel_topic'], self._on_cmd_vel, 10)
+        self.create_subscription(Twist, interfaces['stage2_cmd_vel_topic'], self._on_cmd_vel, 10)
+        self.create_subscription(Int32, body_status_topic, self._on_body_status, STATUS_QOS)
         self.create_subscription(Image, 'apriltag/marked_image', self._on_marked_image, image_qos)
         self.create_subscription(Log, '/rosout', self._on_rosout, 100)
         self.cmd_clients = {c: self.create_client(SetBool, c) for c in ('attach', 'detach')}
@@ -343,14 +405,12 @@ class VirtualTrackingSim(Node):
 
     # ---- ground truth -----------------------------------------------------
 
-    def ground_truth_error(self, pose: np.ndarray, stage: int):
-        t, r_mat = tag_in_optical(pose, self.camera_offset)
-        desired = self.stage_distances[stage - 1]
-        return optical_to_control_error(t, desired, r_mat, float(self.camera_offset[1]))
+    def ground_truth_error(self, pose: np.ndarray, stage: int) -> ControlState:
+        return ground_truth(pose, self.camera_offset, self.calibration[STAGE_KEYS[stage]])
 
     def goal_pose(self, stage: int) -> Tuple[float, float]:
         """Robot position where the controller's errors are all zero."""
-        return (-self.stage_distances[stage - 1] - float(self.camera_offset[0]), 0.0)
+        return goal_pose(self.camera_offset, self.calibration[STAGE_KEYS[stage]])[:2]
 
     # ---- ROS callbacks ----------------------------------------------------
 
@@ -378,9 +438,11 @@ class VirtualTrackingSim(Node):
             # skip the periodic cmd_vel / status logs so state changes stay visible
             if not text.startswith(('[publish]', '[status]')):
                 self.control_log = (self.control_log + [text])[-3:]
-            if self.phase in ACTIVE_PHASES and text.startswith('Stage 1 aligned') and self.stage == 1:
-                self.stage = 2
-                self.run.stage2_t = time.monotonic() - self.run_start
+
+    def _on_body_status(self, msg: Int32):
+        with self.lock:
+            if self.body_recording:
+                self.run.body_status.append(int(msg.data))
 
     def _physics_step(self):
         now = time.monotonic()
@@ -395,8 +457,12 @@ class VirtualTrackingSim(Node):
                                   y + (s * vx + c * vy) * dt,
                                   math.atan2(math.sin(th + wz * dt), math.cos(th + wz * dt))])
             if self.phase in ACTIVE_PHASES:
-                gt = self.ground_truth_error(self.pose, self.stage)
                 t_run = now - self.run_start
+                if 0.0 <= self.hide_tag_after <= t_run and not self.tag_auto_hidden:
+                    self.tag_auto_hidden = True
+                    self.tag_hidden = True
+                    self.get_logger().info(f'tag hidden at t={t_run:.1f}s (hide_tag_after)')
+                gt = self.ground_truth_error(self.pose, self.stage)
                 self.run.samples.append((t_run, *self.pose, gt.x_error, gt.y_error, gt.yaw_error,
                                          *cmd, self.stage))
                 self.trail.append((self.pose[0], self.pose[1]))
@@ -404,11 +470,19 @@ class VirtualTrackingSim(Node):
     def _camera_step(self):
         with self.lock:
             pose = self.pose.copy()
+            hidden = self.tag_hidden
         t, r_mat = tag_in_optical(pose, self.camera_offset)
-        gray = render_camera_image(self.board, t, r_mat, self.tag_size,
-                                   self.fx, self.fy, self.cx, self.cy, self.width, self.height)
-        center_px = project(t.reshape(1, 3), self.fx, self.fy, self.cx, self.cy)[0] if t[2] > 0.05 else None
-        visible = center_px is not None and 0 <= center_px[0] < self.width and 0 <= center_px[1] < self.height
+        if hidden:
+            # background only: apriltag_detection publishes tag_tracing valid=false
+            gray = np.full((self.height, self.width), 110, dtype=np.uint8)
+            visible = False
+        else:
+            gray = render_camera_image(self.board, t, r_mat, self.tag_size,
+                                       self.fx, self.fy, self.cx, self.cy, self.width, self.height)
+            center_px = (project(t.reshape(1, 3), self.fx, self.fy, self.cx, self.cy)[0]
+                         if t[2] > 0.05 else None)
+            visible = (center_px is not None and 0 <= center_px[0] < self.width
+                       and 0 <= center_px[1] < self.height)
 
         rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
         stamp = self.get_clock().now().to_msg()
@@ -466,6 +540,9 @@ class VirtualTrackingSim(Node):
                 return  # reset (or timed out) meanwhile
             self.cmd_pending = False
         if response.success:
+            with self.lock:
+                # apriltag_control: attach -> 1 (STAGE1) ... 0 (IDLE); detach -> 2 (LEAVING) ... 0
+                self.run.body_expected += [1, 0] if cmd == 'attach' else [2, 0]
             self.get_logger().info(f'{cmd} accepted.')
             return
         message = f'{cmd} rejected: {response.message}'
@@ -495,6 +572,10 @@ class VirtualTrackingSim(Node):
         self.run_start = time.monotonic()
         self.run_start_ros = self.get_clock().now()
         self.run_end = None
+        self.tag_hidden = False
+        self.tag_auto_hidden = False
+        self.body_recording = True
+        self.run_serial += 1
         self.finished.clear()
 
     def stop(self):
@@ -542,6 +623,16 @@ class VirtualTrackingSim(Node):
             self.control_log = []
             self.run_start = None
             self.run_end = None
+            self.tag_hidden = False
+            self.tag_auto_hidden = False
+            self.body_recording = False
+            self.run_serial += 1  # drops a pending body_status check
+
+    def toggle_tag_hidden(self):
+        with self.lock:
+            self.tag_hidden = not self.tag_hidden
+            hidden = self.tag_hidden
+        self.get_logger().info(f"tag {'hidden' if hidden else 'shown'} (h key)")
 
     def _on_status(self, msg: String):
         try:
@@ -563,14 +654,20 @@ class VirtualTrackingSim(Node):
                     or status.get('cmd_id') != self.sent_cmd_id):
                 return
             if state != 'IDLE':
+                now = time.monotonic()
                 if phase == 'STARTING':
                     self.phase = 'RUNNING'
+                if state == 'Attaching(STAGE2)' and self.stage == 1:
+                    self.stage = 2
+                    self.run.stage2_t = now - self.run_start
                 values = [status.get(k) for k in ('x_error', 'y_error', 'yaw_error')]
                 age = status.get('last_frame_age')
-                self.run.feedback.append((time.monotonic() - self.run_start,
+                cmd_v = [status.get(k) for k in ('cmd_vx', 'cmd_vy', 'cmd_wz')]
+                self.run.feedback.append((now - self.run_start,
                                           *[math.nan if v is None else v for v in values],
                                           status['cmd_id'], STATE_NUMBERS.get(state, -1),
-                                          math.nan if age is None else age))
+                                          math.nan if age is None else age,
+                                          *[math.nan if v is None else v for v in cmd_v]))
                 return
         # IDLE with our cmd_id: the cmd has ended
         code = int(status.get('error_code', -1))
@@ -620,7 +717,29 @@ class VirtualTrackingSim(Node):
             self.phase = phase
             self.result_message = message
             self.run_end = time.monotonic()
+            self.tag_hidden = False
+            serial = self.run_serial
         self._save_run(phase)
+        # headless ends after the body_status check
+        self._body_check_timer = self.create_timer(
+            BODY_STATUS_CHECK_DELAY, lambda: self._check_body_status(serial))
+
+    def _check_body_status(self, serial: int):
+        """One-shot: compare the body_status values of the ended run with the expected ones."""
+        timer, self._body_check_timer = self._body_check_timer, None
+        if timer is not None:
+            timer.cancel()
+            self.destroy_timer(timer)
+        with self.lock:
+            if serial != self.run_serial:
+                return  # reset or a new run meanwhile
+            self.body_recording = False
+            got, expected = list(self.run.body_status), list(self.run.body_expected)
+        text = f'body_status={got} expected={expected}'
+        if got == expected:
+            self.get_logger().info(f'{text} (OK)')
+        else:
+            self.get_logger().error(f'{text} (NOT OK)')
         self.finished.set()
 
     # ---- logging ----------------------------------------------------------
@@ -631,6 +750,7 @@ class VirtualTrackingSim(Node):
         with self.lock:
             run = RunLog(list(self.run.samples), list(self.run.feedback), self.run.stage2_t,
                          self.run.leave_t, list(self.run.cmd_raw))
+            body_expected = list(self.run.body_expected)
             init = self.initial_pose.copy()
             message = self.result_message
 
@@ -638,13 +758,15 @@ class VirtualTrackingSim(Node):
             writer = csv.writer(f)
             writer.writerow([f'# result={phase}', f'message={message}',
                              f'init_x={init[0]:.4f}', f'init_y={init[1]:.4f}',
-                             f'init_yaw_deg={math.degrees(init[2]):.2f}'])
+                             f'init_yaw_deg={math.degrees(init[2]):.2f}',
+                             f"body_status_expected={','.join(map(str, body_expected))}"])
             writer.writerow(['t', 'x', 'y', 'yaw', 'gt_x_err', 'gt_y_err', 'gt_yaw_err',
                              'cmd_vx', 'cmd_vy', 'cmd_wz', 'stage'])
             writer.writerows(run.samples)
         with open(base + '_feedback.csv', 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['t', 'x_err', 'y_err', 'yaw_err', 'cmd_id', 'state', 'last_frame_age'])
+            writer.writerow(['t', 'x_err', 'y_err', 'yaw_err', 'cmd_id', 'state', 'last_frame_age',
+                             'cmd_vx', 'cmd_vy', 'cmd_wz'])
             writer.writerows(run.feedback)
         with open(base + '_cmd_raw.csv', 'w', newline='') as f:
             writer = csv.writer(f)
@@ -699,6 +821,7 @@ class VirtualTrackingSim(Node):
                 'image': self.marked_image if marked_fresh else self.raw_image,
                 'image_is_marked': marked_fresh,
                 'tag_visible': self.tag_visible,
+                'tag_hidden': self.tag_hidden,
                 'amcl_on': amcl_on,
                 'lidar_safety_disabled': lidar_safety_disabled,
             }
@@ -751,11 +874,13 @@ def put(img, text, org, color=TEXT, scale=0.45, thickness=1):
     cv2.putText(img, text, (int(org[0]), int(org[1])), FONT, scale, color, thickness, cv2.LINE_AA)
 
 
-def draw_plot(img, rect, title, t_max, y_lim, lines=(), dots=(), band=None, hlines=(), vlines=(), legend=()):
+def draw_plot(img, rect, title, t_max, y_lim, lines=(), dots=(), bands=(), hlines=(), vlines=(), legend=()):
     """Minimal time-series plot.
 
     lines: (t_array, v_array, color[, thickness=2])
     dots:  (t_array, v_array, color[, radius=3, filled=False])
+    bands: (t_start, t_end, half_width) shaded between -half_width and +half_width
+    hlines: (value, color)
     """
     x0, y0, w, h = rect
     cv2.rectangle(img, (x0 + 4, y0 + 4), (x0 + w - 5, y0 + h - 5), PANEL, -1)
@@ -769,10 +894,11 @@ def draw_plot(img, rect, title, t_max, y_lim, lines=(), dots=(), band=None, hlin
         vv = top + (y_max - np.clip(np.asarray(v), y_min, y_max)) / (y_max - y_min) * (bottom - top)
         return u, vv
 
-    if band is not None:
-        _, b0 = to_px(0.0, band[1])
-        _, b1 = to_px(0.0, band[0])
-        cv2.rectangle(img, (left, int(b0)), (right, int(b1)), C_TOL, -1)
+    for t0, t1, half_width in bands:
+        u0, b0 = to_px(min(t0, t_max), half_width)
+        u1, b1 = to_px(min(t1, t_max), -half_width)
+        if u1 > u0:
+            cv2.rectangle(img, (int(u0), int(b0)), (int(u1), int(b1)), C_TOL, -1)
 
     for i in range(5):
         v = y_min + (y_max - y_min) * i / 4
@@ -926,6 +1052,8 @@ class Dashboard:
         title = ('marked_image from apriltag_detection' if snap['image_is_marked']
                  else 'synthetic camera image (no marked_image yet)')
         put(img, title, (x0 + 12, y0 + 22), scale=0.5)
+        if snap['tag_hidden']:
+            put(img, '[TAG HIDDEN]  h = show', (x0 + w - 230, y0 + 22), (80, 80, 255), 0.5, 2)
         if frame is None:
             return
         area_w, area_h = w - 24, h - 44
@@ -936,33 +1064,47 @@ class Dashboard:
         img[oy:oy + fh, ox:ox + fw] = resized
 
     def _draw_plots(self, img, snap):
+        sim = self.sim
         samples = np.array(snap['samples'], dtype=float).reshape(-1, 11)
-        feedback = np.array(snap['feedback'], dtype=float).reshape(-1, 7)[:, :4]
+        feedback = np.array(snap['feedback'], dtype=float).reshape(-1, 10)[:, :4]
         t_max = max(5.0, snap['elapsed'] * 1.05)
         vlines = [(t, label) for t, label in ((snap['stage2_t'], 'stage 2'), (snap['leave_t'], 'leave'))
                   if t is not None]
+        # in-position tolerance (x / y) of the stage running at each time; none while leaving
+        stage2_t, leave_t, end_t = snap['stage2_t'], snap['leave_t'], snap['elapsed']
+        tol1, tol2 = sim.tolerances['stage1'], sim.tolerances['stage2']
+        bands = []
+        if not (leave_t is not None and leave_t == 0.0):  # not a leave-only run
+            s1_end = next(t for t in (stage2_t, leave_t, end_t) if t is not None)
+            bands.append((0.0, s1_end, max(tol1.x, tol1.y)))
+            if stage2_t is not None:
+                bands.append((stage2_t, leave_t if leave_t is not None else end_t, max(tol2.x, tol2.y)))
 
         t = samples[:, 0]
         err_values = np.concatenate([samples[:, 4:7].ravel(), feedback[:, 1:4].ravel()])
         err_values = err_values[np.isfinite(err_values)]
         lim = max(0.1, float(np.max(np.abs(err_values))) * 1.1) if err_values.size else 0.2
         draw_plot(
-            img, ERR_RECT, 'Pose error   line = ground truth,  o = controller (status)', t_max, (-lim, lim),
+            img, ERR_RECT, f'Pose error  line=GT o=status   tol x/y/yaw S1 {tol1.x:g}/{tol1.y:g}/{tol1.yaw:g}'
+            f' S2 {tol2.x:g}/{tol2.y:g}/{tol2.yaw:g}', t_max, (-lim, lim),
             lines=[(t, samples[:, 4], C_X), (t, samples[:, 5], C_Y), (t, samples[:, 6], C_YAW)],
             dots=[(feedback[:, 0], feedback[:, 1], C_X), (feedback[:, 0], feedback[:, 2], C_Y),
                   (feedback[:, 0], feedback[:, 3], C_YAW)],
-            band=(-0.05, 0.05), vlines=vlines,
+            bands=bands, vlines=vlines,
             legend=[('x_err m', C_X), ('y_err m', C_Y), ('yaw_err rad', C_YAW)],
         )
         cmd_raw = np.array(snap['cmd_raw'], dtype=float).reshape(-1, 4)
         raw_lines = [(cmd_raw[:, 0], cmd_raw[:, 1 + i], c, 1) for i, c in enumerate((C_X, C_Y, C_YAW))]
         raw_dots = [(cmd_raw[:, 0], cmd_raw[:, 1 + i], c, 2, True) for i, c in enumerate((C_X, C_Y, C_YAW))]
+        # config max_vx / max_vy / max_vw, in each axis' colour
+        v_lim = 1.5 * max(sim.max_v)
+        limits = [(sign * v, c) for v, c in zip(sim.max_v, (C_X, C_Y, C_YAW)) for sign in (1, -1)]
         draw_plot(
-            img, CMD_RECT, 'cmd_vel / pre_cmd_vel sent by control   dot = one message',
-            t_max, (-0.6, 0.6),
+            img, CMD_RECT, 'cmd_vel / pre_cmd_vel sent by control   dot = one message, thin line = max_v*',
+            t_max, (-v_lim, v_lim),
             lines=raw_lines, dots=raw_dots,
-            hlines=[(0.5, C_LIMIT), (-0.5, C_LIMIT)], vlines=vlines,
-            legend=[('vx m/s', C_X), ('vy m/s', C_Y), ('wz rad/s', C_YAW), ('limit', C_LIMIT)],
+            hlines=limits, vlines=vlines,
+            legend=[('vx m/s', C_X), ('vy m/s', C_Y), ('wz rad/s', C_YAW)],
         )
 
     def _draw_bar(self, img, snap):
@@ -1064,6 +1206,8 @@ class Dashboard:
             self.sim.stop()
         elif key == ord('r'):
             self.sim.reset()
+        elif key == ord('h'):
+            self.sim.toggle_tag_hidden()
         elif key in (ord('a'), ord('d')) and not self.sim.is_running():
             self._rotate(math.radians(2.0 if key == ord('a') else -2.0))
         elif key in (ord('+'), ord('=')):
@@ -1075,8 +1219,9 @@ class Dashboard:
 
 def main(args=None):
     rclpy.init(args=args)
-    fake_g7 = FakeG7Services()
-    sim = VirtualTrackingSim(fake_g7)
+    # the sim reads the config and creates the fake G7+ node with its interface names
+    sim = VirtualTrackingSim()
+    fake_g7 = sim.fake_g7
     executor = MultiThreadedExecutor()
     executor.add_node(sim)
     executor.add_node(fake_g7)

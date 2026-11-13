@@ -23,9 +23,9 @@
     "min_vw": 0.01
   },
   "calibration": {
-    "stage1": {"z_ref": 0.5, "x_ref": 0.026, "yaw_ref": 0.0, "stamp": null, "image_path": null},
-    "stage2": {"z_ref": 0.28, "x_ref": 0.026, "yaw_ref": 0.0, "stamp": null, "image_path": null},
-    "detach": {"z_ref": 1.0, "x_ref": 0.026, "yaw_ref": 0.0, "stamp": null, "image_path": null}
+    "stage1": {"z_ref": 0.5, "x_ref": 0.026, "yaw_ref": 0.0},
+    "stage2": {"z_ref": 0.28, "x_ref": 0.026, "yaw_ref": 0.0},
+    "detach": {"z_ref": 1.0}
   },
   "yaw_estimator": {
     "s4_distances": [0.3, 0.5, 0.7],

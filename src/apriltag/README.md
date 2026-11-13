@@ -229,13 +229,13 @@ docker exec -it april_tag_serive bash -ic '
   python3 /mnt/work_space/src/apriltag/tools/calibrate.py --detach'
 ```
 
-Each command saves the tracked tag's `z_ref` (forward distance, m), `x_ref` (optical lateral, m) and `yaw_ref` (rad) to the `calibration` section of `april_tag_config.json` (default `/mnt/work_space/april_tag_config.json`; override with `--file PATH`; only that stage is updated, other sections are kept) and writes an annotated PNG (`calibration_stage1.png` / `calibration_stage2.png` / `calibration_detach.png`) in the same directory, overwriting any previous one.
+`--stage1` / `--stage2` save the tracked tag's `z_ref` (forward distance, m), `x_ref` (optical lateral, m) and `yaw_ref` (rad), `--detach` only `z_ref` (the leave backs up straight and checks only the forward distance), to the `calibration` section of `april_tag_config.json` (default `/mnt/work_space/april_tag_config.json`; override with `--file PATH`; only that stage is replaced, other stages and sections are kept). No image is saved.
 
 `--file` must be an existing file containing a JSON object. If it is missing, not valid JSON or not an object, `calibrate.py` exits 1 at once (before waiting for a tag) and writes nothing.
 
-Stages can be calibrated independently. There are no default distances: `apriltag_control` requires all three points (`stage1`, `stage2`, `detach`, each with numeric `z_ref` > 0, `x_ref`, `yaw_ref`), and exits at startup (or rejects the attach / detach on reload) naming the missing one, e.g. `calibration.stage2 is missing or incomplete …`. `apriltag_detection` and `calibrate.py` do not check them, so a stage can be calibrated while `apriltag_control` is down; with a scoped `GroupAction` the launch keeps the camera and detection running when control exits. After saving, restart the container (`docker restart april_tag_serive`) if control had exited, otherwise the next attach / detach re-reads the file.
+Stages can be calibrated independently. There are no default distances: `apriltag_control` requires all three points (`stage1` and `stage2` with numeric `z_ref` > 0, `x_ref`, `yaw_ref`; `detach` with numeric `z_ref` > 0 only; other keys, e.g. an old `stamp` / `image_path` or `detach.x_ref` / `yaw_ref`, are ignored), and exits at startup (or rejects the attach / detach on reload) naming the missing one, e.g. `calibration.stage2 is missing or incomplete …`. `apriltag_detection` and `calibrate.py` do not check them, so a stage can be calibrated while `apriltag_control` is down; with a scoped `GroupAction` the launch keeps the camera and detection running when control exits. After saving, restart the container (`docker restart april_tag_serive`) if control had exited, otherwise the next attach / detach re-reads the file.
 
-The shipped `april_tag_config.json` holds the previous defaults as points (`z_ref` 0.50 / 0.28 / 1.0 m, `x_ref` 0.026 m = the former `camera_y_offset`, `yaw_ref` 0), which behave as before calibration; `calibrate.py` overwrites them one by one.
+The shipped `april_tag_config.json` holds the previous defaults as points (`z_ref` 0.50 / 0.28 / 1.0 m; stage1 / stage2 `x_ref` 0.026 m = the former `camera_y_offset`, `yaw_ref` 0), which behave as before calibration; `calibrate.py` overwrites them one by one.
 
 ### Using Calibration
 
@@ -251,7 +251,7 @@ The log shows what is used:
 
 ## Virtual End-to-End Test
 
-`tools/virtual_tracking_sim.py` replaces the RealSense camera and the AMR with a simulation, so the real `apriltag_detection` and `apriltag_control` run unmodified: a virtual tag36h11 tag stands at the world origin, a virtual holonomic AMR integrates `/cmd_vel` and `/pre_cmd_vel`, and a synthetic camera image of the tag is rendered from their relative pose and published on `wheelchair/camera/camera/color/image_raw` + `camera_info`.
+`tools/virtual_tracking_sim.py` replaces the RealSense camera and the AMR with a simulation, so the real `apriltag_detection` and `apriltag_control` run unmodified: a virtual tag36h11 tag stands at the world origin, a virtual holonomic AMR integrates the cmd_vel topics of the config's `ros_interfaces` (`/cmd_vel`, `/pre_cmd_vel`), and a synthetic camera image of the tag is rendered from their relative pose and published on `wheelchair/camera/camera/color/image_raw` + `camera_info`.
 
 Run it inside the Docker container (needs `DISPLAY`):
 
@@ -259,26 +259,28 @@ Run it inside the Docker container (needs `DISPLAY`):
 ros2 launch apriltag virtual_tracking.launch.py
 ```
 
-All three nodes read the launch argument `config_file`, default `config/virtual_tracking_config.json` (installed to `share/apriltag/config/`): the same keys as `april_tag_config.json`, with `tag_size` `0.0635`, `manage_amcl_and_lidar_safety` `true` and calibration points `z_ref` 0.50 / 0.28 / 1.0 m, `x_ref` 0.026 m, `yaw_ref` 0. The sim takes its tag size, drawn tag id (`detection.tracking_tag_id`, `-1` → `0`) and stage / leave distances (`calibration.*.z_ref`) from that file. Its ground truth uses its own `camera_y_offset` (0.026 m), so keep `x_ref` 0.026 and `yaw_ref` 0 in a test config. For variant tests copy the file, change it and pass `config_file:=/path/to/copy.json` (e.g. `control.dock_timeout` `3.0` → TIMEOUT, `error_code` 4).
+All three nodes read the launch argument `config_file`, default the workspace root's `virtual_tracking_config.json` (next to `april_tag_config.json`, `/mnt/work_space/virtual_tracking_config.json`), read directly (not installed), so edits apply without a `colcon build`; `apriltag_control` re-reads it on each accepted attach / detach but the sim and `apriltag_detection` only at start, so relaunch after editing it. It has the same keys as `april_tag_config.json`, with `tag_size` `0.0475`, `manage_amcl_and_lidar_safety` `true` and calibration points `z_ref` 0.50 / 0.28 / 1.0 m, stage1 / stage2 `x_ref` 0.026 m, `yaw_ref` 0. The sim validates it like `apriltag_control` (`validate_control_config`) and takes from it the tag size, drawn tag id (`detection.tracking_tag_id`, `-1` → `0`), the calibration points, in-position tolerances, `max_vx` / `max_vy` / `max_vw` (dashboard) and the `ros_interfaces` names (cmd_vel topics, AMCL services, lidar safety topic). Its ground truth uses each stage's calibration point exactly like `apriltag_control`: `optical_to_control_error(t, z_ref, R, x_ref)` and yaw minus `yaw_ref` (detach: `x_ref` = `yaw_ref` = 0), so any calibrated values work; the factory `x_ref` 0.026 equals the sim's `camera_y_offset`, which puts the goals on the tag's centre line. For variant tests copy the file, change it and pass `config_file:=/path/to/copy.json` (e.g. `control.dock_timeout` `3.0` → TIMEOUT, `error_code` 4).
 
-A run is an `attach` call followed by a `detach` call; the reply has no `cmd_id`, so the sim takes it from the status: the first `cmd_id` above the one seen before the call, once the call is accepted. A cmd has ended when `/wheelchair/status` shows `IDLE` with its `cmd_id` (`error_code` 0 with `error_msg` starting with `Cancelled` CANCELED, other 0 SUCCEEDED, else ABORTED); a rejected call, or one without a response after `cmd_reject_timeout` (sim parameter, 2.0 s), ends the run as REJECTED. When the attach succeeds the sim logs `aligned: amcl=off lidar_safety=disabled (held)` (or an error if they were restored too early) and waits in its `ALIGNED` phase (`apriltag_control` is in `IDLE`); Leave (`l`) sends `detach` (headless: sent automatically). The run ends with the detach. Leave without a previous Start runs a leave-only run.
+A run is an `attach` call followed by a `detach` call; the reply has no `cmd_id`, so the sim takes it from the status: the first `cmd_id` above the one seen before the call, once the call is accepted. A cmd has ended when `/wheelchair/status` shows `IDLE` with its `cmd_id` (`error_code` 0 with `error_msg` starting with `Cancelled` CANCELED, other 0 SUCCEEDED, else ABORTED); a rejected call, or one without a response after `cmd_reject_timeout` (sim parameter, 2.0 s), ends the run as REJECTED. When the attach succeeds the sim logs `aligned: amcl=off lidar_safety=disabled (held)` (or an error if they were restored too early) and waits in its `ALIGNED` phase (`apriltag_control` is in `IDLE`); Leave (`l`) sends `detach` (headless: sent automatically). The run ends with the detach. Leave without a previous Start runs a leave-only run. The stage shown (and the Stage 2 time line) follows the status `state` (`Attaching(STAGE2)`).
 
-A fake node `fake_g7_services` stands in for AMCL and the PLC lidar safety. It serves the same three AMCL services and subscribes to the lidar safety topic, but only keeps two bool flags (AMCL on/off, lidar safety enabled/disabled), shown in the dashboard. At the end of every run the sim logs `after cmd: amcl=… lidar_safety=… (restored)`, or an error if `apriltag_control` did not restore them.
+During a run the sim records `/g7_body/simple_ui/body_status` (sim parameter `body_status_topic`) and, 0.5 s after the run ends, compares it with the values the accepted cmds should give (attach `1, 0`, detach `2, 0`): `body_status=[1, 0, 2, 0] expected=[1, 0, 2, 0] (OK)`, or an error `(NOT OK)`. Headless exits after this check.
 
-The whole test runs in `ROS_DOMAIN_ID=65` (launch argument `domain_id`), the same domain as the robot, so **unplug the robot's network cable** before running it. Use the same domain for CLI debugging, e.g. `ROS_DOMAIN_ID=65 ros2 topic echo /cmd_vel`.
+A fake node `fake_g7_services` stands in for AMCL and the PLC lidar safety. It serves the same three AMCL services and subscribes to the lidar safety topic (names from `ros_interfaces`), but only keeps two bool flags (AMCL on/off, lidar safety enabled/disabled), shown in the dashboard. At the end of every run the sim logs `after cmd: amcl=… lidar_safety=… (restored)`, or an error if `apriltag_control` did not restore them.
+
+The whole test runs in `ROS_DOMAIN_ID=65` (launch argument `domain_id`). The robot's domain is set in `docker/.ros2_setup`, but do not rely on it being different: **unplug the robot's network cable**, or use `domain_id:=99` with CycloneDDS on loopback only. Use the same domain for CLI debugging, e.g. `ROS_DOMAIN_ID=99 ros2 topic echo /cmd_vel`.
 
 Dashboard:
 
 | Panel | Content |
 |---|---|
 | Top view | Tag, AMR, camera FOV (yellow = tag in view), trail, Stage 1 / 2 and leave (`L`) goal positions. Drag the AMR body to move it, drag the round handle (or mouse wheel, `a` / `d`) to rotate — only while not running |
-| Camera | `marked_image` from detection, or the raw synthetic image while no `marked_image` has arrived yet |
-| Pose error | Ground-truth error (lines) vs. the controller's error from the status `x_error` / `y_error` / `yaw_error` (circles), ±0.05 tolerance band, Stage 2 and leave start times |
-| cmd_vel | Thick dark line: the cmd the sim actually applies to the AMR (sampled at 50 Hz, zero after 0.5 s without a message). Thin line + dots: every raw `/cmd_vel` / `/pre_cmd_vel` message from `apriltag_control`. ±0.5 limit |
+| Camera | `marked_image` from detection, or the raw synthetic image while no `marked_image` has arrived yet; `[TAG HIDDEN]` while the tag is hidden |
+| Pose error | Ground-truth error (lines) vs. the controller's error from the status `x_error` / `y_error` / `yaw_error` (circles); shaded band = ±max(x, y) in-position tolerance of the stage running at that time (`stage1_tolerance` / `stage2_tolerance`, none while leaving; all tolerances in the title), Stage 2 and leave start times |
+| cmd_vel | Lines + dots: every raw `/cmd_vel` / `/pre_cmd_vel` message from `apriltag_control`. Thin horizontal lines: ±`max_vx` / `max_vy` / `max_vw` in each axis' colour |
 
-Keys: `s` start (calls `attach`), `l` leave (calls `detach`: in `ALIGNED`, or a leave-only run when no run is active), `x` stop (`data: false` on the running cmd's service; nothing to stop in `ALIGNED`), `r` reset to the initial pose, `+` / `-` zoom, `q` quit.
+Keys: `s` start (calls `attach`), `l` leave (calls `detach`: in `ALIGNED`, or a leave-only run when no run is active), `x` stop (`data: false` on the running cmd's service; nothing to stop in `ALIGNED`), `r` reset to the initial pose, `h` hide / show the tag, `+` / `-` zoom, `q` quit.
 
-Every finished run is saved to `virtual_tracking_logs/` (relative to the working directory): `<time>_<result>_sim.csv` (50 Hz pose, ground-truth error, cmd), `<time>_<result>_feedback.csv` (status while the cmd runs: `t, x_err, y_err, yaw_err, cmd_id, state, last_frame_age`; state 1 `Attaching(STAGE1)`, 2 `Attaching(STAGE2)`, 3 `Detaching`; NaN for `null`), `<time>_<result>_cmd_raw.csv` (every raw `/cmd_vel` / `/pre_cmd_vel` message) and a PNG of the dashboard.
+Every finished run is saved to `virtual_tracking_logs/` (relative to the working directory): `<time>_<result>_sim.csv` (50 Hz pose, ground-truth error, cmd), `<time>_<result>_feedback.csv` (status while the cmd runs: `t, x_err, y_err, yaw_err, cmd_id, state, last_frame_age, cmd_vx, cmd_vy, cmd_wz`; state 1 `Attaching(STAGE1)`, 2 `Attaching(STAGE2)`, 3 `Detaching`; NaN for `null`), `<time>_<result>_cmd_raw.csv` (every raw `/cmd_vel` / `/pre_cmd_vel` message) and a PNG of the dashboard.
 
 Headless (no window, `attach` then `detach`, then exit after saving):
 
@@ -287,7 +289,11 @@ ros2 launch apriltag virtual_tracking.launch.py headless:=true auto_start:=true 
     init_x:=-1.0 init_y:=0.15 init_yaw_deg:=10.0
 ```
 
-The sim's camera intrinsics and camera mount offset are ROS parameters of `virtual_tracking_sim`. It always draws a `tag36h11` tag with the config's `tracking_tag_id`, so changing `tracking_tag_id` in a test config does **not** produce TAG_LOST (known limitation).
+The sim's camera intrinsics and camera mount offset are ROS parameters of `virtual_tracking_sim`. It always draws a `tag36h11` tag with the config's `tracking_tag_id`, so changing `tracking_tag_id` in a test config does **not** produce TAG_LOST. To test TAG_LOST use the launch argument `hide_tag_after` (s after the run starts, default `-1` = never) or the `h` key: the sim then publishes the background only, detection reports `valid=false` and `apriltag_control` ends with `error_code` 1 after `lost_target_timeout`:
+
+```bash
+ros2 launch apriltag virtual_tracking.launch.py headless:=true auto_start:=true hide_tag_after:=5.0
+```
 
 ## Topics
 
@@ -355,7 +361,7 @@ Both launch files print log lines without time and without ros2 launch's `[<proc
 
 ```
 [INFO] [wheelchair.apriltag_control][stage LEAVING] : [publish] /pre_cmd_vel vx=-0.100 vy=+0.000 wz=+0.000
-[INFO] [wheelchair.apriltag_detection]: tag_families=tag36h11 tag_size=0.0635 tag_sizes={} tracking=tag36h11 id 0. Detecting continuously; publishing all tags on apriltag_poses, the tracked one on tag_tracing.
+[INFO] [wheelchair.apriltag_detection]: tag_families=tag36h11 tag_size=0.0475 tag_sizes={} tracking=tag36h11 id 0. Detecting continuously; publishing all tags on apriltag_poses, the tracked one on tag_tracing.
 ```
 
 The `[state] OLD -> NEW` line already shows the new state in its prefix.
@@ -394,7 +400,7 @@ The once-per-second limit is `LOG_THROTTLE_SEC` in `control_node.py`.
 | `control.lost_target_timeout` | `1.0` s | control | each cmd | Tracked tag not seen for this long while running → TAG_LOST (> 0) |
 | `control.max_vx` / `max_vy` / `max_vw` | `0.1` / `0.1` m/s, `0.05` rad/s | control | each cmd | Stage 1 / 2 per-axis velocity saturation (> 0); leave backs up at `-max_vx` |
 | `control.min_vx` / `min_vy` / `min_vw` | `0.01` / `0.01` m/s, `0.01` rad/s | control | each cmd | Stage 1 / 2 per-axis minimum (G7+ deadband): after the max clip, a non-zero \|v\| below min is sent as `sign(v)·min`; `0` stays `0` (≥ 0, ≤ max; `0` disables). Not applied to leave or stop commands |
-| `calibration.stage1` / `stage2` / `detach` | `z_ref` 0.50 / 0.28 / 1.0 m, `x_ref` 0.026 m, `yaw_ref` 0 | control | each cmd | **Required.** Target pose of Stage 1 / Stage 2 / leave: `z_ref` = target forward distance (> 0; `detach`: leave distance), `x_ref` (m) / `yaw_ref` (rad) = lateral / yaw reference. Written by `tools/calibrate.py` (see [Calibration](#calibration)); `stamp` / `image_path` are metadata only |
+| `calibration.stage1` / `stage2` / `detach` | `z_ref` 0.50 / 0.28 / 1.0 m; stage1 / stage2 `x_ref` 0.026 m, `yaw_ref` 0 | control | each cmd | **Required.** Target pose of Stage 1 / Stage 2 / leave: `z_ref` = target forward distance (> 0; `detach`: leave distance), `x_ref` (m) / `yaw_ref` (rad) = lateral / yaw reference of stage1 / stage2. `detach` has only `z_ref` (its `x_ref` / `yaw_ref` are 0: during Detaching, status `y_error` is the raw lateral offset); other keys are ignored. Written by `tools/calibrate.py` (see [Calibration](#calibration)) |
 | `yaw_estimator.s4_distances` | `[0.3, 0.5, 0.7]` m | control | each cmd | Yaw precision table: equivalent-distance breakpoints; beyond the last one yaw is not used. Non-empty, same length as `s4_sigmas_deg` |
 | `yaw_estimator.s4_sigmas_deg` | `[1.0, 2.0, 3.0]` deg | control | each cmd | Yaw precision table: sigma at each breakpoint |
 | `ros_interfaces.amcl_check_service` / `amcl_close_service` / `amcl_open_service` | `/check_mcl_if_trigger` / `/close_amcl` / `/open_amcl` | control | startup only | G7+ AMCL services (absolute names) |

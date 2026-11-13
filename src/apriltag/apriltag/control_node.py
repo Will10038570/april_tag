@@ -492,7 +492,10 @@ class AprilTagControlNode(Node):
 
     def _log_calibration(self) -> None:
         """Log the calibration points and in-position tolerances in use."""
-        cal = ', '.join(f'{k}(z_ref={p.z_ref:.4f}m x_ref={p.x_ref:.4f}m yaw_ref={p.yaw_ref:.4f}rad)'
+        # detach has only z_ref (its x_ref / yaw_ref are 0.0)
+        cal = ', '.join(f'{k}(z_ref={p.z_ref:.4f}m'
+                        + ('' if k == 'detach' else f' x_ref={p.x_ref:.4f}m yaw_ref={p.yaw_ref:.4f}rad')
+                        + ')'
                         for k, p in self._calibration.items())
         tol = ', '.join(f'{k}(x={t.x:.3f}m y={t.y:.3f}m yaw={t.yaw:.3f}rad hold={t.hold_seconds:.2f}s)'
                         for k, t in self._tolerances.items())
@@ -548,8 +551,8 @@ class AprilTagControlNode(Node):
         self._active_tol = self._tolerances.get(key)
         tol = self._active_tol
         self.get_logger().info(
-            self._stage() + f'[calibration] {self._state.value}: z_ref={point.z_ref:.4f}m '
-            f'x_ref={point.x_ref:.4f}m yaw_ref={point.yaw_ref:.4f}rad'
+            self._stage() + f'[calibration] {self._state.value}: z_ref={point.z_ref:.4f}m'
+            + ('' if key == 'detach' else f' x_ref={point.x_ref:.4f}m yaw_ref={point.yaw_ref:.4f}rad')
             + (f'; tolerance x={tol.x:.3f}m y={tol.y:.3f}m yaw={tol.yaw:.3f}rad '
                f'hold={tol.hold_seconds:.2f}s' if tol is not None else ''))
         self._set_step_locked(Step.RUNNING, reason)
