@@ -12,7 +12,13 @@ from apriltag.domain.calibration import (
     require_calibration,
     save_calibration_point,
 )
-from apriltag.domain.config_loader import StageTolerance, load_config, validate_control_config
+from apriltag.domain.config_loader import (
+    Stage1Approach,
+    StageTolerance,
+    load_config,
+    parse_stage1_approach,
+    validate_control_config,
+)
 
 # the shipped config at the workspace root (src/apriltag/test -> ../../..)
 REPO_CONFIG = pathlib.Path(__file__).resolve().parents[3] / 'april_tag_config.json'
@@ -24,6 +30,8 @@ VALID = {
     'control': {'manage_amcl_and_lidar_safety': False,
                 'stage1_tolerance': {'x': 0.05, 'y': 0.05, 'yaw': 0.05, 'hold_seconds': 1.0},
                 'stage2_tolerance': {'x': 0.02, 'y': 0.03, 'yaw': 0.04, 'hold_seconds': 0.5},
+                'stage1_approach': {'enabled': True, 'lateral_full': 0.03, 'lateral_zero': 0.08,
+                                    'yaw_full': 0.035, 'yaw_zero': 0.105},
                 'dock_timeout': 300.0, 'undock_timeout': 300.0, 'lost_target_timeout': 1.0,
                 'max_vx': 0.1, 'max_vy': 0.1, 'max_vw': 0.05,
                 'min_vx': 0.01, 'min_vy': 0.01, 'min_vw': 0.01},
@@ -58,7 +66,9 @@ def test_valid_config_loads(tmp_path):
 
 @pytest.mark.skipif(not REPO_CONFIG.exists(), reason='workspace april_tag_config.json not found')
 def test_shipped_config_is_valid():
-    validate_control_config(load_config(str(REPO_CONFIG)))
+    data = load_config(str(REPO_CONFIG))
+    validate_control_config(data)
+    parse_stage1_approach(data)
 
 
 # the virtual test config, next to april_tag_config.json at the workspace root
@@ -66,7 +76,9 @@ VIRTUAL_CONFIG = pathlib.Path(__file__).resolve().parents[3] / 'virtual_tracking
 
 
 def test_virtual_config_is_valid():
-    tol, cal = validate_control_config(load_config(str(VIRTUAL_CONFIG)))
+    data = load_config(str(VIRTUAL_CONFIG))
+    parse_stage1_approach(data)
+    tol, cal = validate_control_config(data)
     # keep the factory calibration values (the sim's ground truth follows any values)
     assert [cal[k].z_ref for k in ('stage1', 'stage2', 'detach')] == [0.5, 0.28, 1.0]
     assert all(cal[k].x_ref == pytest.approx(0.026) and cal[k].yaw_ref == 0.0
@@ -330,3 +342,45 @@ def test_save_calibration_does_not_touch_bad_files(tmp_path):
         save_calibration_point(str(missing), 'stage2', point)
     assert not missing.exists()
     assert not missing.parent.exists()
+
+
+# ---- control.stage1_approach -------------------------------------------------------
+
+def test_stage1_approach_parsed():
+    assert parse_stage1_approach(VALID) == Stage1Approach(True, 0.03, 0.08, 0.035, 0.105)
+
+
+def _approach(**changes):
+    data = copy.deepcopy(VALID)
+    data['control']['stage1_approach'].update(changes)
+    return data
+
+
+def test_stage1_approach_missing():
+    data = copy.deepcopy(VALID)
+    del data['control']['stage1_approach']
+    with pytest.raises(ValueError, match='Missing or invalid control.stage1_approach'):
+        parse_stage1_approach(data)
+
+
+@pytest.mark.parametrize('changes,match', [
+    ({'enabled': 1}, 'enabled must be a bool'),
+    ({'enabled': None}, 'enabled must be a bool'),
+    ({'lateral_full': 'a'}, 'lateral_full must be a number'),
+    ({'yaw_zero': True}, 'yaw_zero must be a number'),
+    ({'yaw_zero': float('inf')}, 'yaw_zero must be a number'),
+    ({'lateral_full': -0.01}, 'lateral_full .* must be >= 0'),
+    ({'lateral_zero': 0.03}, 'lateral_zero .* must be > lateral_full'),
+    ({'yaw_zero': 0.01}, 'yaw_zero .* must be > yaw_full'),
+])
+def test_stage1_approach_invalid(changes, match):
+    with pytest.raises(ValueError, match=match):
+        parse_stage1_approach(_approach(**changes))
+
+
+def test_stage1_approach_missing_field():
+    data = copy.deepcopy(VALID)
+    del data['control']['stage1_approach']['yaw_full']
+    with pytest.raises(ValueError, match='yaw_full must be a number'):
+        parse_stage1_approach(data)
+

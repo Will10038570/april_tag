@@ -115,6 +115,15 @@ def test_corner_near_border_keeps_xy_but_no_yaw():
     assert e.x_f == pytest.approx(0.4)
 
 
+def test_yaw_valid_latches_after_first_usable_frame():
+    est = YawEstimator()
+    assert not estimate(est, 5.0, d=1.2).yaw_valid      # beyond the S4 table
+    assert estimate(est, 5.0, d=0.5).yaw_valid          # first usable frame
+    assert estimate(est, 5.0, d=1.2).yaw_valid          # stays valid for the target
+    est.reset()
+    assert not estimate(est, 5.0, d=1.2).yaw_valid
+
+
 def test_bit_errors_disable_yaw_only():
     corners, _ = synthetic_tag(10.0, d=0.4)
     assert quality_score(corners, 640, 480, hamming=1, decision_margin=100.0) == 0.0

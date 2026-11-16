@@ -71,17 +71,50 @@ def clamp_control(
     vx: float, vy: float, vw: float,
     max_vx: float, max_vy: float, max_vw: float,
     min_vx: float = 0.0, min_vy: float = 0.0, min_vw: float = 0.0,
+    vx_scale: float = 1.0,
 ) -> Tuple[float, float, float]:
     """Per axis: clip to [-max, max], then raise non-zero |v| < min to min.
 
     With 0 <= min <= max (validate_speed_limits) the result is 0 or
     |v| in [min, max]. min = 0 keeps the old max-only behaviour.
+    vx_scale (clipped to [0, 1], non-finite -> 0) multiplies a forward vx
+    (> 0) after the max clip and before the min: the Stage 1 straight
+    approach. A backward vx is not scaled.
     """
+    scale = min(max(float(vx_scale), 0.0), 1.0) if math.isfinite(vx_scale) else 0.0
+    vx = max(min(vx, max_vx), -max_vx)
+    if vx > 0.0:
+        vx *= scale
     return (
-        _apply_min(max(min(vx, max_vx), -max_vx), min_vx),
+        _apply_min(vx, min_vx),
         _apply_min(max(min(vy, max_vy), -max_vy), min_vy),
         _apply_min(max(min(vw, max_vw), -max_vw), min_vw),
     )
+
+
+def ramp_scale(value: float, full: float, zero: float) -> float:
+    """1 at |value| <= full, 0 at |value| >= zero, linear between; non-finite -> 0."""
+    v = abs(float(value))
+    if not math.isfinite(v) or v >= zero:
+        return 0.0
+    if v <= full:
+        return 1.0
+    return (zero - v) / (zero - full)
+
+
+def approach_vx_scale(lateral: float, yaw: float, yaw_valid: bool, cfg) -> float:
+    """Stage 1 forward-speed scale in [0, 1] from how far the robot is off its approach.
+
+    cfg is a config_loader.Stage1Approach. lateral (m): approach-line
+    lateral error, or the camera y_error while the yaw is not valid yet;
+    yaw (rad, minus yaw_ref) counts only when yaw_valid. Disabled -> 1.
+    """
+    if not cfg.enabled:
+        return 1.0
+    scale = ramp_scale(lateral, cfg.lateral_full, cfg.lateral_zero)
+    if yaw_valid:
+        scale *= ramp_scale(yaw, cfg.yaw_full, cfg.yaw_zero)
+    return scale
 
 
 def validate_speed_limits(
@@ -127,10 +160,12 @@ def publish_control(
     min_vx: float = 0.0,
     min_vy: float = 0.0,
     min_vw: float = 0.0,
+    vx_scale: float = 1.0,
 ):
     """Run one control step and publish twist; return state updates.
 
     wz_override (S3 probe turn) replaces the LQR's wz; vx / vy stay the LQR's.
+    vx_scale: see clamp_control (Stage 1 straight approach).
     """
     dt, new_last_time = compute_dt(now, last_time, max_dt)
     state = extract_control_state(best_target)
@@ -139,7 +174,8 @@ def publish_control(
     if wz_override is not None:
         vw = float(wz_override)
     vx, vy, vw = sanitize_control(vx, vy, vw, logger)
-    vx, vy, vw = clamp_control(vx, vy, vw, max_vx, max_vy, max_vw, min_vx, min_vy, min_vw)
+    vx, vy, vw = clamp_control(vx, vy, vw, max_vx, max_vy, max_vw, min_vx, min_vy, min_vw,
+                               vx_scale)
     publish_twist_fn(vx, vy, vw)
 
     return new_last_time, plan

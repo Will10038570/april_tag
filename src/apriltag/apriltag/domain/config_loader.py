@@ -30,6 +30,19 @@ class StageTolerance:
     hold_seconds: float
 
 
+@dataclass(frozen=True)
+class Stage1Approach:
+    """Stage 1 straight approach: forward vx scaled by ramps of |lateral| (m) and |yaw| (rad).
+
+    Scale 1 at <= *_full, 0 at >= *_zero (see control_flow.approach_vx_scale).
+    """
+    enabled: bool
+    lateral_full: float
+    lateral_zero: float
+    yaw_full: float
+    yaw_zero: float
+
+
 def load_config(path: str) -> dict:
     """Load april_tag_config.json.
 
@@ -171,3 +184,32 @@ def validate_control_config(
     ctrl = data['control']
     tolerances = {s: _parse_tolerance(ctrl, f'{s}_tolerance') for s in TOLERANCE_STAGES}
     return tolerances, require_calibration(data)
+
+
+def parse_stage1_approach(data: dict) -> Stage1Approach:
+    """control.stage1_approach (required) of a config from load_config().
+
+    enabled: bool; lateral_full / lateral_zero (m), yaw_full / yaw_zero
+    (rad): numbers with 0 <= full < zero. Raises ValueError naming the bad field.
+    """
+    name = 'control.stage1_approach'
+    sec = data.get('control', {}).get('stage1_approach')
+    if not isinstance(sec, dict):
+        raise ValueError(f'Missing or invalid {name} (an object with enabled, lateral_full, '
+                         'lateral_zero, yaw_full, yaw_zero)')
+    enabled = sec.get('enabled')
+    if not isinstance(enabled, bool):
+        raise ValueError(f'{name}.enabled must be a bool, got {type(enabled).__name__!r}')
+    values = {}
+    for field in ('lateral_full', 'lateral_zero', 'yaw_full', 'yaw_zero'):
+        v = sec.get(field)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f'{name}.{field} must be a number, got {type(v).__name__!r}')
+        values[field] = float(v)
+    for axis in ('lateral', 'yaw'):
+        full, zero = values[f'{axis}_full'], values[f'{axis}_zero']
+        if full < 0.0:
+            raise ValueError(f'{name}.{axis}_full ({full}) must be >= 0')
+        if zero <= full:
+            raise ValueError(f'{name}.{axis}_zero ({zero}) must be > {axis}_full ({full})')
+    return Stage1Approach(enabled=enabled, **values)

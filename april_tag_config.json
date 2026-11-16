@@ -12,6 +12,7 @@
     "manage_amcl_and_lidar_safety": false,
     "stage1_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 1.0},
     "stage2_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 1.0},
+    "stage1_approach": {"enabled": true, "lateral_full": 0.03, "lateral_zero": 0.08, "yaw_full": 0.035, "yaw_zero": 0.105},
     "dock_timeout": 300.0,
     "undock_timeout": 300.0,
     "lost_target_timeout": 1.0,

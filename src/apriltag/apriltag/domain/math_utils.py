@@ -94,6 +94,32 @@ def optical_to_control_error(
     return ControlState(x_error=x_error, y_error=y_error, yaw_error=yaw_error)
 
 
+def approach_lateral_error(
+    forward: float,
+    lateral: float,
+    yaw: float,
+    x_ref: float,
+    yaw_ref: float,
+) -> float:
+    """Signed distance (m) of the camera from a calibration point's approach line.
+
+    The approach line goes through the camera position of the point (tag at
+    forward z_ref, lateral -x_ref, yaw yaw_ref) along its viewing direction;
+    driving straight forward on it reaches the point. forward / lateral are
+    the tag position in the camera control frame (x forward, y left, m), yaw
+    the measured yaw error (rad, rotation_matrix_to_yaw_error). Same sign as
+    the y_error of optical_to_control_error, to which it reduces when the
+    yaw equals yaw_ref:
+
+        e = lateral * cos(d) - forward * sin(d) + x_ref,  d = yaw - yaw_ref
+    """
+    values = (forward, lateral, yaw, x_ref, yaw_ref)
+    if not all(math.isfinite(float(v)) for v in values):
+        raise ValueError(f'Non-finite approach input: {values}')
+    d = float(yaw) - float(yaw_ref)
+    return float(lateral) * math.cos(d) - float(forward) * math.sin(d) + float(x_ref)
+
+
 
 
 def parse_tag_sizes(text: str) -> dict:

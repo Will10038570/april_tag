@@ -20,8 +20,14 @@ from std_msgs.msg import Bool, Int32, String
 from std_srvs.srv import Empty, SetBool, Trigger
 
 from apriltag.control import LQRTracker, TrajectoryPlanner
-from apriltag.domain.config_loader import StageTolerance, load_config, validate_control_config
+from apriltag.domain.config_loader import (
+    StageTolerance,
+    load_config,
+    parse_stage1_approach,
+    validate_control_config,
+)
 from apriltag.domain.math_utils import (
+    approach_lateral_error,
     optical_to_control_error,
     parse_tag_sizes,
     quaternion_to_rotation_matrix,
@@ -39,7 +45,13 @@ from apriltag.runtime.cmd_flow import (
     tag_id_filter,
     validate_goal,
 )
-from apriltag.runtime.control_flow import in_tolerance, leave_step, publish_control, validate_speed_limits
+from apriltag.runtime.control_flow import (
+    approach_vx_scale,
+    in_tolerance,
+    leave_step,
+    publish_control,
+    validate_speed_limits,
+)
 from apriltag.runtime.safety_guard import handle_target_lost
 from apriltag.runtime.target_flow import ANY_TAG_ID, tag_matches
 from apriltag.runtime.yaw_probe import YawProbe, YawProbeConfig
@@ -202,6 +214,11 @@ class AprilTagControlNode(Node):
         # in-position tolerances {'stage1', 'stage2'} and calibration points
         # {'stage1', 'stage2', 'detach'}; all required
         self._tolerances, self._calibration = validate_control_config(_cfg)
+        # Stage 1 straight approach (forward vx scaled until the robot is on
+        # the approach line); required
+        self._stage1_approach = parse_stage1_approach(_cfg)
+        # True once the current Stage 1 run has logged that the yaw became valid
+        self._approach_yaw_logged = False
 
         def jp(section: str, key: str):
             return _cfg[section][key]
@@ -451,6 +468,7 @@ class AprilTagControlNode(Node):
             raise ValueError(f'Invalid config: {reason}')
         parse_tag_sizes(str(cfg['tag_size']['tag_sizes']))
         validate_control_config(cfg)
+        parse_stage1_approach(cfg)
         return cfg
 
     def _apply_config_locked(self, cfg: dict) -> None:
@@ -475,6 +493,7 @@ class AprilTagControlNode(Node):
         self._goal_tag_id         = tag_id_filter(int(cfg['detection']['tracking_tag_id']))
         # already validated by _read_config()
         self._tolerances, self._calibration = validate_control_config(cfg)
+        self._stage1_approach = parse_stage1_approach(cfg)
 
         new_dists = [float(v) for v in cfg['yaw_estimator']['s4_distances']]
         new_sigs  = [float(v) for v in cfg['yaw_estimator']['s4_sigmas_deg']]
@@ -549,12 +568,17 @@ class AprilTagControlNode(Node):
         self._active_x_ref = point.x_ref
         self._active_yaw_ref = point.yaw_ref
         self._active_tol = self._tolerances.get(key)
+        self._approach_yaw_logged = False
         tol = self._active_tol
+        ap = self._stage1_approach
         self.get_logger().info(
             self._stage() + f'[calibration] {self._state.value}: z_ref={point.z_ref:.4f}m'
             + ('' if key == 'detach' else f' x_ref={point.x_ref:.4f}m yaw_ref={point.yaw_ref:.4f}rad')
             + (f'; tolerance x={tol.x:.3f}m y={tol.y:.3f}m yaw={tol.yaw:.3f}rad '
-               f'hold={tol.hold_seconds:.2f}s' if tol is not None else ''))
+               f'hold={tol.hold_seconds:.2f}s' if tol is not None else '')
+            + ((f'; approach lateral {ap.lateral_full:.3f}-{ap.lateral_zero:.3f}m '
+                f'yaw {ap.yaw_full:.3f}-{ap.yaw_zero:.3f}rad' if ap.enabled else '; approach disabled')
+               if self._state is S.STAGE1 else ''))
         self._set_step_locked(Step.RUNNING, reason)
 
     def _is_running_locked(self) -> bool:
@@ -1083,7 +1107,32 @@ class AprilTagControlNode(Node):
         if self.yaw_probe.last_event:
             self.get_logger().info(self._stage() + f'[S3] {self.yaw_probe.last_event}')
 
+        # Stage 1 straight approach: scale the forward vx down while the robot
+        # is off the approach line (tag-frame lateral once the yaw is valid,
+        # the camera y before) or its yaw is off
+        vx_scale, approach_lat, approach_src = 1.0, None, ''
         try:
+            if tracking_state is S.STAGE1 and self._stage1_approach.enabled:
+                if est.yaw_valid:
+                    approach_src = 'tag lateral'
+                    approach_lat = approach_lateral_error(
+                        est.x_f, est.y_f - self._active_x_ref, est.yaw_f,
+                        self._active_x_ref, self._active_yaw_ref)
+                    if not self._approach_yaw_logged:
+                        self._approach_yaw_logged = True
+                        self.get_logger().info(
+                            self._stage() + f'[approach] yaw valid at d={p.z:.3f}m, gating on '
+                            f'tag-frame lateral (lat={approach_lat:+.3f}m, yaw={yaw_f_cal:+.4f}rad)')
+                else:
+                    approach_src = 'camera y'
+                    approach_lat = est.y_f
+                vx_scale = approach_vx_scale(approach_lat, yaw_f_cal, est.yaw_valid,
+                                             self._stage1_approach)
+                self.get_logger().info(
+                    self._stage() + f'[approach] vx_scale={vx_scale:.2f} lat={approach_lat:+.3f}m '
+                    f'({approach_src}) yaw={yaw_f_cal:+.4f}rad',
+                    throttle_duration_sec=LOG_THROTTLE_SEC)
+
             self._last_stamp, latest_plan = publish_control(
                 best_target=best_target,
                 now=stamp,
@@ -1100,6 +1149,7 @@ class AprilTagControlNode(Node):
                 min_vx=self.min_vx,
                 min_vy=self.min_vy,
                 min_vw=self.min_vw,
+                vx_scale=vx_scale,
             )
         except Exception as exc:
             self.get_logger().warn(self._stage() + f"Control publish failed: {exc}")
@@ -1108,7 +1158,9 @@ class AprilTagControlNode(Node):
         self.get_logger().debug(
             self._stage() + f'[yaw] d={p.z:.3f} dh={est.dh:+.3f} snr={est.snr:.2f} c_sign={est.c_sign:.2f} '
             f'c_quality={est.c_quality:.2f} yaw_meas={est.yaw_meas:+.4f} yaw_f={est.yaw_f:+.4f} '
-            f'yaw_abs_f={est.yaw_abs_f:.4f} accepted={est.accepted} wz_cmd={self._last_wz_cmd:+.4f}'
+            f'yaw_abs_f={est.yaw_abs_f:.4f} accepted={est.accepted} wz_cmd={self._last_wz_cmd:+.4f} '
+            f'yaw_valid={est.yaw_valid} vx_scale={vx_scale:.2f}'
+            + (f' lat={approach_lat:+.4f}' if approach_lat is not None else '')
             + (' (S3 probe)' if wz_override is not None else ''))
 
         self.latest_plan = latest_plan

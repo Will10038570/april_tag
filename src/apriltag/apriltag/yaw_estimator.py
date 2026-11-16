@@ -229,6 +229,9 @@ class YawEstimate:
     sigma_size: float
     sigma_eff: float
     accepted: Optional[bool] = field(default=None)
+    # the yaw filter has had a usable frame (within the S4 table) since the
+    # last reset; stays True while the target is kept
+    yaw_valid: bool = False
 
 
 class YawEstimator:
@@ -280,4 +283,5 @@ class YawEstimator:
             sigma_size=s_size,
             sigma_eff=s_eff,
             accepted=accepted,
+            yaw_valid=self.yaw_filter.initialized,
         )

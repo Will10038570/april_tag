@@ -37,6 +37,20 @@ def test_without_min_is_max_only():
     assert clamp_control(0.005, -0.5, 0.001, *MAX) == pytest.approx((0.005, -0.1, 0.001))
 
 
+@pytest.mark.parametrize('vx,scale,expected', [
+    (0.3, 0.0, 0.0),      # gated: forward stopped
+    (0.3, 0.5, 0.05),     # scaled after the max clip
+    (0.3, 0.05, 0.01),    # small result raised to min
+    (0.3, 1.0, 0.1),
+    (-0.3, 0.0, -0.1),    # backward not scaled
+    (0.3, 2.0, 0.1),      # scale clipped to 1
+    (0.3, float('nan'), 0.0),
+])
+def test_vx_scale(vx, scale, expected):
+    out = clamp_control(vx, 0.05, 0.02, *MAX, *MIN, vx_scale=scale)
+    assert out == pytest.approx((expected, 0.05, 0.02))
+
+
 def test_valid_limits():
     assert validate_speed_limits(*MAX, *MIN) is None
     assert validate_speed_limits(*MAX, 0.0, 0.0, 0.0) is None
