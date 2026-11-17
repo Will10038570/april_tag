@@ -2,6 +2,8 @@
 
 > **規則:所有程式碼的 build、執行、測試一律在 Docker container 內進行,不要在 host 的 `/opt/ros/humble` 上跑。**
 > Docker 環境定義在 `/home/cobo/Desktop/april_tag/docker/`(`Dockerfile`、`docker-compose.yml`、`docker_compose_UI_off.yml`、`ros_entrypoint.sh`)。
+>
+> **本機(Jetson `april_tag_serive`)不會接實機機器人**:在這台電腦上 restart / recreate container、停掉實機 launch、`pkill` 測試 process 都不需要顧慮對機器人的影響。第 3.2 節的 domain / 網路線安全注意事項是給接上機器人的環境用的。
 
 套件功能、topic / service / cmd・status 介面、控制架構請看 `src/apriltag/README.md`;本文件只說明「怎麼在 Docker 裡跑起來與驗證」。
 
@@ -108,7 +110,7 @@ docker exec april_tag_serive bash -ic '
 - 拔掉機器人網路線,**或**
 - 改用其他 domain(`domain_id:=99`)並讓 DDS 只走 loopback(見下方指令)。
 
-用 `docker-compose.yml` 建立的 container 本身就在跑實機 launch(domain 72、`lo`),與 domain 99 的測試互不干擾,但清理殘留 process 時不要誤殺它(見本節最後)。
+用 `docker-compose.yml` 建立的 container 本身就在跑實機 launch(domain 72、`lo`),與 domain 99 的測試互不干擾;清理殘留 process 時會連它一起停掉(見本節最後),在本機無妨(見文件開頭:本機不接機器人)。
 
 Headless(無視窗,自動依序送 `attach`、`detach`,存檔後結束):
 
@@ -173,7 +175,7 @@ detection / control / sim 的其他設定全部在 `config_file`(2026-11-12 起 
 
 手動送 cmd 測試(另開終端,同樣設 `ROS_DOMAIN_ID=99` 與 `lo` 的 `CYCLONEDDS_URI`):用 `headless:=true auto_start:=false` 啟動,sim 的物理與相機照常運作,但不會自己送 cmd。指令見第 4 節(`tools/attach.py` / `detach.py` `true|false`,或 `ros2 service call /wheelchair/attach std_srvs/srv/SetBool "{data: true}"`、`ros2 topic echo /wheelchair/status`)。工具呼叫完 service 就結束(不會卡住終端),結果看 status。
 
-**背景 process 注意:** `docker exec` 被中斷(或 Claude Code 的指令被拒絕)時,container 內已啟動的 process **不會**停止;非互動 bash 的背景 job 也會忽略 SIGINT。測完務必確認並清掉殘留(`[a]` 寫法避免 `pkill` 比對到自己)。**先看 `ps` 有沒有實機 launch 的 node**(不是 domain 99 的測試):下面的 `pkill` 會連它們一起停掉(2026-10-19 發生過),有的話改用 `kill -INT <pid>` 只停測試的 PID:
+**背景 process 注意:** `docker exec` 被中斷(或 Claude Code 的指令被拒絕)時,container 內已啟動的 process **不會**停止;非互動 bash 的背景 job 也會忽略 SIGINT。測完務必確認並清掉殘留(`[a]` 寫法避免 `pkill` 比對到自己)。**先看 `ps` 有沒有實機 launch 的 node 或別人正在跑的測試**:下面的 `pkill` 會連它們一起停掉(2026-10-19 發生過),要保留時改用 `kill -INT <pid>` 只停自己的 PID(PID 用 `ps -eo pid,args` 看，不要用 `pgrep -f` 的結果直接 kill:命令列含相同字串時會比對到執行 kill 的 shell 本身,2026-11-17 這樣做時同一 container 另一組 domain 99 測試也同時收到 SIGINT 停掉)(本機不接機器人，停掉實機 launch 無妨;同一 container 已有別的 domain 99 測試時，自己的測試改用其他 domain,如 98):
 
 ```bash
 docker exec april_tag_serive bash -c 'ps aux | grep -E "[a]priltag_|[v]irtual_tracking" || echo "nothing running"'
@@ -188,7 +190,7 @@ docker exec april_tag_serive bash -ic '
   colcon test --packages-select apriltag && colcon test-result --all'
 ```
 
-`src/apriltag/test/` 內有 `test_state_machine.py`(轉移表、cmd 接受表與取消表)、`test_cmd_flow.py`(status JSON、參數檢查、outcome / error_code)、`test_leave_step.py`、`test_target_flow.py`(`choose_best_target`、`tag_matches`)、`test_yaw_*.py`、`test_tag_size.py`、`test_config_loader.py`(`april_tag_config.json` 驗證、calibration 讀寫)、`test_speed_limits.py`(max / min 速度限制;`test_config_loader.py` 另含 tolerance、calibration 必填、removed key 檢查)、`test_sim_geometry.py`(sim 的 `goal_pose` / `ground_truth`)、`test_approach.py`(Stage 1 進場線橫向偏移，以 sim 幾何驗證正負號;`ramp_scale` / `approach_vx_scale`),2026-11-16 共 301 tests。新增的 pytest 請放在 `src/apriltag/test/`,同樣用上面的指令在 container 內執行。
+`src/apriltag/test/` 內有 `test_state_machine.py`(轉移表、cmd 接受表與取消表)、`test_cmd_flow.py`(status JSON、參數檢查、outcome / error_code)、`test_leave_step.py`、`test_target_flow.py`(`choose_best_target`、`tag_matches`)、`test_yaw_*.py`、`test_tag_size.py`、`test_config_loader.py`(`april_tag_config.json` 驗證、calibration 讀寫)、`test_speed_limits.py`(max / min 速度限制;`test_config_loader.py` 另含 tolerance、calibration 必填、removed key 檢查)、`test_sim_geometry.py`(sim 的 `goal_pose` / `ground_truth`)、`test_approach.py`(Stage 1 進場線橫向偏移，以 sim 幾何驗證正負號;`ramp_scale` / `approach_vx_scale`)、`test_lqr_weights.py`(`control.lqr` 出廠 q 與舊 Q/R 等效、`K ≈ √q`),`test_config_loader.py` 另含 `yaw_estimator` / `yaw_probe` 驗證與 `_doc` key 檢查,2026-11-17 共 359 tests。新增的 pytest 請放在 `src/apriltag/test/`,同樣用上面的指令在 container 內執行。
 
 ---
 
@@ -239,7 +241,7 @@ docker exec -it april_tag_serive bash -ic 'ros2 service call /wheelchair/attach 
 
 `apriltag_control` 是狀態機:`IDLE → STAGE1 → STAGE2 → IDLE`(`attach`)與 `IDLE → LEAVING → IDLE`(`detach`),每個非 IDLE state 內有 `preparing → running → ending` 三個步驟(詳見 README 的 State Machine)。每個被接受的 attach / detach 在一條 worker thread 跑。AMCL / lidar safety 由各 state 自己切換:`STAGE1` 準備時 enable lidar、關 AMCL;`STAGE2` 準備時 disable lidar;Stage 2 成功只停車就回 `IDLE`(AMCL 維持關、lidar 維持 disabled);`LEAVING` 結束、任何失敗 / cancel / timeout 與 shutdown 都會 enable lidar 並確保 AMCL 打開(不記錄是誰關的)。整個 cmd 有 timeout(`dock_timeout` / `undock_timeout`,預設 300 s,從 cmd 接受算到進入 ending)。
 
-`april_tag.launch.py` 只接受 `config_file` 一個參數(include RealSense 時以 scoped `GroupAction` 傳 `config_file:=''` 給它:`rs_launch.py` 也有同名 launch 參數,會把我們的 JSON 當相機 YAML 讀,遇 `null` 讓整個 launch 崩潰,2026-11-12 修正前 HEAD 即如此);`manage_amcl_and_lidar_safety`(預設 `false`)等由 `april_tag_config.json` 的 `control` 區塊設定。**stage / leave 目標只來自 `calibration` 的 `stage1` / `stage2` / `detach` 三個點(必填,`z_ref` = 目標前向距離、`x_ref` / `yaw_ref` = 橫向 / yaw 參考;`detach` 只有 `z_ref`(記憶體中 `x_ref` / `yaw_ref` 為 0,Detaching 時 status 的 `y_error` 是未加偏移的橫向值);其他 key(舊檔的 `stamp` / `image_path`、`detach.x_ref` / `yaw_ref`)一律忽略;出廠值 `z_ref` 0.50 / 0.28 / 1.0、stage1 / stage2 `x_ref` 0.026、`yaw_ref` 0,等同舊預設)**,沒有 `stage*_distance` / `leave_distance` / `use_calibration`(留著會被 control 拒絕並提示替代欄位)。到位判斷用 `control.stage1_tolerance` / `stage2_tolerance`(`x` / `y` m、`yaw` rad、`hold_seconds` s,出廠皆 0.05 / 0.05 / 0.05 / 1.0;Stage 1 的 x / y 也是 S3 yaw probe 的啟動條件)。`config_file` 對兩個 node 都是必填;detection 只驗證共用區塊,calibration 不完整時只有 control 啟動失敗(camera / detection 照跑,可用 `calibrate.py` 校正後 `docker restart`),Stage 1 速度發到 `/cmd_vel`,Stage 2 與 leave 發到 `/pre_cmd_vel`(G7+ 精準模式)。Stage 1 / 2 的速度每軸先限制在 `max_vx` / `max_vy` / `max_vw`(0.1 / 0.1 m/s、0.05 rad/s),再把非 0 且 `|v| < min_*`(`min_vx` / `min_vy` / `min_vw`,皆 0.01;補償 G7+ 低速 deadband)的值改成 `sign(v)·min`,0 維持 0(`control_flow.clamp_control`);六個值都在 JSON `control` 區塊、缺一不可,須 max > 0、0 ≤ min ≤ max。Stage 1 直線進場(`control.stage1_approach`,必填:`enabled`、`lateral_full` / `lateral_zero` m、`yaw_full` / `yaw_zero` rad,出廠 `true`、0.03 / 0.08、0.035 / 0.105,僅在 sim 調過):Stage 1 前進的 `vx`(> 0)在 max 限制後、min 之前乘上 `ramp(|lat|) × ramp(|yaw|)`(≤ full 為 1、≥ zero 為 0、中間線性),後退不縮放;yaw 還無效時(`YawEstimate.yaw_valid` false,沒有 S4 表內的 frame,0.0475 m tag 約 0.7 m 外)`lat` = 相機 `y_error`、不看 yaw,有效後(鎖住到換 target)`lat` = 相機到 stage1 進場線的距離(`math_utils.approach_lateral_error`)並看 `|yaw_f − yaw_ref|`;log `[approach] …`。`enabled: false` = 舊行為。leave 不用 planner / LQR:固定發 `vx=-max_vx`(-0.1 m/s)、`vy=wz=0`,直到 camera→tag 前向距離 ≥ `leave_distance` 立即停(不檢查 y / yaw、無 hold)。
+`april_tag.launch.py` 只接受 `config_file` 一個參數(include RealSense 時以 scoped `GroupAction` 傳 `config_file:=''` 給它:`rs_launch.py` 也有同名 launch 參數,會把我們的 JSON 當相機 YAML 讀,遇 `null` 讓整個 launch 崩潰,2026-11-12 修正前 HEAD 即如此);`manage_amcl_and_lidar_safety`(預設 `false`)等由 `april_tag_config.json` 的 `control` 區塊設定。**stage / leave 目標只來自 `calibration` 的 `stage1` / `stage2` / `detach` 三個點(必填,`z_ref` = 目標前向距離、`x_ref` / `yaw_ref` = 橫向 / yaw 參考;`detach` 只有 `z_ref`(記憶體中 `x_ref` / `yaw_ref` 為 0,Detaching 時 status 的 `y_error` 是未加偏移的橫向值);其他 key(舊檔的 `stamp` / `image_path`、`detach.x_ref` / `yaw_ref`)一律忽略;出廠值 `z_ref` 0.50 / 0.28 / 1.0、stage1 / stage2 `x_ref` 0.026、`yaw_ref` 0,等同舊預設)**,沒有 `stage*_distance` / `leave_distance` / `use_calibration`(留著會被 control 拒絕並提示替代欄位)。到位判斷用 `control.stage1_tolerance` / `stage2_tolerance`(`x` / `y` m、`yaw` rad、`hold_seconds` s,出廠皆 0.05 / 0.05 / 0.05 / 1.0;Stage 1 的 x / y 也是 S3 yaw probe 的啟動條件)。`config_file` 對兩個 node 都是必填;detection 只驗證共用區塊,calibration 不完整時只有 control 啟動失敗(camera / detection 照跑,可用 `calibrate.py` 校正後 `docker restart`),Stage 1 速度發到 `/cmd_vel`,Stage 2 與 leave 發到 `/pre_cmd_vel`(G7+ 精準模式)。Stage 1 / 2 的速度每軸先限制在 `max_vx` / `max_vy` / `max_vw`(0.1 / 0.1 m/s、0.05 rad/s),再把非 0 且 `|v| < min_*`(`min_vx` / `min_vy` / `min_vw`,皆 0.01;補償 G7+ 低速 deadband)的值改成 `sign(v)·min`,0 維持 0(`control_flow.clamp_control`);六個值都在 JSON `control` 區塊、缺一不可,須 max > 0、0 ≤ min ≤ max。Stage 1 直線進場(`control.stage1_approach`,必填:`enabled`、`lateral_full` / `lateral_zero` m、`yaw_full` / `yaw_zero` rad,出廠 `true`、0.03 / 0.08、0.035 / 0.105,僅在 sim 調過):Stage 1 前進的 `vx`(> 0)在 max 限制後、min 之前乘上 `ramp(|lat|) × ramp(|yaw|)`(≤ full 為 1、≥ zero 為 0、中間線性),後退不縮放;yaw 還無效時(`YawEstimate.yaw_valid` false,沒有 S4 表內的 frame,0.0475 m tag 約 0.7 m 外)`lat` = 相機 `y_error`、不看 yaw,有效後(鎖住到換 target)`lat` = 相機到 stage1 進場線的距離(`math_utils.approach_lateral_error`)並看 `|yaw_f − yaw_ref|`;log `[approach] …`。`enabled: false` = 舊行為。LQR(`control.lqr`,必填):`q_weights` `[x, y, yaw]`(皆 > 0)、`smooth_tau`(s,> 0,planner 三軸共用);R 固定為 1(`control_node.LQR_R_WEIGHTS`),三軸解耦，每軸 gain `K ≈ √q`(1/s,時間常數 `1/K`,收斂約 `smooth_tau + 1/K`;q 乘 4 → 快 2 倍),只在 `|error| < max_v* / K`(未飽和)時有影響。出廠 `[0.3333, 1.0, 0.1667]` / `0.5` 等同舊寫死的 Q (1, 1, 0.5) / R (3, 1, 3)(K ≈ 0.56 / 0.95 / 0.40)。每次 attach / detach reload 時重建 `LQRTracker` / `TrajectoryPlanner`,啟動與 reload 時 log `[lqr] q=[…] (K~=[…])`。yaw 估計與 S3 probe 的參數全部在 JSON(2026-11-17 起，不再是 ROS 參數):`yaw_estimator`(s4 表 + `border_px`、`margin_lo/hi`、`sigma_dh`、`snr_lo/hi`、`ref_tag_size`、`q_proc`、`gate_sigma`、`gate_min_deg`、`accept_frames`、`consistency_deg`、`abs_window`、`xy_tau`)與 `yaw_probe`(`trigger_frames`、`c_sign_low`、`trigger_yaw`、`wz`、`turn_time`、`settle_frames`、`end_yaw_deg`、`change_deg`、`end_c_sign`、`initial_direction`(1 / -1)、`max_turns`),key = `YawEstimatorConfig` / `YawProbeConfig` 欄位名，全部必填(只有 control 檢查：`config_loader.parse_yaw_estimator` / `parse_yaw_probe`;detection / sim 不受影響),出廠值 = dataclass 預設;每個區塊的 `_doc` 物件是各 key 的說明(選填、loader 忽略，測試檢查與數值 key 一致)。reload 時重建 `YawEstimator` / `YawProbe`,log `[yaw_estimator] …` / `[yaw_probe] …`。leave 不用 planner / LQR:固定發 `vx=-max_vx`(-0.1 m/s)、`vy=wz=0`,直到 camera→tag 前向距離 ≥ `leave_distance` 立即停(不檢查 y / yaw、無 hold)。
 
 `apriltag_detection` 啟動後就一直偵測,不受 `apriltag_control` 控制(沒有 enable service)。debug 影像所有 tag 一律畫綠框。每張影像(收到 `camera_info` 之後)發一則 `apriltag_interfaces/msg/TagPoseArray` 到 `/wheelchair/apriltag_poses`,包含 `tag_families`(launch 參數 `detect_tag_families`,以空白分隔,預設 `tag36h11`;每個 family 一個 detector,CPU 隨數量增加)內所有偵測到的 tag(`family`、`id` 字串、`pose`),沒有 tag 時 `tags` 為空;每個 tag 廣播 TF `<camera_frame> → <family>_<id>`(如 `tag36h11_0`)。`/wheelchair/apriltag_poses` 只作參考 / 除錯,control 不訂閱。沒有 cmd 執行時 `apriltag_control` 會忽略 `tag_tracing`。RealSense 相機(`realsense/launch/camera.launch.py`)也在 `wheelchair` namespace:`/wheelchair/camera/camera/color/*`。
 
@@ -471,6 +473,31 @@ ros2 run rqt_image_view rqt_image_view /wheelchair/apriltag/marked_image
 
   `true` 時遠距離(> 0.72 m)`|y_err| > 0.09` 的 sample 都沒有前進(`false` 時約 116 個);1.0 → 0.7 m 是「tag 置中、朝 tag 前進」(此時 yaw 無效、LQR 不轉，距進場線約 0.12 m),到 0.7 m 停下轉正、橫移再直線進入
 - 未測：實機(門檻值只在 sim 調過、實機 yaw 雜訊下 `e_lat` 是否穩定)
+2026-11-17 LQR 權重移到 JSON(`control.lqr` 的 `q_weights` / `smooth_tau`,必填;R 固定 1;`config_loader.LqrConfig` / `parse_lqr`,只有 control 檢查，detection / sim 不受影響)後，在同一 container(`sleep infinity` override)內實測(domain 98、container 預設 `CYCLONEDDS_URI`;同時有別的 domain 99 測試在跑;config 用 `/tmp` 的 `april_tag_config.json` 副本加 `manage_amcl_and_lidar_safety: true`):
+
+- `colcon test --packages-select apriltag`:323 tests,1 failure(`test_virtual_config_is_valid`,未 commit 的 virtual config `detach.z_ref` 0.8,既有問題)
+- 虛擬測試 headless 4 run 皆 attach / detach `SUCCEEDED`、`(held)`、`(restored)`、`body_status … (OK)`;由 `*_feedback.csv` 算(y / yaw settle = Stage 1 中最後一次超過 0.05 的時間):
+
+  | `q_weights` | 起點 (y, yaw) | Stage 1 時間 | y settle | yaw settle |
+  |---|---|---|---|---|
+  | `[0.3333, 1.0, 0.1667]`(出廠) | 0.15, 10° | 12.2 s(11-16 為 12.0 s) | 2.8 s | 8.4 s |
+  | 出廠 | -0.25, -10° | 14.8 s(11-16 為 13.0 s) | 3.8 s | 9.4 s |
+  | `[0.3333, 0.5, 0.9]` | 0.15, 10° | 12.4 s | 3.4 s | 9.0 s |
+  | `[0.3333, 0.5, 0.9]` | -0.25, -10° | 13.4 s | 4.0 s | 9.4 s |
+
+  y 依預期變慢;yaw 的 K 加倍(0.41 → 0.95)但 settle 幾乎不變:約 0.7 m 外 yaw 無效(wz≈0),有效後 10° 級誤差仍在 `max_vw` 0.05 飽和區。要讓 yaw 變快需同時提高 `max_vw`
+- `auto_start:=false` 手動:副本 `smooth_tau: 0` → `attach.py true` exit 1、`rejected: Config reload failed: control.lqr.smooth_tau (0) must be positive`;改成 `q_weights [0.5, 0.5, 2.0]`、`smooth_tau 0.3` → 接受、`[config] Reloaded`、`[lqr] q=[0.5000, 0.5000, 2.0000] (K~=[0.707, 0.707, 1.414] …) smooth_tau=0.30s`
+- `docker compose --env-file .ros2_setup up -d --force-recreate`(切回實機 launch):control 啟動印 `[lqr] q=[0.3333, 1.0000, 0.1667] …`、`State IDLE`
+- 未測：實機
+
+2026-11-17 yaw 估計 / S3 probe 參數移到 JSON(`yaw_estimator` 補 14 個 key、新增 `yaw_probe` 11 個 key(含原本不是參數的 `end_c_sign`),皆必填、附 `_doc`;刪除 25 個 ROS 參數)後，在同一 container 內實測(domain 98、container 預設 `CYCLONEDDS_URI`;config 為 `/tmp` 的 `april_tag_config.json` 副本加 `manage_amcl_and_lidar_safety: true`):
+
+- `colcon test --packages-select apriltag`:359 tests,1 failure(既有的 `test_virtual_config_is_valid`)
+- 虛擬測試 headless(0.15, 10°):`[yaw_estimator]` / `[yaw_probe]` 印出預設值、attach / detach `SUCCEEDED`、`(held)`、`(restored)`、`body_status … (OK)`,Stage 1 12.4 s(LQR 驗證時 12.2 s)
+- `auto_start:=false`:副本 `yaw_probe.wz: 0` → `rejected: Config reload failed: yaw_probe.wz (0) must be positive`;改 `wz 0.02`、`initial_direction -1`、`yaw_estimator.q_proc 0.0001` → 接受、log 顯示新值、attach `SUCCEEDED`(此 run 未觸發 S3,`turning -` 未實際看到)
+- `docker restart april_tag_serive`:實機 launch 的 control 印 `[lqr]`、`[yaw_estimator]`、`[yaw_probe]`、`State IDLE`
+- 未測：實機
+
 ## 7. `src/apriltag/README.md` 與實際不一致之處
 
 - (2026-10-06 已修正 launch 檔名與 `test/` 目錄;目前無已知不一致)

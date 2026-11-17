@@ -397,6 +397,7 @@ The once-per-second limit is `LOG_THROTTLE_SEC` in `control_node.py`.
 | `control.manage_amcl_and_lidar_safety` | `false` | control | each cmd | `false` skips every AMCL and lidar safety call (tracking is never blocked by them) |
 | `control.stage1_tolerance` / `stage2_tolerance` | `{"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 1.0}` each | control | each cmd | In-position check of Stage 1 / Stage 2: \|x\|, \|y\| (m) and \|yaw\| (rad, filtered size minus `yaw_ref`) within these for `hold_seconds` (s). x / y / yaw > 0, `hold_seconds` ≥ 0. `stage1_tolerance` x / y also gate the S3 yaw probe |
 | `control.stage1_approach` | `{"enabled": true, "lateral_full": 0.03, "lateral_zero": 0.08, "yaw_full": 0.035, "yaw_zero": 0.105}` | control | each cmd | **Required.** Stage 1 straight approach (see [Docking Stages](#docking-stages)): a forward Stage 1 `vx` (> 0, after the `max_vx` clip, before `min_vx`) is multiplied by `ramp(\|lateral\|; lateral_full, lateral_zero) × ramp(\|yaw\|; yaw_full, yaw_zero)` — 1 at ≤ full, 0 at ≥ zero, linear between. `lateral` (m) is the camera's distance from the stage1 approach line once the yaw is valid, the camera `y_error` before; `yaw` (rad, minus `yaw_ref`) counts only once valid. Backward `vx` is not scaled. `enabled` bool; 0 ≤ full < zero. `false` = old behaviour (all axes at once). Shipped values are initial values tuned in the sim only |
+| `control.lqr` | `{"q_weights": [0.3333, 1.0, 0.1667], "smooth_tau": 0.5}` | control | each cmd | **Required.** LQR state weights `q_weights` `[x, y, yaw]` (each > 0) with R fixed to 1 (`control_node.LQR_R_WEIGHTS`): the axes are decoupled, so each axis' gain is `K ≈ √q` (1/s, e.g. `q` 0.25 / 1 / 4 → K ≈ 0.5 / 1 / 2; 4× q = 2× faster) and its time constant `1/K`. `smooth_tau` (s, > 0) is the [trajectory planner](#trajectory-planner) time constant shared by all axes; an axis converges in roughly `smooth_tau + 1/K`. K only matters below saturation (`\|error\| < max_v* / K`); above it the axis runs at `max_v*`. Shipped values equal the old hard-coded Q (1, 1, 0.5) / R (3, 1, 3): K ≈ 0.56 / 0.95 / 0.40. Keep `K × loop latency` small (K ≲ 1.5–2 for ~0.1–0.2 s) or the robot oscillates; a large yaw K also amplifies the yaw measurement noise. Logged as `[lqr] q=[…] (K~=[…])` at start and on each reload |
 | `control.dock_timeout` / `undock_timeout` | `300.0` s | control | each cmd | attach / detach timeout, from cmd accepted until it ends (> 0) |
 | `control.lost_target_timeout` | `1.0` s | control | each cmd | Tracked tag not seen for this long while running → TAG_LOST (> 0) |
 | `control.max_vx` / `max_vy` / `max_vw` | `0.1` / `0.1` m/s, `0.05` rad/s | control | each cmd | Stage 1 / 2 per-axis velocity saturation (> 0); leave backs up at `-max_vx` |
@@ -404,12 +405,22 @@ The once-per-second limit is `LOG_THROTTLE_SEC` in `control_node.py`.
 | `calibration.stage1` / `stage2` / `detach` | `z_ref` 0.50 / 0.28 / 1.0 m; stage1 / stage2 `x_ref` 0.026 m, `yaw_ref` 0 | control | each cmd | **Required.** Target pose of Stage 1 / Stage 2 / leave: `z_ref` = target forward distance (> 0; `detach`: leave distance), `x_ref` (m) / `yaw_ref` (rad) = lateral / yaw reference of stage1 / stage2. `detach` has only `z_ref` (its `x_ref` / `yaw_ref` are 0: during Detaching, status `y_error` is the raw lateral offset); other keys are ignored. Written by `tools/calibrate.py` (see [Calibration](#calibration)) |
 | `yaw_estimator.s4_distances` | `[0.3, 0.5, 0.7]` m | control | each cmd | Yaw precision table: equivalent-distance breakpoints; beyond the last one yaw is not used. Non-empty, same length as `s4_sigmas_deg` |
 | `yaw_estimator.s4_sigmas_deg` | `[1.0, 2.0, 3.0]` deg | control | each cmd | Yaw precision table: sigma at each breakpoint |
+| `yaw_estimator.border_px` / `margin_lo` / `margin_hi` | `10.0` px / `20.0` / `60.0` | control | each cmd | **Required.** S1 frame quality `c_quality`: 0 if a corner is within `border_px` of the image edge (or the decode needed bit corrections), else `decision_margin` mapped linearly from [`margin_lo`, `margin_hi`] to [0, 1]. `border_px` ≥ 0, 0 ≤ `margin_lo` < `margin_hi` |
+| `yaw_estimator.sigma_dh` / `snr_lo` / `snr_hi` | `0.39` px / `1.0` / `2.0` | control | each cmd | **Required.** S2 yaw sign confidence: `SNR = \|dh\| / sigma_dh` (`dh` = left − right tag edge height, px), `c_sign` 0 at `SNR ≤ snr_lo`, 1 at `≥ snr_hi`; a yaw with `c_sign` 0 is used as 0. Larger `sigma_dh` = the sign is trusted later. `sigma_dh` > 0, 0 ≤ `snr_lo` < `snr_hi` |
+| `yaw_estimator.ref_tag_size` | `0.0475` m | control | each cmd | **Required.** Tag size the S4 table was measured with (not the tag in use; the table is scaled by `tag_size`). Change only when the table is recalibrated (> 0) |
+| `yaw_estimator.q_proc` / `gate_sigma` / `gate_min_deg` / `accept_frames` / `consistency_deg` | `0.0004` rad²/s / `3.0` / `3.0` deg / `5` / `3.0` deg | control | each cmd | **Required.** S5 yaw filter: process noise (larger = follows faster, noisier); outlier gate `max(gate_sigma·σ, gate_min_deg)`; after `accept_frames` consecutive rejected frames within `consistency_deg` of their mean, `yaw_f` jumps to that mean. `q_proc` / `gate_min_deg` ≥ 0, `gate_sigma` / `consistency_deg` > 0, `accept_frames` int ≥ 1 |
+| `yaw_estimator.abs_window` / `xy_tau` | `9` frames / `0.1` s | control | each cmd | **Required.** Frames in the `\|yaw_meas\|` median `yaw_abs_f` (in-position check and S3 probe; int ≥ 1); x / y EMA time constant (≥ 0, 0 = none) |
+| `yaw_probe.trigger_frames` / `c_sign_low` / `trigger_yaw` | `10` / `0.5` / `0.05` rad | control | each cmd | **Required.** S3 probe start: in Stage 1 with x / y within `stage1_tolerance`, after `trigger_frames` consecutive frames with `c_sign < c_sign_low` and `yaw_abs_f > trigger_yaw` (int ≥ 1; (0, 1]; > 0) |
+| `yaw_probe.wz` / `turn_time` / `settle_frames` / `initial_direction` | `0.03` rad/s / `1.0` s / `9` / `1` | control | each cmd | **Required.** Probe turn: `wz` (replaces the LQR wz) for `turn_time`, then `settle_frames` still frames before comparing `yaw_abs_f`; the first turn goes `initial_direction` (`1` = +wz, `-1` = −wz). > 0; > 0; int ≥ 1; 1 or −1 |
+| `yaw_probe.end_yaw_deg` / `change_deg` / `end_c_sign` / `max_turns` | `1.5` deg / `0.5` deg / `1.0` / `8` | control | each cmd | **Required.** A turn that changes `yaw_abs_f` by more than `change_deg` counts as better (same way) or worse (reverse). The probe ends at `yaw_abs_f < end_yaw_deg`, when `c_sign` reaches `end_c_sign` (direction known, back to the LQR) or after `max_turns`. > 0; ≥ 0; (0, 1]; int ≥ 1 |
 | `ros_interfaces.amcl_check_service` / `amcl_close_service` / `amcl_open_service` | `/check_mcl_if_trigger` / `/close_amcl` / `/open_amcl` | control | startup only | G7+ AMCL services (absolute names) |
 | `ros_interfaces.lidar_safety_topic` | `/g7_plc/disable_lidar_safety` | control | startup only | G7+ PLC lidar safety (`Bool`, `true` disables the safety field) |
 | `ros_interfaces.stage1_cmd_vel_topic` | `/cmd_vel` | control | startup only | Stage 1 velocity commands |
 | `ros_interfaces.stage2_cmd_vel_topic` | `/pre_cmd_vel` | control | startup only | Stage 2 and leaving velocity commands (G7+ precision mode) |
 
-`config_file` is required by both nodes (`config_file is required` otherwise). `apriltag_detection` checks only the shared sections, so it starts with incomplete calibration; `apriltag_control` additionally requires both tolerances, `control.stage1_approach` and all three calibration points, and rejects removed keys with a hint: `control.stage1_distance` / `stage2_distance` / `leave_distance` (→ `calibration.stage1` / `stage2` / `detach` `.z_ref`) and `calibration.use_calibration` (calibration is always used).
+The `yaw_estimator` and `yaw_probe` sections also hold a `_doc` object (key → description of each value, units and range); it is optional and ignored by the loader.
+
+`config_file` is required by both nodes (`config_file is required` otherwise). `apriltag_detection` checks only the shared sections, so it starts with incomplete calibration; `apriltag_control` additionally requires both tolerances, `control.stage1_approach`, `control.lqr`, all `yaw_estimator` keys, `yaw_probe` and all three calibration points, and rejects removed keys with a hint: `control.stage1_distance` / `stage2_distance` / `leave_distance` (→ `calibration.stage1` / `stage2` / `detach` `.z_ref`) and `calibration.use_calibration` (calibration is always used).
 
 ### ROS parameters not in the JSON (`apriltag_control`)
 
@@ -418,16 +429,13 @@ The once-per-second limit is `LOG_THROTTLE_SEC` in `control_node.py`.
 | `config_file` | `''`, required (`april_tag.launch.py` passes `/mnt/work_space/april_tag_config.json`) |
 | `body_status_topic` | `/g7_body/simple_ui/body_status` |
 | `external_service_timeout` | `5.0` s (wait for service + wait for response, each) |
-| yaw estimator / S3 probe tuning (`quality_border_px`, `ref_tag_size`, `yaw_*`, `probe_*`, …) | see `AprilTagControlNode.__init__()`; `ref_tag_size` (`0.0475`) is the base size of the S4 table, change only when the table is recalibrated |
 
 ### Hard-coded values (`apriltag_control`)
 
 | Value | Setting | Where | Description |
 |---|---|---|---|
 | `max_dt` | `0.2` s | `control_node.py` | Timestep cap (handles frame drops) |
-| `smooth_tau` | `0.5` s | `control_node.py` (`TrajectoryPlanner`) | Reference smoothing time constant |
-| LQR Q weights | `(1.0, 1.0, 0.5)` | `control.py` default | State cost: x, y, yaw |
-| LQR R weights | `(3.0, 1.0, 3.0)` | `control_node.py` | Control cost: vx, vy, vw (vy is penalised least, so lateral correction is fastest) |
+| LQR R weights | `(1.0, 1.0, 1.0)` | `control_node.py` (`LQR_R_WEIGHTS`) | Control cost: vx, vy, vw; fixed so that `control.lqr.q_weights` alone sets each axis' gain |
 
 ## Project Structure
 
@@ -494,7 +502,7 @@ apriltag_ws/
 
 ### Trajectory Planner
 
-The reference for x, y and yaw starts at the current error and slides toward zero on all three axes at once, with first-order smoothing (`smooth_tau = 0.5 s`). It is reset at the start of each stage. Leaving does not use it.
+The reference for x, y and yaw starts at the current error and slides toward zero on all three axes at once, with first-order smoothing (time constant `control.lqr.smooth_tau`, shipped `0.5 s`). It is reset at the start of each stage. Leaving does not use it.
 
 ### LQR Controller
 
@@ -507,6 +515,8 @@ $$e[k+1] = e[k] - \Delta t \cdot u[k] \quad \Rightarrow \quad A = I,\quad B = -\
 The optimal gain $K$ is computed once by solving the **Discrete Algebraic Riccati Equation (DARE)**:
 
 $$u[k] = -K\,(e[k] - e_{ref}[k])$$
+
+$Q = \mathrm{diag}(q)$ with $q$ = `control.lqr.q_weights` and $R = I$. Since $A$, $B$, $Q$, $R$ are all diagonal, each axis is an independent scalar loop with gain $K_i \approx \sqrt{q_i / r_i} = \sqrt{q_i}$ (exact for small $\Delta t$; e.g. $q = 2$ gives 1.32 at $\Delta t = 0.1$ s). Only the ratio $q_i / r_i$ matters, and a larger $q_i$ on one axis does not give it priority over the others: it only makes that axis faster. The gain is recomputed when $\Delta t$ changes by more than 20 %.
 
 ### Coordinate Frame Convention
 

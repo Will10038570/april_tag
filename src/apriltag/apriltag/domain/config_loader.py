@@ -8,6 +8,8 @@ from typing import Dict, Tuple
 
 from apriltag.domain.calibration import CalibrationPoint, require_calibration
 from apriltag.runtime.control_flow import validate_speed_limits
+from apriltag.runtime.yaw_probe import YawProbeConfig
+from apriltag.yaw_estimator import YawEstimatorConfig
 
 # keys that no longer exist, and what replaces them; only apriltag_control
 # checks them (validate_control_config), so apriltag_detection still starts
@@ -41,6 +43,15 @@ class Stage1Approach:
     lateral_zero: float
     yaw_full: float
     yaw_zero: float
+
+
+@dataclass(frozen=True)
+class LqrConfig:
+    """LQR weights: q_weights [x, y, yaw] with R fixed to 1, so each axis' gain
+    K ~= sqrt(q) (1/s; the axes are decoupled), and the reference smoothing
+    time constant smooth_tau (s, shared by all axes)."""
+    q_weights: Tuple[float, float, float]
+    smooth_tau: float
 
 
 def load_config(path: str) -> dict:
@@ -213,3 +224,135 @@ def parse_stage1_approach(data: dict) -> Stage1Approach:
         if zero <= full:
             raise ValueError(f'{name}.{axis}_zero ({zero}) must be > {axis}_full ({full})')
     return Stage1Approach(enabled=enabled, **values)
+
+
+def parse_lqr(data: dict) -> LqrConfig:
+    """control.lqr (required) of a config from load_config().
+
+    q_weights: list of 3 finite numbers [x, y, yaw], each > 0; smooth_tau:
+    finite number > 0 (s). Raises ValueError naming the bad field.
+    """
+    name = 'control.lqr'
+    sec = data.get('control', {}).get('lqr')
+    if not isinstance(sec, dict):
+        raise ValueError(f'Missing or invalid {name} (an object with q_weights, smooth_tau)')
+    q = sec.get('q_weights')
+    if not isinstance(q, list) or len(q) != 3:
+        raise ValueError(f'{name}.q_weights must be a list of 3 numbers [x, y, yaw]')
+    weights = []
+    for i, v in enumerate(q):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f'{name}.q_weights[{i}] must be a number, got {type(v).__name__!r}')
+        if v <= 0.0:
+            raise ValueError(f'{name}.q_weights[{i}] ({v}) must be positive')
+        weights.append(float(v))
+    tau = sec.get('smooth_tau')
+    if isinstance(tau, bool) or not isinstance(tau, (int, float)) or not math.isfinite(tau):
+        raise ValueError(f'{name}.smooth_tau must be a number, got {type(tau).__name__!r}')
+    if tau <= 0.0:
+        raise ValueError(f'{name}.smooth_tau ({tau}) must be positive')
+    return LqrConfig(q_weights=tuple(weights), smooth_tau=float(tau))
+
+
+# ---- yaw_estimator / yaw_probe (apriltag_control only) ---------------------------
+
+def _field_num(sec: dict, name: str, key: str, kind: str, rule: str) -> float:
+    """One numeric field of section `name`.
+
+    kind: 'int' (no bool / float) or 'float' (int accepted, finite);
+    rule: '>0', '>=0', '>=1' or '(0,1]'. Raises ValueError naming the field.
+    """
+    v = sec.get(key)
+    if kind == 'int':
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(f'{name}.{key} must be an integer, got {type(v).__name__!r}')
+    elif isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise ValueError(f'{name}.{key} must be a number, got {v!r}')
+    ok = {'>0': v > 0, '>=0': v >= 0, '>=1': v >= 1, '(0,1]': 0 < v <= 1}[rule]
+    if not ok:
+        raise ValueError(f'{name}.{key} ({v}) must be ' + {
+            '>0': 'positive', '>=0': '>= 0', '>=1': '>= 1', '(0,1]': 'in (0, 1]'}[rule])
+    return int(v) if kind == 'int' else float(v)
+
+
+def _section_with_doc(data: dict, name: str) -> dict:
+    sec = data.get(name)
+    if not isinstance(sec, dict):
+        raise ValueError(f'Missing or invalid {name} in config')
+    if '_doc' in sec and not isinstance(sec['_doc'], dict):
+        raise ValueError(f'{name}._doc must be an object (key -> description)')
+    return sec
+
+
+# key -> (kind, rule); keys are the YawEstimatorConfig fields (s4 lists apart)
+YAW_ESTIMATOR_FIELDS = {
+    'border_px': ('float', '>=0'),
+    'margin_lo': ('float', '>=0'),
+    'margin_hi': ('float', '>0'),
+    'sigma_dh': ('float', '>0'),
+    'snr_lo': ('float', '>=0'),
+    'snr_hi': ('float', '>0'),
+    'ref_tag_size': ('float', '>0'),
+    'q_proc': ('float', '>=0'),
+    'gate_sigma': ('float', '>0'),
+    'gate_min_deg': ('float', '>=0'),
+    'accept_frames': ('int', '>=1'),
+    'consistency_deg': ('float', '>0'),
+    'abs_window': ('int', '>=1'),
+    'xy_tau': ('float', '>=0'),
+}
+
+# key -> (kind, rule); keys are the YawProbeConfig fields (initial_direction apart)
+YAW_PROBE_FIELDS = {
+    'trigger_frames': ('int', '>=1'),
+    'c_sign_low': ('float', '(0,1]'),
+    'trigger_yaw': ('float', '>0'),
+    'wz': ('float', '>0'),
+    'turn_time': ('float', '>0'),
+    'settle_frames': ('int', '>=1'),
+    'end_yaw_deg': ('float', '>0'),
+    'change_deg': ('float', '>=0'),
+    'end_c_sign': ('float', '(0,1]'),
+    'max_turns': ('int', '>=1'),
+}
+
+
+def parse_yaw_estimator(data: dict) -> YawEstimatorConfig:
+    """yaw_estimator (all keys required) of a config from load_config().
+
+    s4_distances / s4_sigmas_deg: non-empty lists of equal length; the other
+    keys are the YawEstimatorConfig fields (see YAW_ESTIMATOR_FIELDS), with
+    margin_lo < margin_hi and snr_lo < snr_hi. `_doc` (optional) is ignored.
+    Raises ValueError naming the bad field.
+    """
+    name = 'yaw_estimator'
+    sec = _section_with_doc(data, name)
+    dists = _require_num_list(sec, name, 's4_distances')
+    sigs = _require_num_list(sec, name, 's4_sigmas_deg')
+    if not dists:
+        raise ValueError('yaw_estimator.s4_distances must not be empty')
+    if len(dists) != len(sigs):
+        raise ValueError('yaw_estimator.s4_distances and s4_sigmas_deg must have equal length')
+    values = {k: _field_num(sec, name, k, kind, rule)
+              for k, (kind, rule) in YAW_ESTIMATOR_FIELDS.items()}
+    for lo, hi in (('margin_lo', 'margin_hi'), ('snr_lo', 'snr_hi')):
+        if not values[lo] < values[hi]:
+            raise ValueError(f'{name}.{lo} ({values[lo]}) must be < {hi} ({values[hi]})')
+    return YawEstimatorConfig(s4_distances=dists, s4_sigmas_deg=sigs, **values)
+
+
+def parse_yaw_probe(data: dict) -> YawProbeConfig:
+    """yaw_probe (required, all keys) of a config from load_config().
+
+    Keys are the YawProbeConfig fields (see YAW_PROBE_FIELDS);
+    initial_direction must be 1 or -1. `_doc` (optional) is ignored.
+    Raises ValueError naming the bad field.
+    """
+    name = 'yaw_probe'
+    sec = _section_with_doc(data, name)
+    values = {k: _field_num(sec, name, k, kind, rule)
+              for k, (kind, rule) in YAW_PROBE_FIELDS.items()}
+    d = sec.get('initial_direction')
+    if isinstance(d, bool) or not isinstance(d, (int, float)) or d not in (1, -1):
+        raise ValueError(f'{name}.initial_direction must be 1 or -1, got {d!r}')
+    return YawProbeConfig(initial_direction=float(d), **values)

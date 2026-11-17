@@ -1,8 +1,8 @@
 import signal
 import threading
 import math
+from dataclasses import fields as _dataclass_fields
 import time
-from dataclasses import replace as _dataclass_replace
 from enum import Enum
 from typing import Optional, Tuple
 
@@ -21,9 +21,13 @@ from std_srvs.srv import Empty, SetBool, Trigger
 
 from apriltag.control import LQRTracker, TrajectoryPlanner
 from apriltag.domain.config_loader import (
+    LqrConfig,
     StageTolerance,
     load_config,
+    parse_lqr,
     parse_stage1_approach,
+    parse_yaw_estimator,
+    parse_yaw_probe,
     validate_control_config,
 )
 from apriltag.domain.math_utils import (
@@ -54,9 +58,14 @@ from apriltag.runtime.control_flow import (
 )
 from apriltag.runtime.safety_guard import handle_target_lost
 from apriltag.runtime.target_flow import ANY_TAG_ID, tag_matches
-from apriltag.runtime.yaw_probe import YawProbe, YawProbeConfig
-from apriltag.yaw_estimator import YawEstimator, YawEstimatorConfig
+from apriltag.runtime.yaw_probe import YawProbe
+from apriltag.yaw_estimator import YawEstimator
 from apriltag.domain.calibration import CalibrationPoint
+
+# LQR R weights [vx, vy, wz], fixed to 1: the axes are decoupled
+# (control.LQRTracker, e[k+1] = e[k] - dt*u), so each axis' gain depends only
+# on q / r, and with r = 1 it is K ~= sqrt(q) (1/s); q comes from control.lqr
+LQR_R_WEIGHTS = (1.0, 1.0, 1.0)
 
 # high-rate messages (cmd_vel, status) are logged at most once per this period
 LOG_THROTTLE_SEC = 1.0
@@ -240,46 +249,10 @@ class AprilTagControlNode(Node):
         if self.tag_size <= 0.0:
             raise ValueError('Parameter tag_size must be positive.')
 
-        def p(name, default):
-            return self.declare_parameter(name, default).value
-
         ## yaw estimator (S1 quality, S2 sign confidence, S4 precision, S5 filter)
-        self.yaw_estimator = YawEstimator(YawEstimatorConfig(
-            border_px=float(p('quality_border_px', 10.0)),
-            margin_lo=float(p('decision_margin_lo', 20.0)),
-            margin_hi=float(p('decision_margin_hi', 60.0)),
-            sigma_dh=float(p('sigma_dh', 0.39)),
-            snr_lo=float(p('c_sign_snr_lo', 1.0)),
-            snr_hi=float(p('c_sign_snr_hi', 2.0)),
-            s4_distances=[float(v) for v in jp('yaw_estimator', 's4_distances')],
-            s4_sigmas_deg=[float(v) for v in jp('yaw_estimator', 's4_sigmas_deg')],
-            # base size of the S4 table, not the tag in use: change only when
-            # the table is recalibrated
-            ref_tag_size=float(p('ref_tag_size', 0.0475)),
-            q_proc=float(p('yaw_q_proc', 0.02 ** 2)),
-            gate_sigma=float(p('yaw_gate_sigma', 3.0)),
-            gate_min_deg=float(p('yaw_gate_min_deg', 3.0)),
-            accept_frames=int(p('yaw_accept_frames', 5)),
-            consistency_deg=float(p('yaw_consistency_deg', 3.0)),
-            abs_window=int(p('yaw_abs_window', 9)),
-            xy_tau=float(p('xy_ema_tau', 0.1)),
-        ))
-        cfg = self.yaw_estimator.cfg
-        if len(cfg.s4_distances) != len(cfg.s4_sigmas_deg) or not cfg.s4_distances:
-            raise ValueError('s4_distances and s4_sigmas_deg must be non-empty and of equal length.')
-        ## S3 stuck protection (probe turns in Stage 1)
-        self.yaw_probe = YawProbe(YawProbeConfig(
-            trigger_frames=int(p('probe_trigger_frames', 10)),
-            c_sign_low=float(p('probe_c_sign_low', 0.5)),
-            trigger_yaw=float(p('probe_trigger_yaw', 0.05)),
-            wz=float(p('probe_wz', 0.03)),
-            turn_time=float(p('probe_turn_time', 1.0)),
-            settle_frames=int(p('probe_settle_frames', 9)),
-            end_yaw_deg=float(p('probe_end_yaw_deg', 1.5)),
-            change_deg=float(p('probe_change_deg', 0.5)),
-            initial_direction=float(p('probe_initial_direction', 1.0)),
-            max_turns=int(p('probe_max_turns', 8)),
-        ))
+        ## and S3 stuck protection (probe turns in Stage 1): JSON yaw_estimator /
+        ## yaw_probe (required)
+        self._apply_yaw(_cfg)
         # capture time (s) of the last frame given to the yaw estimator
         self._last_estimate_stamp = None
         # wz actually published last (0 after a stop), for the yaw filter
@@ -290,11 +263,9 @@ class AprilTagControlNode(Node):
         self.desired_distance = self._calibration['stage1'].z_ref
 
         ## control-related state and parameters
-        # trajectory planner and LQR tracker
-        # smooth_tau=0.5: slower reference prevents y overshoot/oscillation
-        self.trajectory_planner = TrajectoryPlanner(smooth_tau=0.5)
-        # r_weights: R_vx=3.0 > R_vy=1.0 → K_vy > K_vx (lateral faster than forward)
-        self.lqr_tracker = LQRTracker(r_weights=(3.0, 1.0, 3.0))
+        # trajectory planner and LQR tracker from control.lqr (required):
+        # q_weights [x, y, yaw] with R = 1 (K ~= sqrt(q)), smooth_tau (s)
+        self._apply_lqr(parse_lqr(_cfg))
         # Stage 1: normal cmd_vel; Stage 2 and leaving: G7+ precision cmd_vel,
         # same as the final approach of G7+ AutoCharging
         self.stage1_cmd_vel_topic = str(jp('ros_interfaces', 'stage1_cmd_vel_topic'))
@@ -434,6 +405,8 @@ class AprilTagControlNode(Node):
             + ('any' if self._goal_tag_id == ANY_TAG_ID else self._goal_tag_id)
         )
         self._log_calibration()
+        self._log_lqr()
+        self._log_yaw()
         self.get_logger().info(
             self._stage() + f'State {self._state.value}. Call {self.attach_srv.srv_name} or '
             f'{self.detach_srv.srv_name} to start.'
@@ -469,6 +442,9 @@ class AprilTagControlNode(Node):
         parse_tag_sizes(str(cfg['tag_size']['tag_sizes']))
         validate_control_config(cfg)
         parse_stage1_approach(cfg)
+        parse_lqr(cfg)
+        parse_yaw_estimator(cfg)
+        parse_yaw_probe(cfg)
         return cfg
 
     def _apply_config_locked(self, cfg: dict) -> None:
@@ -494,20 +470,43 @@ class AprilTagControlNode(Node):
         # already validated by _read_config()
         self._tolerances, self._calibration = validate_control_config(cfg)
         self._stage1_approach = parse_stage1_approach(cfg)
+        # rebuilt every time: both are reset when a stage starts running anyway
+        self._apply_lqr(parse_lqr(cfg))
 
-        new_dists = [float(v) for v in cfg['yaw_estimator']['s4_distances']]
-        new_sigs  = [float(v) for v in cfg['yaw_estimator']['s4_sigmas_deg']]
-        old_dists = [float(v) for v in self.yaw_estimator.cfg.s4_distances]
-        old_sigs  = [float(v) for v in self.yaw_estimator.cfg.s4_sigmas_deg]
-        if new_dists != old_dists or new_sigs != old_sigs:
-            self.yaw_estimator = YawEstimator(
-                _dataclass_replace(self.yaw_estimator.cfg,
-                                   s4_distances=new_dists, s4_sigmas_deg=new_sigs))
-            self.yaw_probe.reset()
+        # rebuilt every time: a cmd resets both on its first frame anyway
+        # (_target_id is cleared when the cmd is accepted)
+        self._apply_yaw(cfg)
 
         self.get_logger().info(
             self._stage() + f'[config] Reloaded from {self._config_file!r}')
         self._log_calibration()
+        self._log_lqr()
+        self._log_yaw()
+
+    def _apply_yaw(self, cfg: dict) -> None:
+        """Build the yaw estimator and the S3 yaw probe from JSON yaw_estimator / yaw_probe."""
+        self.yaw_estimator = YawEstimator(parse_yaw_estimator(cfg))
+        self.yaw_probe = YawProbe(parse_yaw_probe(cfg))
+
+    def _log_yaw(self) -> None:
+        """Log every yaw_estimator / yaw_probe value in use."""
+        for tag, obj in (('yaw_estimator', self.yaw_estimator.cfg), ('yaw_probe', self.yaw_probe.cfg)):
+            text = ' '.join(f'{f.name}={getattr(obj, f.name)}' for f in _dataclass_fields(obj))
+            self.get_logger().info(self._stage() + f'[{tag}] {text}')
+
+    def _apply_lqr(self, lqr: LqrConfig) -> None:
+        """Build the trajectory planner and LQR tracker from control.lqr (R fixed to 1)."""
+        self._lqr = lqr
+        self.trajectory_planner = TrajectoryPlanner(smooth_tau=lqr.smooth_tau)
+        self.lqr_tracker = LQRTracker(q_weights=lqr.q_weights, r_weights=LQR_R_WEIGHTS)
+
+    def _log_lqr(self) -> None:
+        """Log the LQR weights in use and the approximate gains K ~= sqrt(q)."""
+        q = self._lqr.q_weights
+        self.get_logger().info(
+            self._stage() + '[lqr] q=[' + ', '.join(f'{v:.4f}' for v in q) + '] (K~=['
+            + ', '.join(f'{math.sqrt(v):.3f}' for v in q) + '] 1/s, [x, y, yaw]) '
+            f'smooth_tau={self._lqr.smooth_tau:.2f}s r=1')
 
     def _log_calibration(self) -> None:
         """Log the calibration points and in-position tolerances in use."""

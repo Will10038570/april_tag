@@ -1,6 +1,7 @@
 """april_tag_config.json: load_config / validate_control_config and calibration read / write."""
 
 import copy
+import dataclasses
 import json
 import pathlib
 
@@ -13,12 +14,24 @@ from apriltag.domain.calibration import (
     save_calibration_point,
 )
 from apriltag.domain.config_loader import (
+    LqrConfig,
     Stage1Approach,
     StageTolerance,
     load_config,
+    parse_lqr,
     parse_stage1_approach,
+    parse_yaw_estimator,
+    parse_yaw_probe,
     validate_control_config,
 )
+from apriltag.runtime.yaw_probe import YawProbeConfig
+from apriltag.yaw_estimator import YawEstimatorConfig
+
+# dataclass defaults (no tag-size literals here, see test_tag_size.py)
+EST_DEFAULTS = {k: v for k, v in dataclasses.asdict(YawEstimatorConfig()).items()
+                if not k.startswith('s4_')}
+PROBE_DEFAULTS = dataclasses.asdict(YawProbeConfig())
+PROBE_DEFAULTS['initial_direction'] = 1
 
 # the shipped config at the workspace root (src/apriltag/test -> ../../..)
 REPO_CONFIG = pathlib.Path(__file__).resolve().parents[3] / 'april_tag_config.json'
@@ -32,13 +45,16 @@ VALID = {
                 'stage2_tolerance': {'x': 0.02, 'y': 0.03, 'yaw': 0.04, 'hold_seconds': 0.5},
                 'stage1_approach': {'enabled': True, 'lateral_full': 0.03, 'lateral_zero': 0.08,
                                     'yaw_full': 0.035, 'yaw_zero': 0.105},
+                'lqr': {'q_weights': [0.3333, 1.0, 0.1667], 'smooth_tau': 0.5},
                 'dock_timeout': 300.0, 'undock_timeout': 300.0, 'lost_target_timeout': 1.0,
                 'max_vx': 0.1, 'max_vy': 0.1, 'max_vw': 0.05,
                 'min_vx': 0.01, 'min_vy': 0.01, 'min_vw': 0.01},
     'calibration': {'stage1': {'z_ref': 0.5, 'x_ref': 0.026, 'yaw_ref': 0.0},
                     'stage2': {'z_ref': 0.28, 'x_ref': 0.01, 'yaw_ref': 0.02},
                     'detach': {'z_ref': 1.0}},
-    'yaw_estimator': {'s4_distances': [0.3, 0.5, 0.7], 's4_sigmas_deg': [1.0, 2.0, 3.0]},
+    'yaw_estimator': {'s4_distances': [0.3, 0.5, 0.7], 's4_sigmas_deg': [1.0, 2.0, 3.0],
+                      **EST_DEFAULTS},
+    'yaw_probe': dict(PROBE_DEFAULTS),
     'ros_interfaces': {'amcl_check_service': '/check_mcl_if_trigger',
                        'amcl_close_service': '/close_amcl',
                        'amcl_open_service': '/open_amcl',
@@ -69,6 +85,9 @@ def test_shipped_config_is_valid():
     data = load_config(str(REPO_CONFIG))
     validate_control_config(data)
     parse_stage1_approach(data)
+    parse_lqr(data)
+    parse_yaw_estimator(data)
+    parse_yaw_probe(data)
 
 
 # the virtual test config, next to april_tag_config.json at the workspace root
@@ -78,6 +97,9 @@ VIRTUAL_CONFIG = pathlib.Path(__file__).resolve().parents[3] / 'virtual_tracking
 def test_virtual_config_is_valid():
     data = load_config(str(VIRTUAL_CONFIG))
     parse_stage1_approach(data)
+    parse_lqr(data)
+    parse_yaw_estimator(data)
+    parse_yaw_probe(data)
     tol, cal = validate_control_config(data)
     # keep the factory calibration values (the sim's ground truth follows any values)
     assert [cal[k].z_ref for k in ('stage1', 'stage2', 'detach')] == [0.5, 0.28, 1.0]
@@ -107,7 +129,9 @@ def test_bad_json(tmp_path):
         load_config(str(p))
 
 
-@pytest.mark.parametrize('section', list(VALID))
+# yaw_probe is checked by apriltag_control only (parse_yaw_probe, see
+# test_yaw_sections_not_required_by_load_config)
+@pytest.mark.parametrize('section', [s for s in VALID if s != 'yaw_probe'])
 def test_missing_section(tmp_path, section):
     data = copy.deepcopy(VALID)
     del data[section]
@@ -384,3 +408,166 @@ def test_stage1_approach_missing_field():
     with pytest.raises(ValueError, match='yaw_full must be a number'):
         parse_stage1_approach(data)
 
+
+
+# ---- control.lqr ------------------------------------------------------------------
+
+def test_lqr_parsed():
+    assert parse_lqr(VALID) == LqrConfig((0.3333, 1.0, 0.1667), 0.5)
+
+
+def test_lqr_ints_accepted():
+    data = copy.deepcopy(VALID)
+    data['control']['lqr'] = {'q_weights': [1, 2, 3], 'smooth_tau': 1}
+    assert parse_lqr(data) == LqrConfig((1.0, 2.0, 3.0), 1.0)
+
+
+def test_lqr_missing():
+    data = copy.deepcopy(VALID)
+    del data['control']['lqr']
+    with pytest.raises(ValueError, match='Missing or invalid control.lqr'):
+        parse_lqr(data)
+
+
+def test_lqr_not_required_by_load_config(tmp_path):
+    # only apriltag_control requires it; detection and the sim use load_config alone
+    data = copy.deepcopy(VALID)
+    del data['control']['lqr']
+    assert load_config(_write(tmp_path, data)) == data
+
+
+def _lqr(**changes):
+    data = copy.deepcopy(VALID)
+    data['control']['lqr'].update(changes)
+    return data
+
+
+@pytest.mark.parametrize('changes, match', [
+    ({'q_weights': [1.0, 1.0]}, r'q_weights must be a list of 3'),
+    ({'q_weights': [1.0, 1.0, 1.0, 1.0]}, r'q_weights must be a list of 3'),
+    ({'q_weights': 1.0}, r'q_weights must be a list of 3'),
+    ({'q_weights': [1.0, True, 1.0]}, r'q_weights\[1\] must be a number'),
+    ({'q_weights': [1.0, 1.0, 'a']}, r'q_weights\[2\] must be a number'),
+    ({'q_weights': [float('nan'), 1.0, 1.0]}, r'q_weights\[0\] must be a number'),
+    ({'q_weights': [1.0, 0, 1.0]}, r'q_weights\[1\] \(0\) must be positive'),
+    ({'q_weights': [1.0, 1.0, -1.0]}, r'q_weights\[2\] \(-1.0\) must be positive'),
+    ({'smooth_tau': 0}, r'smooth_tau \(0\) must be positive'),
+    ({'smooth_tau': -0.1}, r'smooth_tau \(-0.1\) must be positive'),
+    ({'smooth_tau': True}, r'smooth_tau must be a number'),
+    ({'smooth_tau': None}, r'smooth_tau must be a number'),
+])
+def test_lqr_invalid(changes, match):
+    with pytest.raises(ValueError, match=match):
+        parse_lqr(_lqr(**changes))
+
+
+# ---- yaw_estimator / yaw_probe -----------------------------------------------------
+
+def test_yaw_estimator_parsed():
+    cfg = parse_yaw_estimator(VALID)
+    assert cfg == YawEstimatorConfig(s4_distances=[0.3, 0.5, 0.7], s4_sigmas_deg=[1.0, 2.0, 3.0])
+
+
+def test_yaw_probe_parsed():
+    assert parse_yaw_probe(VALID) == YawProbeConfig()
+
+
+def test_yaw_probe_negative_direction():
+    data = copy.deepcopy(VALID)
+    data['yaw_probe']['initial_direction'] = -1
+    assert parse_yaw_probe(data).initial_direction == -1.0
+
+
+@pytest.mark.parametrize('path', [REPO_CONFIG, VIRTUAL_CONFIG], ids=['april_tag', 'virtual'])
+def test_shipped_yaw_defaults(path):
+    # the shipped values equal the dataclass defaults (the s4 table may differ)
+    if not path.exists():
+        pytest.skip(f'{path.name} not found')
+    data = load_config(str(path))
+    est = dataclasses.asdict(parse_yaw_estimator(data))
+    assert {k: v for k, v in est.items() if not k.startswith('s4_')} == pytest.approx(EST_DEFAULTS)
+    assert dataclasses.asdict(parse_yaw_probe(data)) == pytest.approx(dataclasses.asdict(YawProbeConfig()))
+
+
+@pytest.mark.parametrize('path', [REPO_CONFIG, VIRTUAL_CONFIG], ids=['april_tag', 'virtual'])
+@pytest.mark.parametrize('section', ['yaw_estimator', 'yaw_probe'])
+def test_shipped_doc_keys(path, section):
+    # every value has a description and every description a value
+    if not path.exists():
+        pytest.skip(f'{path.name} not found')
+    sec = json.loads(path.read_text())[section]
+    assert set(sec['_doc']) == set(sec) - {'_doc'}
+    assert all(isinstance(v, str) and v for v in sec['_doc'].values())
+
+
+def test_yaw_probe_missing():
+    data = copy.deepcopy(VALID)
+    del data['yaw_probe']
+    with pytest.raises(ValueError, match='Missing or invalid yaw_probe'):
+        parse_yaw_probe(data)
+
+
+def test_yaw_estimator_field_missing():
+    data = copy.deepcopy(VALID)
+    del data['yaw_estimator']['sigma_dh']
+    with pytest.raises(ValueError, match=r'yaw_estimator\.sigma_dh must be a number'):
+        parse_yaw_estimator(data)
+
+
+def test_yaw_sections_not_required_by_load_config(tmp_path):
+    # only apriltag_control needs them; detection and the sim use load_config alone
+    data = copy.deepcopy(VALID)
+    del data['yaw_probe']
+    data['yaw_estimator'] = {k: data['yaw_estimator'][k] for k in ('s4_distances', 's4_sigmas_deg')}
+    assert load_config(_write(tmp_path, data)) == data
+
+
+def test_yaw_doc_ignored():
+    data = copy.deepcopy(VALID)
+    data['yaw_estimator']['_doc'] = {'sigma_dh': 'text'}
+    data['yaw_probe']['_doc'] = {}
+    assert parse_yaw_estimator(data) == parse_yaw_estimator(VALID)
+    assert parse_yaw_probe(data) == parse_yaw_probe(VALID)
+
+
+def _yaw(section, **changes):
+    data = copy.deepcopy(VALID)
+    data[section].update(changes)
+    return data
+
+
+@pytest.mark.parametrize('changes, match', [
+    ({'abs_window': 2.5}, r'abs_window must be an integer'),
+    ({'accept_frames': 0}, r'accept_frames \(0\) must be >= 1'),
+    ({'accept_frames': True}, r'accept_frames must be an integer'),
+    ({'sigma_dh': 0}, r'sigma_dh \(0\) must be positive'),
+    ({'ref_tag_size': -1.0}, r'ref_tag_size \(-1.0\) must be positive'),
+    ({'border_px': -1}, r'border_px \(-1\) must be >= 0'),
+    ({'q_proc': float('nan')}, r'q_proc must be a number'),
+    ({'xy_tau': None}, r'xy_tau must be a number'),
+    ({'margin_lo': 60.0}, r'margin_lo \(60.0\) must be < margin_hi'),
+    ({'snr_lo': 2.0, 'snr_hi': 1.0}, r'snr_lo \(2.0\) must be < snr_hi'),
+    ({'_doc': 'text'}, r'yaw_estimator\._doc must be an object'),
+])
+def test_yaw_estimator_invalid(changes, match):
+    with pytest.raises(ValueError, match=match):
+        parse_yaw_estimator(_yaw('yaw_estimator', **changes))
+
+
+@pytest.mark.parametrize('changes, match', [
+    ({'trigger_frames': 0}, r'trigger_frames \(0\) must be >= 1'),
+    ({'max_turns': 1.0}, r'max_turns must be an integer'),
+    ({'c_sign_low': 0}, r'c_sign_low \(0\) must be in \(0, 1\]'),
+    ({'end_c_sign': 1.5}, r'end_c_sign \(1.5\) must be in \(0, 1\]'),
+    ({'wz': 0}, r'wz \(0\) must be positive'),
+    ({'turn_time': -1.0}, r'turn_time \(-1.0\) must be positive'),
+    ({'change_deg': -0.5}, r'change_deg \(-0.5\) must be >= 0'),
+    ({'trigger_yaw': float('inf')}, r'trigger_yaw must be a number'),
+    ({'initial_direction': 0}, r'initial_direction must be 1 or -1'),
+    ({'initial_direction': 2}, r'initial_direction must be 1 or -1'),
+    ({'initial_direction': True}, r'initial_direction must be 1 or -1'),
+    ({'_doc': ['x']}, r'yaw_probe\._doc must be an object'),
+])
+def test_yaw_probe_invalid(changes, match):
+    with pytest.raises(ValueError, match=match):
+        parse_yaw_probe(_yaw('yaw_probe', **changes))
