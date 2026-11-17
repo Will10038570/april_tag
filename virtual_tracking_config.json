@@ -11,9 +11,9 @@
   },
   "control": {
     "manage_amcl_and_lidar_safety": true,
-    "stage1_tolerance": {"x": 0.001, "y": 0.001, "yaw": 0.05, "hold_seconds": 1.0},
-    "stage2_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 1.0},
-    "stage1_approach": {"enabled": true, "lateral_full": 0.03, "lateral_zero": 0.08, "yaw_full": 0.035, "yaw_zero": 0.105},
+    "stage1_tolerance": {"x": 0.025, "y": 0.025, "yaw": 0.03, "hold_seconds": 1.0},
+    "stage2_tolerance": {"x": 0.025, "y": 0.025, "yaw": 0.03, "hold_seconds": 1.0},
+    "stage1_approach": {"enabled": true, "lateral_full": 0, "lateral_zero": 0.08, "yaw_full": 0, "yaw_zero": 0.105},
     "dock_timeout": 300.0,
     "undock_timeout": 300.0,
     "lost_target_timeout": 1.0,
@@ -26,12 +26,12 @@
   },
   "calibration": {
     "stage1": {"z_ref": 0.5, "x_ref": 0.0, "yaw_ref": 0},
-    "stage2": {"z_ref": 0.28, "x_ref": 0.026, "yaw_ref": 1.0},
+    "stage2": {"z_ref": 0.28, "x_ref": 0.0, "yaw_ref": 0},
     "detach": {"z_ref": 0.8}
   },
   "yaw_estimator": {
-    "s4_distances": [0.3, 0.5, 0.7],
-    "s4_sigmas_deg": [1.0, 2.0, 3.0]
+    "s4_distances": [0.3, 0.5, 0.7, 1.0],
+    "s4_sigmas_deg": [1.0, 2.0, 3.0, 3.0]
   },
   "ros_interfaces": {
     "amcl_check_service": "/check_mcl_if_trigger",
