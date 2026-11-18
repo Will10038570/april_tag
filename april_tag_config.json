@@ -1,4 +1,5 @@
 {
+  "_comment": "Virtual test config for launch/virtual_tracking.launch.py, read by apriltag_detection, apriltag_control and virtual_tracking_sim. The sim ground truth uses each calibration point (z_ref, x_ref, yaw_ref; detach has only z_ref) like apriltag_control, so any calibrated values work; the factory x_ref 0.026 equals the sim camera_y_offset, giving goals on the tag centre line. Copy this file and pass config_file:= for variant tests (control.dock_timeout 3.0 -> TIMEOUT); TAG_LOST: launch argument hide_tag_after:=5.0.",
   "detection": {
     "detect_tag_families": "tag36h11",
     "tracking_tag_family": "tag36h11",
@@ -10,28 +11,28 @@
   },
   "control": {
     "manage_amcl_and_lidar_safety": false,
-    "stage1_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 1.0},
-    "stage2_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 1.0},
-    "stage1_approach": {"enabled": true, "lateral_full": 0.03, "lateral_zero": 0.08, "yaw_full": 0.035, "yaw_zero": 0.105},
-    "lqr": {"q_weights": [0.3333, 1.0, 0.1667], "smooth_tau": 0.5},
+    "stage1_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 2},
+    "stage2_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 2},
+    "stage1_approach": {"enabled": false, "lateral_full": 0, "lateral_zero": 0.1, "yaw_full": 0, "yaw_zero": 0.105},
+    "lqr": {"q_weights": [0.333, 1, 0.167], "smooth_tau": 0.8},
     "dock_timeout": 300.0,
     "undock_timeout": 300.0,
     "lost_target_timeout": 1.0,
     "max_vx": 0.1,
     "max_vy": 0.1,
-    "max_vw": 0.05,
+    "max_vw": 0.1,
     "min_vx": 0.01,
     "min_vy": 0.01,
     "min_vw": 0.01
   },
   "calibration": {
-    "stage1": {"z_ref": 0.5, "x_ref": 0.026, "yaw_ref": 0.0},
-    "stage2": {"z_ref": 0.28, "x_ref": 0.026, "yaw_ref": 0.0},
-    "detach": {"z_ref": 1.0}
+    "stage1": {"z_ref": 0.55, "x_ref": 0.0, "yaw_ref": 0},
+    "stage2": {"z_ref": 0.285, "x_ref": 0.03, "yaw_ref": 0},
+    "detach": {"z_ref": 0.8}
   },
   "yaw_estimator": {
-    "s4_distances": [0.3, 0.5, 0.7],
-    "s4_sigmas_deg": [1.0, 2.0, 3.0],
+    "s4_distances": [0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0],
+    "s4_sigmas_deg": [1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5],
     "border_px": 10.0,
     "margin_lo": 20.0,
     "margin_hi": 60.0,
@@ -66,7 +67,7 @@
     }
   },
   "yaw_probe": {
-    "trigger_frames": 10,
+    "trigger_frames": 50,
     "c_sign_low": 0.5,
     "trigger_yaw": 0.05,
     "wz": 0.03,
