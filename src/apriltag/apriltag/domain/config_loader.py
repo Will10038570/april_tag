@@ -226,6 +226,19 @@ def parse_stage1_approach(data: dict) -> Stage1Approach:
     return Stage1Approach(enabled=enabled, **values)
 
 
+def parse_per_axis_hold(data: dict) -> bool:
+    """control.per_axis_hold (required bool) of a config from load_config().
+
+    True: in Stage 1 / 2 each axis within its stage tolerance gets 0 (not
+    corrected); with all three within, one zero command is sent and nothing
+    more until an axis leaves. Raises ValueError if missing or not a bool.
+    """
+    v = data.get('control', {}).get('per_axis_hold')
+    if not isinstance(v, bool):
+        raise ValueError(f'control.per_axis_hold must be a bool, got {type(v).__name__!r}')
+    return v
+
+
 def parse_lqr(data: dict) -> LqrConfig:
     """control.lqr (required) of a config from load_config().
 

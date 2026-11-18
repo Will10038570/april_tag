@@ -161,11 +161,15 @@ def publish_control(
     min_vy: float = 0.0,
     min_vw: float = 0.0,
     vx_scale: float = 1.0,
+    hold_axes: Optional[Tuple[bool, bool, bool]] = None,
 ):
     """Run one control step and publish twist; return state updates.
 
     wz_override (S3 probe turn) replaces the LQR's wz; vx / vy stay the LQR's.
     vx_scale: see clamp_control (Stage 1 straight approach).
+    hold_axes (x, y, yaw): a True axis is set to 0 (not corrected) after the
+    LQR / wz_override and before the clamp, so min_v* does not raise it.
+    None = all axes corrected.
     """
     dt, new_last_time = compute_dt(now, last_time, max_dt)
     state = extract_control_state(best_target)
@@ -174,6 +178,9 @@ def publish_control(
     if wz_override is not None:
         vw = float(wz_override)
     vx, vy, vw = sanitize_control(vx, vy, vw, logger)
+    if hold_axes is not None:
+        hx, hy, hyaw = hold_axes
+        vx, vy, vw = (0.0 if hx else vx), (0.0 if hy else vy), (0.0 if hyaw else vw)
     vx, vy, vw = clamp_control(vx, vy, vw, max_vx, max_vy, max_vw, min_vx, min_vy, min_vw,
                                vx_scale)
     publish_twist_fn(vx, vy, vw)
@@ -194,12 +201,17 @@ def leave_step(x_error: float, max_vx: float) -> Tuple[bool, float, float, float
     return False, -max_vx, 0.0, 0.0
 
 
-def in_tolerance(target: Optional[Dict[str, float]], tol) -> bool:
-    """In-position check: |x|, |y|, |yaw| of target within tol (a StageTolerance)."""
+def axes_in_tolerance(target: Optional[Dict[str, float]], tol) -> Tuple[bool, bool, bool]:
+    """Per axis: |x|, |y|, |yaw| of target within tol (a StageTolerance); None -> all False."""
     if target is None:
-        return False
+        return False, False, False
     return (
-        abs(float(target.get('x_error', 0.0))) <= tol.x
-        and abs(float(target.get('y_error', 0.0))) <= tol.y
-        and abs(float(target.get('yaw_error', 0.0))) <= tol.yaw
+        abs(float(target.get('x_error', 0.0))) <= tol.x,
+        abs(float(target.get('y_error', 0.0))) <= tol.y,
+        abs(float(target.get('yaw_error', 0.0))) <= tol.yaw,
     )
+
+
+def in_tolerance(target: Optional[Dict[str, float]], tol) -> bool:
+    """In-position check: |x|, |y|, |yaw| of target all within tol (a StageTolerance)."""
+    return all(axes_in_tolerance(target, tol))

@@ -19,6 +19,7 @@ from apriltag.domain.config_loader import (
     StageTolerance,
     load_config,
     parse_lqr,
+    parse_per_axis_hold,
     parse_stage1_approach,
     parse_yaw_estimator,
     parse_yaw_probe,
@@ -40,7 +41,7 @@ VALID = {
     'detection': {'detect_tag_families': 'tag36h11',
                   'tracking_tag_family': 'tag36h11', 'tracking_tag_id': 0},
     'tag_size': {'tag_size': 0.0635, 'tag_sizes': ''},
-    'control': {'manage_amcl_and_lidar_safety': False,
+    'control': {'manage_amcl_and_lidar_safety': False, 'per_axis_hold': True,
                 'stage1_tolerance': {'x': 0.05, 'y': 0.05, 'yaw': 0.05, 'hold_seconds': 1.0},
                 'stage2_tolerance': {'x': 0.02, 'y': 0.03, 'yaw': 0.04, 'hold_seconds': 0.5},
                 'stage1_approach': {'enabled': True, 'lateral_full': 0.03, 'lateral_zero': 0.08,
@@ -85,6 +86,7 @@ def test_shipped_config_is_valid():
     data = load_config(str(REPO_CONFIG))
     validate_control_config(data)
     parse_stage1_approach(data)
+    assert parse_per_axis_hold(data) is True
     parse_lqr(data)
     parse_yaw_estimator(data)
     parse_yaw_probe(data)
@@ -97,6 +99,7 @@ VIRTUAL_CONFIG = pathlib.Path(__file__).resolve().parents[3] / 'virtual_tracking
 def test_virtual_config_is_valid():
     data = load_config(str(VIRTUAL_CONFIG))
     parse_stage1_approach(data)
+    assert parse_per_axis_hold(data) is True
     parse_lqr(data)
     parse_yaw_estimator(data)
     parse_yaw_probe(data)
@@ -420,6 +423,31 @@ def test_lqr_ints_accepted():
     data = copy.deepcopy(VALID)
     data['control']['lqr'] = {'q_weights': [1, 2, 3], 'smooth_tau': 1}
     assert parse_lqr(data) == LqrConfig((1.0, 2.0, 3.0), 1.0)
+
+
+@pytest.mark.parametrize('value', [True, False])
+def test_per_axis_hold(value):
+    assert parse_per_axis_hold(_with('control', 'per_axis_hold', value)) is value
+
+
+@pytest.mark.parametrize('value', [1, 0, 'true', None, 1.0])
+def test_per_axis_hold_not_bool(value):
+    with pytest.raises(ValueError, match='control.per_axis_hold must be a bool'):
+        parse_per_axis_hold(_with('control', 'per_axis_hold', value))
+
+
+def test_per_axis_hold_missing():
+    data = copy.deepcopy(VALID)
+    del data['control']['per_axis_hold']
+    with pytest.raises(ValueError, match='control.per_axis_hold must be a bool'):
+        parse_per_axis_hold(data)
+
+
+def test_per_axis_hold_not_required_by_load_config(tmp_path):
+    # only apriltag_control requires it; detection and the sim use load_config alone
+    data = copy.deepcopy(VALID)
+    del data['control']['per_axis_hold']
+    assert load_config(_write(tmp_path, data)) == data
 
 
 def test_lqr_missing():

@@ -10,20 +10,21 @@
     "tag_sizes": ""
   },
   "control": {
-    "manage_amcl_and_lidar_safety": true,
-    "stage1_tolerance": {"x": 0.03, "y": 0.03, "yaw": 0.05, "hold_seconds": 2},
-    "stage2_tolerance": {"x": 0.05, "y": 0.05, "yaw": 0.05, "hold_seconds": 2},
+    "manage_amcl_and_lidar_safety": false,
+    "per_axis_hold": true,
+    "stage1_tolerance": {"x": 0.02, "y": 0.01, "yaw": 0.05, "hold_seconds": 0.1},
+    "stage2_tolerance": {"x": 0.01, "y": 0.01, "yaw": 0.01, "hold_seconds": 0.1},
     "stage1_approach": {"enabled": false, "lateral_full": 0, "lateral_zero": 0.1, "yaw_full": 0, "yaw_zero": 0.105},
-    "lqr": {"q_weights": [0.05, 1, 1.5], "smooth_tau": 0.8},
+    "lqr": {"q_weights": [0.3333, 1.0, 0.1667], "smooth_tau": 0.8},
     "dock_timeout": 300.0,
     "undock_timeout": 300.0,
     "lost_target_timeout": 1.0,
     "max_vx": 0.1,
     "max_vy": 0.1,
     "max_vw": 0.1,
-    "min_vx": 0.0,
-    "min_vy": 0.0,
-    "min_vw": 0.0
+    "min_vx": 0.01,
+    "min_vy": 0.01,
+    "min_vw": 0.01
   },
   "calibration": {
     "stage1": {"z_ref": 0.5, "x_ref": 0.0, "yaw_ref": 0},

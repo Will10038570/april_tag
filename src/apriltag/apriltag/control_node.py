@@ -25,6 +25,7 @@ from apriltag.domain.config_loader import (
     StageTolerance,
     load_config,
     parse_lqr,
+    parse_per_axis_hold,
     parse_stage1_approach,
     parse_yaw_estimator,
     parse_yaw_probe,
@@ -51,7 +52,7 @@ from apriltag.runtime.cmd_flow import (
 )
 from apriltag.runtime.control_flow import (
     approach_vx_scale,
-    in_tolerance,
+    axes_in_tolerance,
     leave_step,
     publish_control,
     validate_speed_limits,
@@ -226,6 +227,9 @@ class AprilTagControlNode(Node):
         # Stage 1 straight approach (forward vx scaled until the robot is on
         # the approach line); required
         self._stage1_approach = parse_stage1_approach(_cfg)
+        # Stage 1 / 2: an axis within the stage tolerance is not corrected (sent 0);
+        # required
+        self.per_axis_hold = parse_per_axis_hold(_cfg)
         # True once the current Stage 1 run has logged that the yaw became valid
         self._approach_yaw_logged = False
 
@@ -308,6 +312,11 @@ class AprilTagControlNode(Node):
         self._idle.set()
         self._stage_logger = _StageLogger(self)
         self._error_zero_since = None
+        # per_axis_hold: True once the zero command for "all three axes within
+        # tolerance" has gone out (reset by any other command); under _control_lock
+        self._hold_stopped = False
+        # last (x, y, yaw) hold flags logged by [axis_hold]
+        self._hold_axes_logged: Optional[tuple] = None
         # in-position tolerance of the running stage (None while leaving / IDLE)
         self._active_tol: Optional[StageTolerance] = None
         # set when the running goal has a result (its state is in ENDING)
@@ -442,6 +451,7 @@ class AprilTagControlNode(Node):
         parse_tag_sizes(str(cfg['tag_size']['tag_sizes']))
         validate_control_config(cfg)
         parse_stage1_approach(cfg)
+        parse_per_axis_hold(cfg)
         parse_lqr(cfg)
         parse_yaw_estimator(cfg)
         parse_yaw_probe(cfg)
@@ -470,6 +480,7 @@ class AprilTagControlNode(Node):
         # already validated by _read_config()
         self._tolerances, self._calibration = validate_control_config(cfg)
         self._stage1_approach = parse_stage1_approach(cfg)
+        self.per_axis_hold = parse_per_axis_hold(cfg)
         # rebuilt every time: both are reset when a stage starts running anyway
         self._apply_lqr(parse_lqr(cfg))
 
@@ -518,6 +529,7 @@ class AprilTagControlNode(Node):
         tol = ', '.join(f'{k}(x={t.x:.3f}m y={t.y:.3f}m yaw={t.yaw:.3f}rad hold={t.hold_seconds:.2f}s)'
                         for k, t in self._tolerances.items())
         self.get_logger().info(self._stage() + f'[calibration] {cal}; tolerance {tol}')
+        self.get_logger().info(self._stage() + f'[axis_hold] per_axis_hold={self.per_axis_hold}')
 
     def _transition_locked(self, new: TrackingState, step: Optional[Step], reason: str) -> bool:
         """Change state (and its step) if allowed; the caller must hold _control_lock."""
@@ -547,6 +559,8 @@ class AprilTagControlNode(Node):
     def _reset_control_locked(self) -> None:
         """Reset the controller for a new tracking phase; the caller must hold _control_lock."""
         self._error_zero_since = None
+        self._hold_stopped = False
+        self._hold_axes_logged = None
         self._last_stamp = None
         self._last_target_time = None
         self._latest_best_target = {}
@@ -646,10 +660,24 @@ class AprilTagControlNode(Node):
             publish_twist(pub, vx, vy, vw)
             self._last_wz_cmd = float(vw)
             self._last_cmd = (float(vx), float(vy), float(vw), time.monotonic())
+            self._hold_stopped = False
         self.get_logger().info(
             self._stage() + f'[publish] {pub.topic_name} vx={vx:+.3f} vy={vy:+.3f} wz={vw:+.3f}',
             throttle_duration_sec=LOG_THROTTLE_SEC,
         )
+
+    def _publish_hold_stop(self) -> None:
+        """per_axis_hold with all three axes within tolerance: one zero command
+        on the running stage's topic, then nothing until another command."""
+        with self._control_lock:
+            if not self._is_running_locked() or self._hold_stopped:
+                return
+            pub = self.stage1_cmd_pub if self._state is S.STAGE1 else self.stage2_cmd_pub
+            publish_twist(pub, 0.0, 0.0, 0.0)
+            self._last_wz_cmd = 0.0
+            self._last_cmd = (0.0, 0.0, 0.0, time.monotonic())
+            self._hold_stopped = True
+        self.get_logger().info(self._stage() + f'[publish] {pub.topic_name} axis hold vx=0 vy=0 wz=0')
 
     def _safe_stop(self, reset_planner: bool = False) -> None:
         self._publish_zero_on_all('safe stop')
@@ -1093,13 +1121,33 @@ class AprilTagControlNode(Node):
         }
         self._latest_best_target = best_target
 
+        # in-position check on the filtered x / y and the size of the yaw
+        # (yaw_abs_f), never on yaw_f, which is pulled to 0 when the
+        # direction is unknown; per_axis_hold uses the same per-axis result
+        done_target = {
+            'x_error': x_f,
+            'y_error': est.y_f,
+            'yaw_error': yaw_abs_cal,
+        }
+        tol = self._active_tol
+        in_tol = axes_in_tolerance(done_target, tol) if tol is not None else (False, False, False)
+        hold_axes = in_tol if self.per_axis_hold else None
+        if hold_axes is not None and hold_axes != self._hold_axes_logged:
+            self._hold_axes_logged = hold_axes
+            self.get_logger().info(
+                self._stage() + '[axis_hold] '
+                + ' '.join(f'{n}={"hold" if h else "fix"}' for n, h in zip(('x', 'y', 'yaw'), hold_axes))
+                + f' (x_f={x_f:+.4f}, y_f={est.y_f:+.4f}, |yaw|={yaw_abs_cal:.4f})',
+                throttle_duration_sec=LOG_THROTTLE_SEC)
+
         # S3: probe turns when Stage 1 is in x / y tolerance but the yaw
-        # direction cannot be told
+        # direction cannot be told (not while the yaw axis is held)
         wz_override = self.yaw_probe.step(
             now=now,
             enabled=(tracking_state is S.STAGE1
                      and abs(x_f) <= self._tolerances['stage1'].x
-                     and abs(est.y_f) <= self._tolerances['stage1'].y),
+                     and abs(est.y_f) <= self._tolerances['stage1'].y
+                     and not (hold_axes is not None and hold_axes[2])),
             c_sign=est.c_sign,
             yaw_abs_f=est.yaw_abs_f,
         )
@@ -1110,50 +1158,57 @@ class AprilTagControlNode(Node):
         # is off the approach line (tag-frame lateral once the yaw is valid,
         # the camera y before) or its yaw is off
         vx_scale, approach_lat, approach_src = 1.0, None, ''
-        try:
-            if tracking_state is S.STAGE1 and self._stage1_approach.enabled:
-                if est.yaw_valid:
-                    approach_src = 'tag lateral'
-                    approach_lat = approach_lateral_error(
-                        est.x_f, est.y_f - self._active_x_ref, est.yaw_f,
-                        self._active_x_ref, self._active_yaw_ref)
-                    if not self._approach_yaw_logged:
-                        self._approach_yaw_logged = True
-                        self.get_logger().info(
-                            self._stage() + f'[approach] yaw valid at d={p.z:.3f}m, gating on '
-                            f'tag-frame lateral (lat={approach_lat:+.3f}m, yaw={yaw_f_cal:+.4f}rad)')
-                else:
-                    approach_src = 'camera y'
-                    approach_lat = est.y_f
-                vx_scale = approach_vx_scale(approach_lat, yaw_f_cal, est.yaw_valid,
-                                             self._stage1_approach)
-                self.get_logger().info(
-                    self._stage() + f'[approach] vx_scale={vx_scale:.2f} lat={approach_lat:+.3f}m '
-                    f'({approach_src}) yaw={yaw_f_cal:+.4f}rad',
-                    throttle_duration_sec=LOG_THROTTLE_SEC)
+        latest_plan = self.latest_plan
+        if hold_axes is not None and all(hold_axes):
+            # all three within tolerance: one zero command, then none until an
+            # axis leaves (the planner / LQR are not stepped meanwhile)
+            self._publish_hold_stop()
+        else:
+            try:
+                if tracking_state is S.STAGE1 and self._stage1_approach.enabled:
+                    if est.yaw_valid:
+                        approach_src = 'tag lateral'
+                        approach_lat = approach_lateral_error(
+                            est.x_f, est.y_f - self._active_x_ref, est.yaw_f,
+                            self._active_x_ref, self._active_yaw_ref)
+                        if not self._approach_yaw_logged:
+                            self._approach_yaw_logged = True
+                            self.get_logger().info(
+                                self._stage() + f'[approach] yaw valid at d={p.z:.3f}m, gating on '
+                                f'tag-frame lateral (lat={approach_lat:+.3f}m, yaw={yaw_f_cal:+.4f}rad)')
+                    else:
+                        approach_src = 'camera y'
+                        approach_lat = est.y_f
+                    vx_scale = approach_vx_scale(approach_lat, yaw_f_cal, est.yaw_valid,
+                                                 self._stage1_approach)
+                    self.get_logger().info(
+                        self._stage() + f'[approach] vx_scale={vx_scale:.2f} lat={approach_lat:+.3f}m '
+                        f'({approach_src}) yaw={yaw_f_cal:+.4f}rad',
+                        throttle_duration_sec=LOG_THROTTLE_SEC)
 
-            self._last_stamp, latest_plan = publish_control(
-                best_target=best_target,
-                now=stamp,
-                last_time=self._last_stamp,
-                max_dt=self.max_dt,
-                trajectory_planner=self.trajectory_planner,
-                lqr_tracker=self.lqr_tracker,
-                max_vx=self.max_vx,
-                max_vy=self.max_vy,
-                max_vw=self.max_vw,
-                publish_twist_fn=self._publish_control_command,
-                logger=self._stage_logger,
-                wz_override=wz_override,
-                min_vx=self.min_vx,
-                min_vy=self.min_vy,
-                min_vw=self.min_vw,
-                vx_scale=vx_scale,
-            )
-        except Exception as exc:
-            self.get_logger().warn(self._stage() + f"Control publish failed: {exc}")
-            self._safe_stop(reset_planner=True)
-            return
+                self._last_stamp, latest_plan = publish_control(
+                    best_target=best_target,
+                    now=stamp,
+                    last_time=self._last_stamp,
+                    max_dt=self.max_dt,
+                    trajectory_planner=self.trajectory_planner,
+                    lqr_tracker=self.lqr_tracker,
+                    max_vx=self.max_vx,
+                    max_vy=self.max_vy,
+                    max_vw=self.max_vw,
+                    publish_twist_fn=self._publish_control_command,
+                    logger=self._stage_logger,
+                    wz_override=wz_override,
+                    min_vx=self.min_vx,
+                    min_vy=self.min_vy,
+                    min_vw=self.min_vw,
+                    vx_scale=vx_scale,
+                    hold_axes=hold_axes,
+                )
+            except Exception as exc:
+                self.get_logger().warn(self._stage() + f"Control publish failed: {exc}")
+                self._safe_stop(reset_planner=True)
+                return
         self.get_logger().debug(
             self._stage() + f'[yaw] d={p.z:.3f} dh={est.dh:+.3f} snr={est.snr:.2f} c_sign={est.c_sign:.2f} '
             f'c_quality={est.c_quality:.2f} yaw_meas={est.yaw_meas:+.4f} yaw_f={est.yaw_f:+.4f} '
@@ -1163,16 +1218,7 @@ class AprilTagControlNode(Node):
             + (' (S3 probe)' if wz_override is not None else ''))
 
         self.latest_plan = latest_plan
-        # in-position check on the filtered x / y and the size of the yaw
-        # (yaw_abs_f), never on yaw_f, which is pulled to 0 when the
-        # direction is unknown
-        done_target = {
-            'x_error': x_f,
-            'y_error': est.y_f,
-            'yaw_error': yaw_abs_cal,
-        }
-        tol = self._active_tol
-        if tol is None or not in_tolerance(done_target, tol):
+        if tol is None or not all(in_tol):
             self._error_zero_since = None
             return
 
