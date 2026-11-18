@@ -22,13 +22,13 @@
     "max_vx": 0.1,
     "max_vy": 0.1,
     "max_vw": 0.1,
-    "min_vx": 0.01,
-    "min_vy": 0.01,
+    "min_vx": 0.02,
+    "min_vy": 0.02,
     "min_vw": 0.01
   },
   "calibration": {
-    "stage1": {"z_ref": 0.5, "x_ref": 0.0, "yaw_ref": 0},
-    "stage2": {"z_ref": 0.28, "x_ref": 0.0, "yaw_ref": 0},
+    "stage1": {"z_ref": 0.55, "x_ref": 0.0, "yaw_ref": 0},
+    "stage2": {"z_ref": 0.285, "x_ref": 0.03, "yaw_ref": 0},
     "detach": {"z_ref": 0.8}
   },
   "yaw_estimator": {

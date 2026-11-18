@@ -312,9 +312,6 @@ class AprilTagControlNode(Node):
         self._idle.set()
         self._stage_logger = _StageLogger(self)
         self._error_zero_since = None
-        # per_axis_hold: True once the zero command for "all three axes within
-        # tolerance" has gone out (reset by any other command); under _control_lock
-        self._hold_stopped = False
         # last (x, y, yaw) hold flags logged by [axis_hold]
         self._hold_axes_logged: Optional[tuple] = None
         # in-position tolerance of the running stage (None while leaving / IDLE)
@@ -559,7 +556,6 @@ class AprilTagControlNode(Node):
     def _reset_control_locked(self) -> None:
         """Reset the controller for a new tracking phase; the caller must hold _control_lock."""
         self._error_zero_since = None
-        self._hold_stopped = False
         self._hold_axes_logged = None
         self._last_stamp = None
         self._last_target_time = None
@@ -660,24 +656,10 @@ class AprilTagControlNode(Node):
             publish_twist(pub, vx, vy, vw)
             self._last_wz_cmd = float(vw)
             self._last_cmd = (float(vx), float(vy), float(vw), time.monotonic())
-            self._hold_stopped = False
         self.get_logger().info(
             self._stage() + f'[publish] {pub.topic_name} vx={vx:+.3f} vy={vy:+.3f} wz={vw:+.3f}',
             throttle_duration_sec=LOG_THROTTLE_SEC,
         )
-
-    def _publish_hold_stop(self) -> None:
-        """per_axis_hold with all three axes within tolerance: one zero command
-        on the running stage's topic, then nothing until another command."""
-        with self._control_lock:
-            if not self._is_running_locked() or self._hold_stopped:
-                return
-            pub = self.stage1_cmd_pub if self._state is S.STAGE1 else self.stage2_cmd_pub
-            publish_twist(pub, 0.0, 0.0, 0.0)
-            self._last_wz_cmd = 0.0
-            self._last_cmd = (0.0, 0.0, 0.0, time.monotonic())
-            self._hold_stopped = True
-        self.get_logger().info(self._stage() + f'[publish] {pub.topic_name} axis hold vx=0 vy=0 wz=0')
 
     def _safe_stop(self, reset_planner: bool = False) -> None:
         self._publish_zero_on_all('safe stop')
@@ -1159,11 +1141,7 @@ class AprilTagControlNode(Node):
         # the camera y before) or its yaw is off
         vx_scale, approach_lat, approach_src = 1.0, None, ''
         latest_plan = self.latest_plan
-        if hold_axes is not None and all(hold_axes):
-            # all three within tolerance: one zero command, then none until an
-            # axis leaves (the planner / LQR are not stepped meanwhile)
-            self._publish_hold_stop()
-        else:
+        if hold_axes is None or not all(hold_axes):
             try:
                 if tracking_state is S.STAGE1 and self._stage1_approach.enabled:
                     if est.yaw_valid:
