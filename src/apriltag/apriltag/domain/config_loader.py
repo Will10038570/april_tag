@@ -54,17 +54,6 @@ class LqrConfig:
     smooth_tau: float
 
 
-@dataclass(frozen=True)
-class YawDeadband:
-    """Stage 1 / 2 yaw deadband on |yaw_f - yaw_ref| (rad), with hysteresis.
-
-    JSON keys in / out (enter / exit here: `in` is a Python keyword). The yaw
-    command is sent as 0 from |yaw| < enter until |yaw| > exit.
-    """
-    enter: float
-    exit: float
-
-
 def load_config(path: str) -> dict:
     """Load april_tag_config.json.
 
@@ -276,29 +265,6 @@ def parse_lqr(data: dict) -> LqrConfig:
     if tau <= 0.0:
         raise ValueError(f'{name}.smooth_tau ({tau}) must be positive')
     return LqrConfig(q_weights=tuple(weights), smooth_tau=float(tau))
-
-
-def parse_yaw_deadband(data: dict) -> YawDeadband:
-    """control.yaw_deadband (required) of a config from load_config().
-
-    in / out: finite numbers (rad) with 0 < in < out. Raises ValueError
-    naming the bad field.
-    """
-    name = 'control.yaw_deadband'
-    sec = data.get('control', {}).get('yaw_deadband')
-    if not isinstance(sec, dict):
-        raise ValueError(f'Missing or invalid {name} (an object with in, out)')
-    values = {}
-    for key in ('in', 'out'):
-        v = sec.get(key)
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
-            raise ValueError(f'{name}.{key} must be a number, got {type(v).__name__!r}')
-        values[key] = float(v)
-    if values['in'] <= 0.0:
-        raise ValueError(f'{name}.in ({values["in"]}) must be positive')
-    if values['out'] <= values['in']:
-        raise ValueError(f'{name}.out ({values["out"]}) must be > in ({values["in"]})')
-    return YawDeadband(enter=values['in'], exit=values['out'])
 
 
 # ---- yaw_estimator / yaw_probe (apriltag_control only) ---------------------------

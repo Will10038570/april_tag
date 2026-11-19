@@ -42,7 +42,6 @@ VALID = {
                   'tracking_tag_family': 'tag36h11', 'tracking_tag_id': 0},
     'tag_size': {'tag_size': 0.0635, 'tag_sizes': ''},
     'control': {'manage_amcl_and_lidar_safety': False, 'per_axis_hold': True,
-                'yaw_deadband': {'in': 0.03, 'out': 0.05},
                 'stage1_tolerance': {'x': 0.05, 'y': 0.05, 'yaw': 0.05, 'hold_seconds': 1.0},
                 'stage2_tolerance': {'x': 0.02, 'y': 0.03, 'yaw': 0.04, 'hold_seconds': 0.5},
                 'stage1_approach': {'enabled': True, 'lateral_full': 0.03, 'lateral_zero': 0.08,
@@ -93,7 +92,26 @@ def test_shipped_config_is_valid():
     parse_yaw_probe(data)
 
 
-@pytest.mark.parametrize('path', [REPO_CONFIG], ids=['april_tag'])
+# the virtual test config, next to april_tag_config.json at the workspace root
+VIRTUAL_CONFIG = pathlib.Path(__file__).resolve().parents[3] / 'virtual_tracking_config.json'
+
+
+def test_virtual_config_is_valid():
+    data = load_config(str(VIRTUAL_CONFIG))
+    parse_stage1_approach(data)
+    assert parse_per_axis_hold(data) is True
+    parse_lqr(data)
+    parse_yaw_estimator(data)
+    parse_yaw_probe(data)
+    tol, cal = validate_control_config(data)
+    # keep the factory calibration values (the sim's ground truth follows any values)
+    assert [cal[k].z_ref for k in ('stage1', 'stage2', 'detach')] == [0.5, 0.28, 1.0]
+    assert all(cal[k].x_ref == pytest.approx(0.026) and cal[k].yaw_ref == 0.0
+               for k in ('stage1', 'stage2'))
+    assert (cal['detach'].x_ref, cal['detach'].yaw_ref) == (0.0, 0.0)
+
+
+@pytest.mark.parametrize('path', [REPO_CONFIG, VIRTUAL_CONFIG], ids=['april_tag', 'virtual'])
 def test_shipped_configs_clean(path):
     if not path.exists():
         pytest.skip(f'{path.name} not found')
@@ -488,7 +506,7 @@ def test_yaw_probe_negative_direction():
     assert parse_yaw_probe(data).initial_direction == -1.0
 
 
-@pytest.mark.parametrize('path', [REPO_CONFIG], ids=['april_tag'])
+@pytest.mark.parametrize('path', [REPO_CONFIG, VIRTUAL_CONFIG], ids=['april_tag', 'virtual'])
 def test_shipped_yaw_defaults(path):
     # the shipped values equal the dataclass defaults (the s4 table may differ)
     if not path.exists():
@@ -499,7 +517,7 @@ def test_shipped_yaw_defaults(path):
     assert dataclasses.asdict(parse_yaw_probe(data)) == pytest.approx(dataclasses.asdict(YawProbeConfig()))
 
 
-@pytest.mark.parametrize('path', [REPO_CONFIG], ids=['april_tag'])
+@pytest.mark.parametrize('path', [REPO_CONFIG, VIRTUAL_CONFIG], ids=['april_tag', 'virtual'])
 @pytest.mark.parametrize('section', ['yaw_estimator', 'yaw_probe'])
 def test_shipped_doc_keys(path, section):
     # every value has a description and every description a value

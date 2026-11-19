@@ -23,12 +23,10 @@ from apriltag.control import LQRTracker, TrajectoryPlanner
 from apriltag.domain.config_loader import (
     LqrConfig,
     StageTolerance,
-    YawDeadband,
     load_config,
     parse_lqr,
     parse_per_axis_hold,
     parse_stage1_approach,
-    parse_yaw_deadband,
     parse_yaw_estimator,
     parse_yaw_probe,
     validate_control_config,
@@ -58,7 +56,6 @@ from apriltag.runtime.control_flow import (
     leave_step,
     publish_control,
     validate_speed_limits,
-    yaw_deadband_hold,
 )
 from apriltag.runtime.safety_guard import handle_target_lost
 from apriltag.runtime.target_flow import ANY_TAG_ID, tag_matches
@@ -233,11 +230,6 @@ class AprilTagControlNode(Node):
         # Stage 1 / 2: an axis within the stage tolerance is not corrected (sent 0);
         # required
         self.per_axis_hold = parse_per_axis_hold(_cfg)
-        # Stage 1 / 2: yaw sent as 0 while |yaw_f - yaw_ref| is inside the
-        # deadband (hysteresis in / out); required
-        self._yaw_deadband: YawDeadband = parse_yaw_deadband(_cfg)
-        self._yaw_db_hold = True
-        self._yaw_db_logged: Optional[bool] = None
         # True once the current Stage 1 run has logged that the yaw became valid
         self._approach_yaw_logged = False
 
@@ -457,7 +449,6 @@ class AprilTagControlNode(Node):
         validate_control_config(cfg)
         parse_stage1_approach(cfg)
         parse_per_axis_hold(cfg)
-        parse_yaw_deadband(cfg)
         parse_lqr(cfg)
         parse_yaw_estimator(cfg)
         parse_yaw_probe(cfg)
@@ -487,7 +478,6 @@ class AprilTagControlNode(Node):
         self._tolerances, self._calibration = validate_control_config(cfg)
         self._stage1_approach = parse_stage1_approach(cfg)
         self.per_axis_hold = parse_per_axis_hold(cfg)
-        self._yaw_deadband = parse_yaw_deadband(cfg)
         # rebuilt every time: both are reset when a stage starts running anyway
         self._apply_lqr(parse_lqr(cfg))
 
@@ -537,9 +527,6 @@ class AprilTagControlNode(Node):
                         for k, t in self._tolerances.items())
         self.get_logger().info(self._stage() + f'[calibration] {cal}; tolerance {tol}')
         self.get_logger().info(self._stage() + f'[axis_hold] per_axis_hold={self.per_axis_hold}')
-        self.get_logger().info(
-            self._stage() + f'[yaw_deadband] in={self._yaw_deadband.enter:.4f}rad '
-            f'out={self._yaw_deadband.exit:.4f}rad')
 
     def _transition_locked(self, new: TrackingState, step: Optional[Step], reason: str) -> bool:
         """Change state (and its step) if allowed; the caller must hold _control_lock."""
@@ -570,8 +557,6 @@ class AprilTagControlNode(Node):
         """Reset the controller for a new tracking phase; the caller must hold _control_lock."""
         self._error_zero_since = None
         self._hold_axes_logged = None
-        self._yaw_db_hold = True
-        self._yaw_db_logged = None
         self._last_stamp = None
         self._last_target_time = None
         self._latest_best_target = {}
@@ -1150,25 +1135,6 @@ class AprilTagControlNode(Node):
         )
         if self.yaw_probe.last_event:
             self.get_logger().info(self._stage() + f'[S3] {self.yaw_probe.last_event}')
-
-        # yaw deadband (hysteresis on yaw_f): the yaw command, LQR or S3
-        # probe, is sent as 0 while held; merged into hold_axes, so with all
-        # three axes held no command is sent
-        try:
-            self._yaw_db_hold = yaw_deadband_hold(self._yaw_db_hold, yaw_f_cal,
-                                                  self._yaw_deadband.enter, self._yaw_deadband.exit)
-        except ValueError as exc:
-            self.get_logger().warn(self._stage() + f"Yaw deadband failed: {exc}")
-            self._safe_stop(reset_planner=True)
-            return
-        if self._yaw_db_hold != self._yaw_db_logged:
-            self._yaw_db_logged = self._yaw_db_hold
-            self.get_logger().info(
-                self._stage() + f'[yaw_deadband] {"hold" if self._yaw_db_hold else "fix"} '
-                f'(yaw_f={yaw_f_cal:+.4f}, in={self._yaw_deadband.enter:.4f}, '
-                f'out={self._yaw_deadband.exit:.4f})')
-        base_hold = hold_axes if hold_axes is not None else (False, False, False)
-        hold_axes = (base_hold[0], base_hold[1], base_hold[2] or self._yaw_db_hold)
 
         # Stage 1 straight approach: scale the forward vx down while the robot
         # is off the approach line (tag-frame lateral once the yaw is valid,

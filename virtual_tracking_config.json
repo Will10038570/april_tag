@@ -1,0 +1,104 @@
+{
+  "_comment": "Virtual test config for launch/virtual_tracking.launch.py, read by apriltag_detection, apriltag_control and virtual_tracking_sim. The sim ground truth uses each calibration point (z_ref, x_ref, yaw_ref; detach has only z_ref) like apriltag_control, so any calibrated values work; the factory x_ref 0.026 equals the sim camera_y_offset, giving goals on the tag centre line. Copy this file and pass config_file:= for variant tests (control.dock_timeout 3.0 -> TIMEOUT); TAG_LOST: launch argument hide_tag_after:=5.0.",
+  "detection": {
+    "detect_tag_families": "tag36h11",
+    "tracking_tag_family": "tag36h11",
+    "tracking_tag_id": 0
+  },
+  "tag_size": {
+    "tag_size": 0.0475,
+    "tag_sizes": ""
+  },
+  "control": {
+    "manage_amcl_and_lidar_safety": false,
+    "per_axis_hold": true,
+    "stage1_tolerance": {"x": 0.02, "y": 0.01, "yaw": 0.05, "hold_seconds": 0.1},
+    "stage2_tolerance": {"x": 0.01, "y": 0.01, "yaw": 0.01, "hold_seconds": 0.1},
+    "stage1_approach": {"enabled": false, "lateral_full": 0, "lateral_zero": 0.1, "yaw_full": 0, "yaw_zero": 0.105},
+    "lqr": {"q_weights": [0.3333, 1.0, 0.1667], "smooth_tau": 0.8},
+    "dock_timeout": 300.0,
+    "undock_timeout": 300.0,
+    "lost_target_timeout": 1.0,
+    "max_vx": 0.1,
+    "max_vy": 0.1,
+    "max_vw": 0.1,
+    "min_vx": 0.01,
+    "min_vy": 0.01,
+    "min_vw": 0.01
+  },
+  "calibration": {
+    "stage1": {"z_ref": 0.5, "x_ref": 0.0, "yaw_ref": 0},
+    "stage2": {"z_ref": 0.28, "x_ref": 0.0, "yaw_ref": 0},
+    "detach": {"z_ref": 0.8}
+  },
+  "yaw_estimator": {
+    "s4_distances": [0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0],
+    "s4_sigmas_deg": [1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5],
+    "border_px": 10.0,
+    "margin_lo": 20.0,
+    "margin_hi": 60.0,
+    "sigma_dh": 0.39,
+    "snr_lo": 1.0,
+    "snr_hi": 2.0,
+    "ref_tag_size": 0.0475,
+    "q_proc": 0.0004,
+    "gate_sigma": 3.0,
+    "gate_min_deg": 3.0,
+    "accept_frames": 5,
+    "consistency_deg": 3.0,
+    "abs_window": 9,
+    "xy_tau": 0.1,
+    "_doc": {
+      "s4_distances": "S4 (m): equivalent-distance breakpoints for a tag of ref_tag_size; beyond the last one the yaw is not used",
+      "s4_sigmas_deg": "S4 (deg): yaw precision at each breakpoint; larger = the yaw filter trusts the measurement less",
+      "border_px": "S1 (px, >= 0): a tag corner closer than this to the image edge sets c_quality = 0 (yaw not trusted for that frame)",
+      "margin_lo": "S1 (>= 0, < margin_hi): decision_margin at or below this gives c_quality 0",
+      "margin_hi": "S1: decision_margin at or above this gives c_quality 1 (linear between margin_lo and margin_hi)",
+      "sigma_dh": "S2 (px, > 0): noise of dh (left edge - right edge height) with camera and tag still; SNR = |dh| / sigma_dh. Larger = needs a bigger dh before the yaw sign is trusted",
+      "snr_lo": "S2 (>= 0, < snr_hi): SNR at or below this gives c_sign 0 (yaw sign unknown, yaw used as 0)",
+      "snr_hi": "S2: SNR at or above this gives c_sign 1 (yaw sign trusted; linear between snr_lo and snr_hi)",
+      "ref_tag_size": "S4 (m, > 0): tag size the s4 table was measured with (not the tag in use); change only when the table is recalibrated",
+      "q_proc": "S5 (rad^2/s, >= 0): yaw filter process noise. Larger = yaw_f follows new measurements faster but noisier; smaller = smoother but lags",
+      "gate_sigma": "S5 (> 0): outlier gate = max(gate_sigma * sigma, gate_min_deg); a measurement farther than this from yaw_f is rejected",
+      "gate_min_deg": "S5 (deg, >= 0): minimum outlier gate width",
+      "accept_frames": "S5 (int >= 1): after this many consecutive rejected frames that agree within consistency_deg, yaw_f jumps to their mean (anti-stuck). Larger = fewer, later jumps",
+      "consistency_deg": "S5 (deg, > 0): how close the rejected frames must be to each other to be accepted as the new yaw",
+      "abs_window": "frames (int >= 1) in the |yaw_meas| median (yaw_abs_f) used by the in-position check and the S3 probe",
+      "xy_tau": "x / y EMA time constant (s, >= 0; 0 = no filtering)"
+    }
+  },
+  "yaw_probe": {
+    "trigger_frames": 50,
+    "c_sign_low": 0.5,
+    "trigger_yaw": 0.05,
+    "wz": 0.03,
+    "turn_time": 1.0,
+    "settle_frames": 9,
+    "end_yaw_deg": 1.5,
+    "change_deg": 0.5,
+    "end_c_sign": 1.0,
+    "initial_direction": 1,
+    "max_turns": 8,
+    "_doc": {
+      "trigger_frames": "int >= 1: the probe starts after this many consecutive frames with c_sign < c_sign_low (Stage 1, x / y within stage1_tolerance)",
+      "c_sign_low": "(0, 1]: c_sign below this counts as 'yaw direction unknown'",
+      "trigger_yaw": "rad, > 0: the probe starts only if yaw_abs_f (|yaw| median) is above this",
+      "wz": "rad/s, > 0: turn speed while probing; replaces the LQR wz",
+      "turn_time": "s, > 0: duration of one probe turn",
+      "settle_frames": "int >= 1: still frames after a turn before |yaw| is compared",
+      "end_yaw_deg": "deg, > 0: the probe ends when yaw_abs_f is below this",
+      "change_deg": "deg, >= 0: |yaw| change after a turn that counts as better (same way) or worse (reverse)",
+      "end_c_sign": "(0, 1]: the probe ends and hands back to the LQR when c_sign reaches this (direction known)",
+      "initial_direction": "1 or -1: direction of the first probe turn (+wz / -wz)",
+      "max_turns": "int >= 1: the probe ends after this many turns"
+    }
+  },
+  "ros_interfaces": {
+    "amcl_check_service": "/check_mcl_if_trigger",
+    "amcl_close_service": "/close_amcl",
+    "amcl_open_service": "/open_amcl",
+    "lidar_safety_topic": "/g7_plc/disable_lidar_safety",
+    "stage1_cmd_vel_topic": "/cmd_vel",
+    "stage2_cmd_vel_topic": "/pre_cmd_vel"
+  }
+}
