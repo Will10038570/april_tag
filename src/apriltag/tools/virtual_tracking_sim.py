@@ -296,9 +296,12 @@ class VirtualTrackingSim(Node):
         # leave targets), tolerances, speed limits and ROS interface names
         config_file = str(param('config_file', ''))
         if not config_file:
-            raise ValueError('config_file is required (path to the virtual test config).')
+            raise ValueError('config_file is required (path to april_tag_config.json).')
         config = load_config(config_file)
         self.tolerances, self.calibration = validate_control_config(config)
+        # false (april_tag_config.json default): apriltag_control never touches
+        # AMCL / lidar safety, so the "held" check after attach is skipped
+        self.manage_amcl_and_lidar_safety = bool(config['control']['manage_amcl_and_lidar_safety'])
         self.tag_size = float(config['tag_size']['tag_size'])
         # Index stage - 1: Stage 1, Stage 2, leave (stage 3, calibration.detach)
         self.stage_distances = tuple(self.calibration[STAGE_KEYS[s]].z_ref for s in (1, 2, 3))
@@ -688,7 +691,9 @@ class VirtualTrackingSim(Node):
         amcl_on, lidar_safety_disabled = self.fake_g7.state()
         held = (f"aligned: amcl={'on' if amcl_on else 'off'} "
                 f"lidar_safety={'disabled' if lidar_safety_disabled else 'enabled'}")
-        if not amcl_on and lidar_safety_disabled:
+        if not self.manage_amcl_and_lidar_safety:
+            self.get_logger().info(f'{held} (unmanaged, held check skipped)')
+        elif not amcl_on and lidar_safety_disabled:
             self.get_logger().info(f'{held} (held)')
         else:
             self.get_logger().error(f'{held} (NOT held)')

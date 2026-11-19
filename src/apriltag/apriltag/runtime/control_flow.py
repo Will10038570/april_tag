@@ -201,6 +201,20 @@ def leave_step(x_error: float, max_vx: float) -> Tuple[bool, float, float, float
     return False, -max_vx, 0.0, 0.0
 
 
+def yaw_deadband_hold(prev_hold: bool, yaw_error: float, enter: float, exit: float) -> bool:
+    """Yaw deadband with hysteresis on |yaw_error| (rad).
+
+    Held: stays held until |yaw_error| > exit. Not held: becomes held when
+    |yaw_error| < enter. In between the previous state is kept.
+    """
+    e = abs(float(yaw_error))
+    if not math.isfinite(e):
+        raise ValueError("Non-finite yaw_error for the yaw deadband")
+    if prev_hold:
+        return not e > exit
+    return e < enter
+
+
 def axes_in_tolerance(target: Optional[Dict[str, float]], tol) -> Tuple[bool, bool, bool]:
     """Per axis: |x|, |y|, |yaw| of target within tol (a StageTolerance); None -> all False."""
     if target is None:

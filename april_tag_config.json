@@ -12,10 +12,11 @@
   "control": {
     "manage_amcl_and_lidar_safety": false,
     "per_axis_hold": true,
+    "yaw_deadband": {"in": 0.005, "out": 0.05},
     "stage1_tolerance": {"x": 0.02, "y": 0.01, "yaw": 0.05, "hold_seconds": 0.1},
     "stage2_tolerance": {"x": 0.01, "y": 0.01, "yaw": 0.03, "hold_seconds": 0.1},
     "stage1_approach": {"enabled": false, "lateral_full": 0, "lateral_zero": 0.1, "yaw_full": 0, "yaw_zero": 0.105},
-    "lqr": {"q_weights": [0.3333, 1.0, 0.1667], "smooth_tau": 0.8},
+    "lqr": {"q_weights": [0.3333, 1.0, 0.167], "smooth_tau": 0.8},
     "dock_timeout": 300.0,
     "undock_timeout": 300.0,
     "lost_target_timeout": 1.0,
@@ -24,7 +25,7 @@
     "max_vw": 0.1,
     "min_vx": 0.02,
     "min_vy": 0.02,
-    "min_vw": 0.015
+    "min_vw": 0.07
   },
   "calibration": {
     "stage1": {"z_ref": 0.55, "x_ref": 0.0, "yaw_ref": 0},
