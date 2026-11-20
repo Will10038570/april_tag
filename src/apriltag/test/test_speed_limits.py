@@ -52,19 +52,41 @@ def test_vx_scale(vx, scale, expected):
 
 
 def test_valid_limits():
-    assert validate_speed_limits(*MAX, *MIN) is None
-    assert validate_speed_limits(*MAX, 0.0, 0.0, 0.0) is None
-    assert validate_speed_limits(*MAX, *MAX) is None          # min == max allowed
+    assert validate_speed_limits(*MAX, *MIN, 0.01) is None
+    assert validate_speed_limits(*MAX, 0.0, 0.0, 0.0, 0.0) is None
+    assert validate_speed_limits(*MAX, *MAX, 0.05) is None    # min == max allowed
+    assert validate_speed_limits(*MAX, *MIN, 0.03) is None    # min_vw_move > min_vw allowed
+    assert validate_speed_limits(*MAX, 0.01, 0.01, 0.03, 0.01) is None   # and < min_vw
 
 
 @pytest.mark.parametrize('limits,key', [
-    ((0.0, 0.1, 0.05, 0.01, 0.01, 0.01), 'max_vx'),
-    ((0.1, -0.1, 0.05, 0.01, 0.01, 0.01), 'max_vy'),
-    ((0.1, 0.1, 0.05, 0.01, -0.01, 0.01), 'min_vy'),
-    ((0.1, 0.1, 0.05, 0.01, 0.01, 0.06), 'min_vw'),          # min > max
-    ((0.1, 0.1, 0.05, 0.2, 0.01, 0.01), 'min_vx'),
-    ((float('nan'), 0.1, 0.05, 0.01, 0.01, 0.01), 'max_vx'),
+    ((0.0, 0.1, 0.05, 0.01, 0.01, 0.01, 0.01), 'max_vx'),
+    ((0.1, -0.1, 0.05, 0.01, 0.01, 0.01, 0.01), 'max_vy'),
+    ((0.1, 0.1, 0.05, 0.01, -0.01, 0.01, 0.01), 'min_vy'),
+    ((0.1, 0.1, 0.05, 0.01, 0.01, 0.06, 0.01), 'min_vw'),          # min > max
+    ((0.1, 0.1, 0.05, 0.2, 0.01, 0.01, 0.01), 'min_vx'),
+    ((float('nan'), 0.1, 0.05, 0.01, 0.01, 0.01, 0.01), 'max_vx'),
+    ((0.1, 0.1, 0.05, 0.01, 0.01, 0.01, -0.01), 'min_vw_move'),    # must be >= 0
+    ((0.1, 0.1, 0.05, 0.01, 0.01, 0.01, 0.06), 'min_vw_move'),     # > max_vw
+    ((0.1, 0.1, 0.05, 0.01, 0.01, 0.01, float('nan')), 'min_vw_move'),
 ])
 def test_invalid_limits(limits, key):
     reason = validate_speed_limits(*limits)
     assert reason is not None and key in reason
+
+
+@pytest.mark.parametrize('vx,vy,vw,kwargs,expected_wz', [
+    (0.05, 0.0, 0.005, {}, 0.03),               # vx moving -> min_vw_move
+    (0.0, 0.05, -0.005, {}, -0.03),             # vy moving -> min_vw_move, sign kept
+    (0.0, 0.0, 0.005, {}, 0.01),                # in place -> min_vw
+    (0.05, 0.0, 0.005, {'vx_scale': 0.0}, 0.01),  # vx scaled to 0 -> in place
+    (0.05, 0.0, 0.0, {}, 0.0),                  # zero wz stays zero
+    (0.05, 0.0, 0.04, {}, 0.04),                # above both minimums unchanged
+])
+def test_wz_min_depends_on_translation(vx, vy, vw, kwargs, expected_wz):
+    out = clamp_control(vx, vy, vw, *MAX, *MIN, min_vw_move=0.03, **kwargs)
+    assert out[2] == pytest.approx(expected_wz)
+
+
+def test_wz_min_move_none_uses_min_vw():
+    assert clamp_control(0.05, 0.0, 0.005, *MAX, *MIN)[2] == pytest.approx(0.01)

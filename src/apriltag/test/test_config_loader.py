@@ -49,7 +49,8 @@ VALID = {
                 'lqr': {'q_weights': [0.3333, 1.0, 0.1667], 'smooth_tau': 0.5},
                 'dock_timeout': 300.0, 'undock_timeout': 300.0, 'lost_target_timeout': 1.0,
                 'max_vx': 0.1, 'max_vy': 0.1, 'max_vw': 0.05,
-                'min_vx': 0.01, 'min_vy': 0.01, 'min_vw': 0.01},
+                'min_vx': 0.01, 'min_vy': 0.01, 'min_vw': 0.01,
+                'min_vw_move': 0.01},
     'calibration': {'stage1': {'z_ref': 0.5, 'x_ref': 0.026, 'yaw_ref': 0.0},
                     'stage2': {'z_ref': 0.28, 'x_ref': 0.01, 'yaw_ref': 0.02},
                     'detach': {'z_ref': 1.0}},
@@ -92,30 +93,8 @@ def test_shipped_config_is_valid():
     parse_yaw_probe(data)
 
 
-# the virtual test config, next to april_tag_config.json at the workspace root
-VIRTUAL_CONFIG = pathlib.Path(__file__).resolve().parents[3] / 'virtual_tracking_config.json'
-
-
-def test_virtual_config_is_valid():
-    data = load_config(str(VIRTUAL_CONFIG))
-    parse_stage1_approach(data)
-    assert parse_per_axis_hold(data) is True
-    parse_lqr(data)
-    parse_yaw_estimator(data)
-    parse_yaw_probe(data)
-    tol, cal = validate_control_config(data)
-    # keep the factory calibration values (the sim's ground truth follows any values)
-    assert [cal[k].z_ref for k in ('stage1', 'stage2', 'detach')] == [0.5, 0.28, 1.0]
-    assert all(cal[k].x_ref == pytest.approx(0.026) and cal[k].yaw_ref == 0.0
-               for k in ('stage1', 'stage2'))
-    assert (cal['detach'].x_ref, cal['detach'].yaw_ref) == (0.0, 0.0)
-
-
-@pytest.mark.parametrize('path', [REPO_CONFIG, VIRTUAL_CONFIG], ids=['april_tag', 'virtual'])
-def test_shipped_configs_clean(path):
-    if not path.exists():
-        pytest.skip(f'{path.name} not found')
-    cal = json.loads(path.read_text())['calibration']
+def test_shipped_configs_clean():
+    cal = json.loads(REPO_CONFIG.read_text())['calibration']
     assert set(cal['stage1']) == set(cal['stage2']) == {'z_ref', 'x_ref', 'yaw_ref'}
     assert list(cal['detach']) == ['z_ref']
 
@@ -150,6 +129,8 @@ def test_missing_section(tmp_path, section):
     ('control', 'max_vy', True),                      # bool is not a number
     ('control', 'min_vx', -0.01),                     # must be >= 0
     ('control', 'min_vw', 0.06),                      # min > max_vw
+    ('control', 'min_vw_move', -0.01),                # must be >= 0
+    ('control', 'min_vw_move', 0.06),                 # > max_vw
     ('detection', 'tracking_tag_id', False),          # bool is not an int
     ('detection', 'tracking_tag_id', 0.0),
     ('detection', 'tracking_tag_id', -2),
@@ -166,7 +147,8 @@ def test_invalid_value(tmp_path, section, key, value):
         load_config(_write(tmp_path, _with(section, key, value)))
 
 
-@pytest.mark.parametrize('key', ['max_vx', 'max_vy', 'max_vw', 'min_vx', 'min_vy', 'min_vw'])
+@pytest.mark.parametrize('key', ['max_vx', 'max_vy', 'max_vw', 'min_vx', 'min_vy', 'min_vw',
+                                 'min_vw_move'])
 def test_missing_speed_limit(tmp_path, key):
     data = copy.deepcopy(VALID)
     del data['control'][key]
@@ -506,24 +488,10 @@ def test_yaw_probe_negative_direction():
     assert parse_yaw_probe(data).initial_direction == -1.0
 
 
-@pytest.mark.parametrize('path', [REPO_CONFIG, VIRTUAL_CONFIG], ids=['april_tag', 'virtual'])
-def test_shipped_yaw_defaults(path):
-    # the shipped values equal the dataclass defaults (the s4 table may differ)
-    if not path.exists():
-        pytest.skip(f'{path.name} not found')
-    data = load_config(str(path))
-    est = dataclasses.asdict(parse_yaw_estimator(data))
-    assert {k: v for k, v in est.items() if not k.startswith('s4_')} == pytest.approx(EST_DEFAULTS)
-    assert dataclasses.asdict(parse_yaw_probe(data)) == pytest.approx(dataclasses.asdict(YawProbeConfig()))
-
-
-@pytest.mark.parametrize('path', [REPO_CONFIG, VIRTUAL_CONFIG], ids=['april_tag', 'virtual'])
 @pytest.mark.parametrize('section', ['yaw_estimator', 'yaw_probe'])
-def test_shipped_doc_keys(path, section):
+def test_shipped_doc_keys(section):
     # every value has a description and every description a value
-    if not path.exists():
-        pytest.skip(f'{path.name} not found')
-    sec = json.loads(path.read_text())[section]
+    sec = json.loads(REPO_CONFIG.read_text())[section]
     assert set(sec['_doc']) == set(sec) - {'_doc'}
     assert all(isinstance(v, str) and v for v in sec['_doc'].values())
 

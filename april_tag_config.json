@@ -24,7 +24,8 @@
     "max_vw": 0.1,
     "min_vx": 0.02,
     "min_vy": 0.02,
-    "min_vw": 0.015
+    "min_vw": 0.07,
+    "min_vw_move": 0.015
   },
   "calibration": {
     "stage1": {"z_ref": 0.55, "x_ref": 0.0, "yaw_ref": 0},

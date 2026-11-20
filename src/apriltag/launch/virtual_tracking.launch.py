@@ -13,7 +13,7 @@ CycloneDDS on loopback only. CLI debugging:
     ROS_DOMAIN_ID=99 ros2 topic echo /cmd_vel
 
 All node settings come from config_file (default: the workspace root's
-virtual_tracking_config.json, next to april_tag_config.json, read directly, so
+april_tag_config.json, the same file the robot launch uses, read directly, so
 edits apply without a colcon build; apriltag_detection and the sim read it only at start,
 so relaunch after editing it). Variant tests: copy it, change e.g.
 control.dock_timeout to 3.0 (TIMEOUT, error_code 4), and pass
@@ -38,10 +38,10 @@ OUTPUT_FORMAT = '{line}'
 CONTROL_LOG_ENV = {'RCUTILS_CONSOLE_OUTPUT_FORMAT': '[{severity}] [{name}]{message}'}
 
 # Default config: install/apriltag/share/apriltag → ../../../../ = workspace root,
-# so edits to <workspace>/virtual_tracking_config.json apply without a build
+# so edits to <workspace>/april_tag_config.json apply without a build
 _pkg_share = get_package_share_directory('apriltag')
 _DEFAULT_CONFIG = os.path.normpath(os.path.join(
-    _pkg_share, '..', '..', '..', '..', 'virtual_tracking_config.json'))
+    _pkg_share, '..', '..', '..', '..', 'april_tag_config.json'))
 
 
 def generate_launch_description():
@@ -61,7 +61,8 @@ def generate_launch_description():
                                           'starts (TAG_LOST test); < 0 = never'),
         # every apriltag_detection / apriltag_control / sim setting (tag, tag size,
         # timeouts, calibration points = stage / leave distances, tolerances); the
-        # default is the src file itself (no build needed, relaunch after editing);
+        # default is the workspace april_tag_config.json (no build needed, relaunch
+        # after editing);
         # for variant tests copy it and pass config_file:=/path/to/copy.json
         DeclareLaunchArgument('config_file', default_value=_DEFAULT_CONFIG),
     ]

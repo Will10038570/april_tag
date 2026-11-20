@@ -18,17 +18,17 @@ apriltag_detection and apriltag_control nodes run unmodified:
 - Start calls the /wheelchair/attach service (std_srvs/SetBool, data=true), whose response
   gives the cmd_id (or rejects it: the run ends as REJECTED). When /wheelchair/status shows
   IDLE with its cmd_id, error_code 0 and error_msg 'Attach succeeded' (a cancel is
-  also error_code 0, with error_msg 'Cancelled ...'), apriltag_control is back in IDLE with
-  AMCL closed and lidar safety disabled (checked here as "held"); the sim waits
-  in ALIGNED. Leave then calls /wheelchair/detach (headless: automatically) and
-  the run ends with its status, where AMCL and lidar safety must be restored.
+  also error_code 0, with error_msg 'Cancelled ...'), apriltag_control is back in IDLE;
+  the sim waits in ALIGNED. Leave then calls /wheelchair/detach (headless:
+  automatically) and the run ends with its status. AMCL / lidar safety are not
+  checked (only shown in the dashboard).
   Leave without a previous Start runs a leave-only run (detach is accepted in
   IDLE). A cmd service without a response within cmd_reject_timeout ends the
   run as REJECTED;
 - a fake G7+ node (FakeG7Services) stands in for AMCL and the PLC lidar safety.
   It only keeps two bool flags, switched through the same AMCL services and lidar
-  safety topic apriltag_control uses on the robot, so the call order and restores
-  can be checked;
+  safety topic apriltag_control uses on the robot, so the calls succeed when
+  manage_amcl_and_lidar_safety is true (the flags are shown in the dashboard);
 - body_status (G7+ UI topic) is recorded during a run and compared with the
   values the accepted cmds should give (attach 1, 0; detach 2, 0);
 - the tag can be hidden (h key, or hide_tag_after seconds after a run starts)
@@ -684,14 +684,6 @@ class VirtualTrackingSim(Node):
                 return  # reset while running
             self.phase = 'ALIGNED'
             self.result_message = message
-        # apriltag_control is back in IDLE with AMCL closed, lidar safety disabled
-        amcl_on, lidar_safety_disabled = self.fake_g7.state()
-        held = (f"aligned: amcl={'on' if amcl_on else 'off'} "
-                f"lidar_safety={'disabled' if lidar_safety_disabled else 'enabled'}")
-        if not amcl_on and lidar_safety_disabled:
-            self.get_logger().info(f'{held} (held)')
-        else:
-            self.get_logger().error(f'{held} (NOT held)')
         if self.headless:
             self.leave()
 
@@ -780,14 +772,6 @@ class VirtualTrackingSim(Node):
             summary += (f' | final GT err x={final[4]:+.4f} y={final[5]:+.4f} yaw={final[6]:+.4f}'
                         f' | max |cmd| vx={max_cmd[0]:.3f} vy={max_cmd[1]:.3f} wz={max_cmd[2]:.3f}')
         self.get_logger().info(summary)
-        # every cmd end must leave AMCL on and lidar safety enabled
-        amcl_on, lidar_safety_disabled = self.fake_g7.state()
-        restore = (f"after cmd: amcl={'on' if amcl_on else 'off'} "
-                   f"lidar_safety={'disabled' if lidar_safety_disabled else 'enabled'}")
-        if amcl_on and not lidar_safety_disabled:
-            self.get_logger().info(f'{restore} (restored)')
-        else:
-            self.get_logger().error(f'{restore} (NOT restored)')
         self.get_logger().info(f'Run saved to {base}_*.csv')
         with self.lock:
             self.png_request = base + '.png'

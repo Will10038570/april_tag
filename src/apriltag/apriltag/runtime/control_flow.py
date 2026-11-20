@@ -72,6 +72,7 @@ def clamp_control(
     max_vx: float, max_vy: float, max_vw: float,
     min_vx: float = 0.0, min_vy: float = 0.0, min_vw: float = 0.0,
     vx_scale: float = 1.0,
+    min_vw_move: Optional[float] = None,
 ) -> Tuple[float, float, float]:
     """Per axis: clip to [-max, max], then raise non-zero |v| < min to min.
 
@@ -80,16 +81,19 @@ def clamp_control(
     vx_scale (clipped to [0, 1], non-finite -> 0) multiplies a forward vx
     (> 0) after the max clip and before the min: the Stage 1 straight
     approach. A backward vx is not scaled.
+    The wz minimum is min_vw_move when the resulting vx or vy is non-zero
+    (turning while translating), min_vw when both are 0 (turning in place);
+    min_vw_move None -> always min_vw.
     """
     scale = min(max(float(vx_scale), 0.0), 1.0) if math.isfinite(vx_scale) else 0.0
     vx = max(min(vx, max_vx), -max_vx)
     if vx > 0.0:
         vx *= scale
-    return (
-        _apply_min(vx, min_vx),
-        _apply_min(max(min(vy, max_vy), -max_vy), min_vy),
-        _apply_min(max(min(vw, max_vw), -max_vw), min_vw),
-    )
+    vx_out = _apply_min(vx, min_vx)
+    vy_out = _apply_min(max(min(vy, max_vy), -max_vy), min_vy)
+    moving = vx_out != 0.0 or vy_out != 0.0
+    min_w = min_vw_move if (moving and min_vw_move is not None) else min_vw
+    return vx_out, vy_out, _apply_min(max(min(vw, max_vw), -max_vw), min_w)
 
 
 def ramp_scale(value: float, full: float, zero: float) -> float:
@@ -120,10 +124,12 @@ def approach_vx_scale(lateral: float, yaw: float, yaw_valid: bool, cfg) -> float
 def validate_speed_limits(
     max_vx: float, max_vy: float, max_vw: float,
     min_vx: float, min_vy: float, min_vw: float,
+    min_vw_move: float,
 ) -> Optional[str]:
     """Return why the speed limits are invalid, or None if they are valid.
 
-    Each max must be > 0, each min >= 0, and min <= max on every axis.
+    Each max must be > 0, each min >= 0, and min <= max on every axis;
+    min_vw_move (the wz minimum while vx or vy is non-zero) is >= 0 and <= max_vw.
     """
     for axis, max_v, min_v in (('vx', max_vx, min_vx), ('vy', max_vy, min_vy), ('vw', max_vw, min_vw)):
         if not (math.isfinite(max_v) and max_v > 0.0):
@@ -132,6 +138,10 @@ def validate_speed_limits(
             return f'min_{axis} ({min_v}) must be >= 0'
         if min_v > max_v:
             return f'min_{axis} ({min_v}) must be <= max_{axis} ({max_v})'
+    if not (math.isfinite(min_vw_move) and min_vw_move >= 0.0):
+        return f'min_vw_move ({min_vw_move}) must be >= 0'
+    if min_vw_move > max_vw:
+        return f'min_vw_move ({min_vw_move}) must be <= max_vw ({max_vw})'
     return None
 
 
@@ -162,6 +172,7 @@ def publish_control(
     min_vw: float = 0.0,
     vx_scale: float = 1.0,
     hold_axes: Optional[Tuple[bool, bool, bool]] = None,
+    min_vw_move: Optional[float] = None,
 ):
     """Run one control step and publish twist; return state updates.
 
@@ -170,6 +181,7 @@ def publish_control(
     hold_axes (x, y, yaw): a True axis is set to 0 (not corrected) after the
     LQR / wz_override and before the clamp, so min_v* does not raise it.
     None = all axes corrected.
+    min_vw_move: see clamp_control (wz minimum while vx or vy is non-zero).
     """
     dt, new_last_time = compute_dt(now, last_time, max_dt)
     state = extract_control_state(best_target)
@@ -182,7 +194,7 @@ def publish_control(
         hx, hy, hyaw = hold_axes
         vx, vy, vw = (0.0 if hx else vx), (0.0 if hy else vy), (0.0 if hyaw else vw)
     vx, vy, vw = clamp_control(vx, vy, vw, max_vx, max_vy, max_vw, min_vx, min_vy, min_vw,
-                               vx_scale)
+                               vx_scale=vx_scale, min_vw_move=min_vw_move)
     publish_twist_fn(vx, vy, vw)
 
     return new_last_time, plan

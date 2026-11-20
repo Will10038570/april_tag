@@ -279,7 +279,8 @@ class AprilTagControlNode(Node):
         # capture time (s) of the last pose used for control, for dt
         self._last_stamp = None
         # per-axis speed limits for Stage 1 / 2 (vx, vy m/s; vw rad/s): clip to
-        # max, then raise a non-zero |v| below min to min (G7+ deadband);
+        # max, then raise a non-zero |v| below min to min (G7+ deadband); the wz
+        # minimum is min_vw_move when the sent vx or vy is non-zero, else min_vw;
         # leave backs up at -max_vx
         self.max_vx = float(jp('control', 'max_vx'))
         self.max_vy = float(jp('control', 'max_vy'))
@@ -287,8 +288,10 @@ class AprilTagControlNode(Node):
         self.min_vx = float(jp('control', 'min_vx'))
         self.min_vy = float(jp('control', 'min_vy'))
         self.min_vw = float(jp('control', 'min_vw'))
+        self.min_vw_move = float(jp('control', 'min_vw_move'))
         _speed_reason = validate_speed_limits(self.max_vx, self.max_vy, self.max_vw,
-                                              self.min_vx, self.min_vy, self.min_vw)
+                                              self.min_vx, self.min_vy, self.min_vw,
+                                              self.min_vw_move)
         if _speed_reason is not None:
             raise ValueError(f'Parameter {_speed_reason}.')
         self.max_dt = 0.2
@@ -470,6 +473,7 @@ class AprilTagControlNode(Node):
         self.min_vx               = float(cfg['control']['min_vx'])
         self.min_vy               = float(cfg['control']['min_vy'])
         self.min_vw               = float(cfg['control']['min_vw'])
+        self.min_vw_move          = float(cfg['control']['min_vw_move'])
         self.tag_size             = float(cfg['tag_size']['tag_size'])
         self.tag_sizes            = parse_tag_sizes(str(cfg['tag_size']['tag_sizes']))
         self._goal_tag_family     = str(cfg['detection']['tracking_tag_family']).strip()
@@ -1182,6 +1186,7 @@ class AprilTagControlNode(Node):
                     min_vw=self.min_vw,
                     vx_scale=vx_scale,
                     hold_axes=hold_axes,
+                    min_vw_move=self.min_vw_move,
                 )
             except Exception as exc:
                 self.get_logger().warn(self._stage() + f"Control publish failed: {exc}")

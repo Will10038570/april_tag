@@ -138,7 +138,8 @@ def _validate_config(data: dict) -> None:
         if v <= 0.0:
             raise ValueError(f'control.{key} must be positive')
     speed = {key: _require_num(ctrl, 'control', key)
-             for key in ('max_vx', 'max_vy', 'max_vw', 'min_vx', 'min_vy', 'min_vw')}
+             for key in ('max_vx', 'max_vy', 'max_vw', 'min_vx', 'min_vy', 'min_vw',
+                         'min_vw_move')}
     reason = validate_speed_limits(**speed)
     if reason is not None:
         raise ValueError(f'control.{reason}')
